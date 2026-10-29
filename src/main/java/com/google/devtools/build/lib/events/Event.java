@@ -15,10 +15,10 @@ package com.google.devtools.build.lib.events;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.collect.ImmutableList.toImmutableList;
-import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Comparator.comparing;
 
 import com.google.common.collect.ImmutableClassToInstanceMap;
+import com.google.devtools.build.lib.unsafe.StringUnsafe;
 import com.google.errorprone.annotations.CheckReturnValue;
 import java.io.IOException;
 import java.util.Arrays;
@@ -38,7 +38,7 @@ import net.starlark.java.syntax.SyntaxError;
  */
 @Immutable
 @CheckReturnValue
-public final class Event {
+public final class Event implements Reportable {
 
   private final EventKind kind;
 
@@ -66,21 +66,39 @@ public final class Event {
     this.properties = checkNotNull(properties);
   }
 
+  @Override
+  public void reportTo(ExtendedEventHandler handler) {
+    handler.handle(this);
+  }
+
+  @Override
+  public boolean storeForReplay() {
+    return kind != EventKind.PROGRESS
+        && kind != EventKind.WARNING
+        && kind != EventKind.INFO
+        && kind != EventKind.DEBUG;
+  }
+
   public EventKind getKind() {
     return kind;
   }
 
   public String getMessage() {
-    return message instanceof String ? (String) message : new String((byte[]) message, UTF_8);
+    return message instanceof String
+        ? (String) message
+        : StringUnsafe.newInstance((byte[]) message, StringUnsafe.LATIN1);
   }
 
   /**
-   * Returns this event's message as a {@link byte[]}. If this event was instantiated using a {@link
-   * String}, the returned byte array is encoded using {@link
-   * java.nio.charset.StandardCharsets#UTF_8}.
+   * Returns this event's message as a {@link byte[]} by unwrapping Bazel's {@link
+   * com.google.devtools.build.lib.util.StringEncoding internal string encoding}.
+   *
+   * <p>Caller's must not modify the returned array.
    */
   public byte[] getMessageBytes() {
-    return message instanceof byte[] ? (byte[]) message : ((String) message).getBytes(UTF_8);
+    return message instanceof byte[]
+        ? (byte[]) message
+        : StringUnsafe.getInternalStringBytes((String) message);
   }
 
   /** Returns the property value associated with {@code type} if any, and {@code null} otherwise. */
@@ -151,12 +169,15 @@ public final class Event {
   }
 
   /**
-   * Like {@link #withProperty(Class, Object)}, with {@code type.equals(String.class)}.
+   * {@inheritDoc}
+   *
+   * <p>Behaves like {@link #withProperty(Class, Object)}, with {@code type.equals(String.class)}.
    *
    * <p>Additionally, if the event this is called on already has a {@link String} property with
    * value {@code tag}, or if {@code tag} is {@code null} and the event has no {@link String}
    * property, then this returns that event (it does not create a new {@link Event} instance).
    */
+  @Override
   public Event withTag(@Nullable String tag) {
     if (Objects.equals(tag, getProperty(String.class))) {
       return this;

@@ -50,7 +50,7 @@ public class ActionLookupData implements ExecutionPhaseSkyKey {
     return new UnshareableActionLookupData(actionLookupKey, actionIndex);
   }
 
-  public ActionLookupKey getActionLookupKey() {
+  public final ActionLookupKey getActionLookupKey() {
     return actionLookupKey;
   }
 
@@ -80,17 +80,16 @@ public class ActionLookupData implements ExecutionPhaseSkyKey {
     if (this == obj) {
       return true;
     }
-    if (!(obj instanceof ActionLookupData)) {
+    if (!(obj instanceof ActionLookupData that)) {
       return false;
     }
-    ActionLookupData that = (ActionLookupData) obj;
     return this.actionIndex == that.actionIndex
         && this.actionLookupKey.equals(that.actionLookupKey)
         && valueIsShareable() == that.valueIsShareable();
   }
 
   @Override
-  public String toString() {
+  public final String toString() {
     return MoreObjects.toStringHelper(this)
         .add("actionLookupKey", actionLookupKey)
         .add("actionIndex", actionIndex)
@@ -98,7 +97,7 @@ public class ActionLookupData implements ExecutionPhaseSkyKey {
   }
 
   @Override
-  public SkyFunctionName functionName() {
+  public final SkyFunctionName functionName() {
     return SkyFunctions.ACTION_EXECUTION;
   }
 

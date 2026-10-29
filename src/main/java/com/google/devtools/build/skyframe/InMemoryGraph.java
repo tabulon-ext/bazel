@@ -13,12 +13,13 @@
 // limitations under the License.
 package com.google.devtools.build.skyframe;
 
-import com.google.common.collect.Maps;
 import com.google.devtools.build.skyframe.InMemoryGraphImpl.EdgelessInMemoryGraphImpl;
-import java.util.Collections;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import java.util.Collection;
 import java.util.Map;
-import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
 import javax.annotation.Nullable;
 
 /** {@link ProcessableGraph} that exposes the contents of the entire graph. */
@@ -26,27 +27,43 @@ public interface InMemoryGraph extends ProcessableGraph {
 
   /** Creates a new in-memory graph suitable for incremental builds. */
   static InMemoryGraph create() {
-    return new InMemoryGraphImpl();
+    return new InMemoryGraphImpl(/* usePooledInterning= */ true);
+  }
+
+  static InMemoryGraph create(boolean usePooledInterning) {
+    return new InMemoryGraphImpl(usePooledInterning);
   }
 
   /**
    * Creates a new in-memory graph that discards graph edges to save memory and cannot be used for
    * incremental builds.
    */
-  static InMemoryGraph createEdgeless() {
-    return new EdgelessInMemoryGraphImpl();
+  static InMemoryGraph createEdgeless(boolean usePooledInterning) {
+    return new EdgelessInMemoryGraphImpl(usePooledInterning);
   }
 
   @Override
-  Map<SkyKey, ? extends NodeEntry> createIfAbsentBatch(
-      @Nullable SkyKey requestor, Reason reason, Iterable<SkyKey> keys);
+  @CanIgnoreReturnValue
+  NodeBatch createIfAbsentBatch(
+      @Nullable SkyKey requestor, Reason reason, Iterable<? extends SkyKey> keys);
 
   @Nullable
   @Override
   NodeEntry get(@Nullable SkyKey requestor, Reason reason, SkyKey key);
 
   @Override
-  Map<SkyKey, ? extends NodeEntry> getBatch(
+  default NodeBatch getBatch(
+      @Nullable SkyKey requestor, Reason reason, Iterable<? extends SkyKey> keys) {
+    return getBatchMap(requestor, reason, keys)::get;
+  }
+
+  @Override
+  default LookupHint getLookupHint(SkyKey key) {
+    return LookupHint.INDIVIDUAL;
+  }
+
+  @Override
+  Map<SkyKey, ? extends NodeEntry> getBatchMap(
       @Nullable SkyKey requestor, Reason reason, Iterable<? extends SkyKey> keys);
 
   /**
@@ -63,19 +80,54 @@ public interface InMemoryGraph extends ProcessableGraph {
    * Returns a read-only live view of the done values in the graph. Dirty, changed, and error values
    * are not present in the returned map
    */
-  default Map<SkyKey, SkyValue> getDoneValues() {
-    return transformDoneEntries(getAllValuesMutable());
+  Map<SkyKey, SkyValue> getDoneValues();
+
+  /**
+   * Returns the values of the done nodes whose keys match the given filter.
+   *
+   * <p>Unlike {@link #getDoneValues()}, the result is not a live view: the graph is walked once, in
+   * parallel, and only the values of matching keys are read.
+   */
+  default Map<SkyKey, SkyValue> collectDoneValues(Predicate<SkyKey> keyFilter) {
+    var result = new ConcurrentHashMap<SkyKey, SkyValue>();
+    parallelForEach(
+        entry -> {
+          var key = entry.getKey();
+          if (!keyFilter.test(key)) {
+            return;
+          }
+          var value = ValueWithMetadata.justValue(entry.getValueMaybeWithMetadata());
+          if (value != null && entry.isDone()) {
+            result.put(key, value);
+          }
+        });
+    return result;
   }
 
-  // Only for use by MemoizingEvaluator#delete
-  Map<SkyKey, InMemoryNodeEntry> getAllValues();
+  /** Returns an unmodifiable collection of all nodes in the graph. */
+  Collection<InMemoryNodeEntry> getAllNodeEntries();
 
-  ConcurrentHashMap<SkyKey, InMemoryNodeEntry> getAllValuesMutable();
+  /** Applies the given consumer to each node in the graph, potentially in parallel. */
+  void parallelForEach(Consumer<InMemoryNodeEntry> consumer);
 
-  static Map<SkyKey, SkyValue> transformDoneEntries(Map<SkyKey, InMemoryNodeEntry> nodeMap) {
-    return Collections.unmodifiableMap(
-        Maps.filterValues(
-            Maps.transformValues(nodeMap, entry -> entry.isDone() ? entry.getValue() : null),
-            Objects::nonNull));
-  }
+  /**
+   * Removes the node entry associated with the given {@link SkyKey} from the graph if it is done.
+   */
+  void removeIfDone(SkyKey key);
+
+  /**
+   * Cleans up {@linkplain com.google.devtools.build.lib.concurrent.PooledInterner.Pool interning
+   * pools} by moving objects to weak interners and uninstalling the current pools.
+   *
+   * <p>May destroy this graph. Only call when the graph is about to be thrown away.
+   */
+  void cleanupInterningPools();
+
+  /**
+   * Returns the {@link InMemoryNodeEntry} for a given {@link SkyKey} if present in the graph.
+   * Otherwise, returns null.
+   */
+  @Nullable
+  InMemoryNodeEntry getIfPresent(SkyKey key);
+
 }

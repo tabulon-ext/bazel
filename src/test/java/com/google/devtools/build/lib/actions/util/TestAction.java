@@ -25,7 +25,7 @@ import com.google.devtools.build.lib.actions.ActionExecutionException;
 import com.google.devtools.build.lib.actions.ActionKeyContext;
 import com.google.devtools.build.lib.actions.ActionResult;
 import com.google.devtools.build.lib.actions.Artifact;
-import com.google.devtools.build.lib.actions.MiddlemanType;
+import com.google.devtools.build.lib.actions.InputMetadataProvider;
 import com.google.devtools.build.lib.collect.nestedset.NestedSet;
 import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
 import com.google.devtools.build.lib.collect.nestedset.Order;
@@ -65,6 +65,7 @@ public class TestAction extends AbstractAction {
   protected final Callable<Void> effect;
   private final NestedSet<Artifact> mandatoryInputs;
   private final ImmutableList<Artifact> optionalInputs;
+  private boolean inputsDiscovered = false;
 
   /** Use this constructor if the effect can't throw exceptions. */
   public TestAction(Runnable effect, NestedSet<Artifact> inputs, ImmutableSet<Artifact> outputs) {
@@ -94,16 +95,43 @@ public class TestAction extends AbstractAction {
   }
 
   @Override
+  protected boolean inputsDiscovered() {
+    return inputsDiscovered;
+  }
+
+  @Override
+  protected void setInputsDiscovered(boolean inputsDiscovered) {
+    this.inputsDiscovered = inputsDiscovered;
+  }
+
+  @Override
+  public NestedSet<Artifact> getOriginalInputs() {
+    return mandatoryInputs;
+  }
+
+  @Override
   public NestedSet<Artifact> getAllowedDerivedInputs() {
     return NestedSetBuilder.<Artifact>wrap(Order.STABLE_ORDER, optionalInputs);
   }
 
   @Override
-  public NestedSet<Artifact> discoverInputs(ActionExecutionContext actionExecutionContext) {
+  public NestedSet<Artifact> discoverInputs(ActionExecutionContext actionExecutionContext)
+      throws ActionExecutionException {
     Preconditions.checkState(discoversInputs(), this);
+    ImmutableList.Builder<Artifact> existingOptionalInputs = ImmutableList.builder();
+    for (Artifact input : optionalInputs) {
+      try {
+        if (input.getPath().exists()) {
+          existingOptionalInputs.add(input);
+        }
+      } catch (IOException e) {
+        DetailedExitCode code = CrashFailureDetails.detailedExitCodeForThrowable(e);
+        throw new ActionExecutionException(
+            "TestAction failed due to exception: " + e.getMessage(), e, this, false, code);
+      }
+    }
     NestedSet<Artifact> discoveredInputs =
-        NestedSetBuilder.wrap(
-            Order.STABLE_ORDER, Iterables.filter(optionalInputs, i -> i.getPath().exists()));
+        NestedSetBuilder.wrap(Order.STABLE_ORDER, existingOptionalInputs.build());
     updateInputs(
         NestedSetBuilder.<Artifact>stableOrder()
             .addTransitive(mandatoryInputs)
@@ -115,19 +143,23 @@ public class TestAction extends AbstractAction {
   @Override
   public ActionResult execute(ActionExecutionContext actionExecutionContext)
       throws ActionExecutionException, InterruptedException {
-    for (Artifact artifact : getInputs().toList()) {
-      // Do not check *.optional artifacts - artifacts with such extension are
-      // used by tests to specify artifacts that may or may not be missing.
-      // This is used, e.g., to test Blaze behavior when action has missing
-      // input artifacts but still is successfully executed.
-      if (!artifact.getPath().exists()) {
-        throw new IllegalStateException("action's input file does not exist: "
-            + artifact.getPath());
-      }
-    }
-
     try {
+      for (Artifact artifact : getInputs().toList()) {
+        // Do not check *.optional artifacts - artifacts with such extension are
+        // used by tests to specify artifacts that may or may not be missing.
+        // This is used, e.g., to test Blaze behavior when action has missing
+        // input artifacts but still is successfully executed.
+        if (!artifact.getPath().exists()) {
+          throw new IllegalStateException(
+              "action's input file does not exist: " + artifact.getPath());
+        }
+      }
+
       effect.call();
+
+      for (Artifact artifact : getOutputs()) {
+        FileSystemUtils.touchFile(artifact.getPath());
+      }
     } catch (RuntimeException | Error | ActionExecutionException | InterruptedException e) {
       throw e;
     } catch (Exception e) {
@@ -136,21 +168,13 @@ public class TestAction extends AbstractAction {
           "TestAction failed due to exception: " + e.getMessage(), e, this, false, code);
     }
 
-    try {
-      for (Artifact artifact : getOutputs()) {
-        FileSystemUtils.touchFile(artifact.getPath());
-      }
-    } catch (IOException e) {
-      throw new AssertionError(e);
-    }
-
     return ActionResult.EMPTY;
   }
 
   @Override
   protected void computeKey(
       ActionKeyContext actionKeyContext,
-      @Nullable Artifact.ArtifactExpander artifactExpander,
+      @Nullable InputMetadataProvider inputMetadataProvider,
       Fingerprint fp) {
     fp.addPaths(Artifact.asSortedPathFragments(getOutputs()));
     fp.addPaths(Artifact.asSortedPathFragments(getMandatoryInputs().toList()));
@@ -161,28 +185,17 @@ public class TestAction extends AbstractAction {
     return "Test";
   }
 
-  /** No-op action that has exactly one output, and can be a middleman action. */
+  /** No-op action that has exactly one output. */
   @AutoCodec
   public static class DummyAction extends TestAction {
-    private final MiddlemanType type;
-
     @AutoCodec.Instantiator
-    public DummyAction(NestedSet<Artifact> inputs, Artifact primaryOutput, MiddlemanType type) {
+    public DummyAction(NestedSet<Artifact> inputs, Artifact primaryOutput) {
       super(NO_EFFECT, inputs, ImmutableSet.of(primaryOutput));
-      this.type = type;
-    }
-
-    public DummyAction(NestedSet<Artifact> inputs, Artifact output) {
-      this(inputs, output, MiddlemanType.NORMAL);
     }
 
     public DummyAction(Artifact input, Artifact output) {
       this(NestedSetBuilder.create(Order.STABLE_ORDER, input), output);
     }
 
-    @Override
-    public MiddlemanType getActionType() {
-      return type;
-    }
   }
 }

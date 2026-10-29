@@ -14,49 +14,80 @@
 
 package com.google.devtools.build.lib.analysis.actions;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.nio.charset.StandardCharsets.ISO_8859_1;
 
+import com.google.common.collect.ImmutableList;
+import com.google.devtools.build.lib.actions.AbstractAction;
 import com.google.devtools.build.lib.actions.ActionExecutionContext;
 import com.google.devtools.build.lib.actions.ArtifactPathResolver;
 import com.google.devtools.build.lib.actions.EnvironmentalExecException;
-import com.google.devtools.build.lib.actions.SpawnContinuation;
-import com.google.devtools.build.lib.server.FailureDetails;
+import com.google.devtools.build.lib.actions.ExecException;
+import com.google.devtools.build.lib.actions.SpawnResult;
+import com.google.devtools.build.lib.server.FailureDetails.Execution;
+import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
+import com.google.devtools.build.lib.util.DeterministicWriter;
 import com.google.devtools.build.lib.util.StringUtilities;
 import java.io.IOException;
+import java.util.List;
+import net.starlark.java.eval.EvalException;
 
-/** Strategy to perform template expansion locally. */
+/**
+ * Strategy to perform template expansion locally and write the result with a given {@link
+ * FileWriteActionContext}.
+ */
 public class LocalTemplateExpansionStrategy implements TemplateExpansionContext {
   public static final Class<LocalTemplateExpansionStrategy> TYPE =
       LocalTemplateExpansionStrategy.class;
 
-  public static LocalTemplateExpansionStrategy INSTANCE = new LocalTemplateExpansionStrategy();
+  private final FileWriteActionContext fileWriteStrategy;
+
+  /**
+   * @param fileWriteStrategy the strategy with which to write the expanded template, independent of
+   *     the {@link FileWriteActionContext} selected for file write actions
+   */
+  public LocalTemplateExpansionStrategy(FileWriteActionContext fileWriteStrategy) {
+    this.fileWriteStrategy = fileWriteStrategy;
+  }
 
   @Override
-  public SpawnContinuation expandTemplate(
-      TemplateExpansionAction action, ActionExecutionContext ctx) throws InterruptedException {
+  public ImmutableList<SpawnResult> expandTemplate(
+      AbstractAction action,
+      ActionExecutionContext ctx,
+      TemplateExpansionContext.TemplateMetadata templateMetadata)
+      throws InterruptedException, ExecException {
     try {
-      final String expandedTemplate = getExpandedTemplateUnsafe(action, ctx.getPathResolver());
-      DeterministicWriter deterministicWriter = out -> out.write(expandedTemplate.getBytes(UTF_8));
-      return ctx.getContext(FileWriteActionContext.class)
-          .beginWriteOutputToFile(
-              action, ctx, deterministicWriter, action.makeExecutable(), /*isRemotable=*/ true);
-    } catch (IOException e) {
-      return SpawnContinuation.failedWithExecException(
-          new EnvironmentalExecException(
-              e, FailureDetails.Execution.Code.LOCAL_TEMPLATE_EXPANSION_FAILURE));
+      final String expandedTemplate =
+          getExpandedTemplateUnsafe(
+              templateMetadata.template(), templateMetadata.substitutions(), ctx.getPathResolver());
+      DeterministicWriter deterministicWriter =
+          out -> out.write(expandedTemplate.getBytes(ISO_8859_1));
+      return fileWriteStrategy.writeOutputToFile(
+          action,
+          ctx,
+          deterministicWriter,
+          templateMetadata.makeExecutable(),
+          /* isRemotable= */ true);
+    } catch (IOException | EvalException e) {
+      throw new EnvironmentalExecException(
+          e,
+          FailureDetail.newBuilder()
+              .setExecution(
+                  Execution.newBuilder().setCode(Execution.Code.LOCAL_TEMPLATE_EXPANSION_FAILURE))
+              .build());
     }
   }
 
   /**
-   * Get the result of the template expansion prior to executing the action.
-   * TODO(b/110418949): Stop public access to this method as it's unhealthy to evaluate the
-   * action result without the action being executed.
+   * Get the result of the template expansion prior to executing the action. TODO(b/110418949): Stop
+   * public access to this method as it's unhealthy to evaluate the action result without the action
+   * being executed.
    */
-  public String getExpandedTemplateUnsafe(TemplateExpansionAction action,
-      ArtifactPathResolver resolver) throws IOException {
+  public static String getExpandedTemplateUnsafe(
+      Template template, List<Substitution> substitutions, ArtifactPathResolver resolver)
+      throws EvalException, IOException, InterruptedException {
     String templateString;
-    templateString = action.getTemplate().getContent(resolver);
-    for (Substitution entry : action.getSubstitutions()) {
+    templateString = template.getContent(resolver);
+    for (Substitution entry : substitutions) {
       templateString =
           StringUtilities.replaceAllLiteral(templateString, entry.getKey(), entry.getValue());
     }

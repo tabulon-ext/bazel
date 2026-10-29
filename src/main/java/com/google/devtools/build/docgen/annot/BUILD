@@ -1,20 +1,22 @@
 load("@rules_java//java:defs.bzl", "java_library")
 
-licenses(["notice"])
-
-package(default_visibility = ["//src:__subpackages__"])
+package(
+    default_applicable_licenses = ["//:license"],
+    default_visibility = ["//visibility:public"],
+)
 
 filegroup(
     name = "srcs",
     srcs = glob(["*"]),
-    visibility = ["//src:__subpackages__"],
+    visibility = ["//visibility:public"],
 )
 
 java_library(
     name = "annot",
     srcs = [
         "DocCategory.java",
-        "DocumentMethods.java",
+        "GlobalMethodDocs.java",
         "StarlarkConstructor.java",
     ],
+    deps = ["//third_party/java/guava:base"],
 )

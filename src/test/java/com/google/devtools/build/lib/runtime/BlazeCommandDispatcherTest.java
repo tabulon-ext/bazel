@@ -15,10 +15,10 @@ package com.google.devtools.build.lib.runtime;
 
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.extensions.proto.ProtoTruth.assertThat;
+import static com.google.devtools.build.lib.bazel.BazelServices.BAZEL_SERVICES;
 import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.util.Arrays.asList;
 import static java.util.concurrent.TimeUnit.SECONDS;
-import static org.junit.Assert.assertThrows;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
@@ -35,7 +35,7 @@ import com.google.devtools.build.lib.events.EventKind;
 import com.google.devtools.build.lib.events.Reporter;
 import com.google.devtools.build.lib.profiler.MemoryProfiler;
 import com.google.devtools.build.lib.profiler.Profiler;
-import com.google.devtools.build.lib.runtime.CommandDispatcher.LockingMode;
+import com.google.devtools.build.lib.runtime.CommandDispatcher.UiVerbosity;
 import com.google.devtools.build.lib.runtime.proto.InvocationPolicyOuterClass.InvocationPolicy;
 import com.google.devtools.build.lib.server.FailureDetails;
 import com.google.devtools.build.lib.server.FailureDetails.BuildProgress;
@@ -57,11 +57,13 @@ import com.google.devtools.common.options.Option;
 import com.google.devtools.common.options.OptionDocumentationCategory;
 import com.google.devtools.common.options.OptionEffectTag;
 import com.google.devtools.common.options.OptionsBase;
+import com.google.devtools.common.options.OptionsClass;
 import com.google.devtools.common.options.OptionsParser;
 import com.google.devtools.common.options.OptionsParsingResult;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.lang.ref.WeakReference;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -93,7 +95,7 @@ public final class BlazeCommandDispatcherTest {
 
   @After
   public void cleanUp() {
-    BugReport.maybePropagateUnprocessedThrowableIfInTest();
+    BugReport.maybePropagateLastCrashIfInTest();
   }
 
   private void initializeRuntimeInternal(BlazeModule... additionalModules) throws Exception {
@@ -101,14 +103,18 @@ public final class BlazeCommandDispatcherTest {
     ServerDirectories serverDirectories =
         new ServerDirectories(
             scratch.dir("install_base"), scratch.dir("output_base"), scratch.dir("user_root"));
+    OptionsParsingResult startupOptionsProvider =
+        OptionsParser.builder().optionsClasses(BlazeServerStartupOptions.class).build();
+    for (var service : BAZEL_SERVICES) {
+      service.globalInit(startupOptionsProvider, BAZEL_SERVICES);
+    }
     // no ConfiguredTargetFactory is needed for testing command dispatch
     BlazeRuntime.Builder builder =
         new BlazeRuntime.Builder()
             .setFileSystem(scratch.getFileSystem())
             .setServerDirectories(serverDirectories)
             .setProductName(productName)
-            .setStartupOptionsProvider(
-                OptionsParser.builder().optionsClasses(BlazeServerStartupOptions.class).build())
+            .setStartupOptionsProvider(startupOptionsProvider)
             .addBlazeModule(
                 new BlazeModule() {
                   @Override
@@ -123,6 +129,9 @@ public final class BlazeCommandDispatcherTest {
                     }
                   }
                 });
+    for (var service : BAZEL_SERVICES) {
+      builder.addBlazeService(service);
+    }
     for (BlazeModule module : additionalModules) {
       builder.addBlazeModule(module);
     }
@@ -132,7 +141,6 @@ public final class BlazeCommandDispatcherTest {
         new BlazeDirectories(
             serverDirectories,
             scratch.dir("scratch"),
-            /* defaultSystemJavabase= */ null,
             productName);
     runtime.initWorkspace(directories, /*binTools=*/null);
     errorOnAfterCommand = null;
@@ -141,36 +149,38 @@ public final class BlazeCommandDispatcherTest {
   @After
   public void stopProfilers() throws Exception {
     // Needs to be done because we are simulating crashes but keeping the jvm alive.
-    Profiler.instance().stop();
-    MemoryProfiler.instance().stop();
+    try {
+      Profiler.instance().stop();
+      MemoryProfiler.instance().stop();
+    } finally {
+      Profiler.setTraceProfilerService(null);
+    }
   }
 
   /** Options for {@link FooCommand}. */
-  public static class FooOptions extends OptionsBase {
+  @OptionsClass
+  public abstract static class FooOptions extends OptionsBase {
 
     @Option(
-      name = "success",
-      documentationCategory = OptionDocumentationCategory.UNCATEGORIZED,
-      effectTags = {OptionEffectTag.NO_OP},
-      defaultValue = "true"
-    )
-    public boolean exitStatus;
+        name = "success",
+        documentationCategory = OptionDocumentationCategory.UNCATEGORIZED,
+        effectTags = {OptionEffectTag.NO_OP},
+        defaultValue = "true")
+    public abstract boolean getExitStatus();
 
     @Option(
-      name = "stdout",
-      documentationCategory = OptionDocumentationCategory.UNCATEGORIZED,
-      effectTags = {OptionEffectTag.NO_OP},
-      defaultValue = ""
-    )
-    public String stdout;
+        name = "stdout",
+        documentationCategory = OptionDocumentationCategory.UNCATEGORIZED,
+        effectTags = {OptionEffectTag.NO_OP},
+        defaultValue = "")
+    public abstract String getStdout();
 
     @Option(
-      name = "stderr",
-      documentationCategory = OptionDocumentationCategory.UNCATEGORIZED,
-      effectTags = {OptionEffectTag.NO_OP},
-      defaultValue = ""
-    )
-    public String stderr;
+        name = "stderr",
+        documentationCategory = OptionDocumentationCategory.UNCATEGORIZED,
+        effectTags = {OptionEffectTag.NO_OP},
+        defaultValue = "")
+    public abstract String getStderr();
   }
 
   @Command(name = "foo", options = {FooOptions.class},
@@ -180,9 +190,9 @@ public final class BlazeCommandDispatcherTest {
     @Override
     public BlazeCommandResult exec(CommandEnvironment env, OptionsParsingResult options) {
       FooOptions fooOptions = options.getOptions(FooOptions.class);
-      env.getReporter().getOutErr().printOut(fooOptions.stdout);
-      env.getReporter().getOutErr().printErr(fooOptions.stderr);
-      if (fooOptions.exitStatus) {
+      env.getReporter().getOutErr().printOut(fooOptions.getStdout());
+      env.getReporter().getOutErr().printErr(fooOptions.getStderr());
+      if (fooOptions.getExitStatus()) {
         return BlazeCommandResult.success();
       } else {
         return BlazeCommandResult.failureDetail(
@@ -244,8 +254,8 @@ public final class BlazeCommandDispatcherTest {
     String[] args = {"foo", "--stdout=Hello, out.",
                      "--stderr=Hello, err.", "--success=false"};
     BlazeCommandResult result = dispatch.exec(Arrays.asList(args), "test", outErr);
-    assertThat(outErr.outAsLatin1()).isEqualTo("Hello, out.");
-    assertThat(outErr.errAsLatin1()).isEqualTo("Hello, err.");
+    assertThat(outErr.outAsLatin1()).endsWith("Hello, out.");
+    assertThat(outErr.errAsLatin1()).endsWith("Hello, err.");
     assertThat(result.getExitCode()).isEqualTo(ExitCode.BUILD_FAILURE);
   }
 
@@ -277,7 +287,8 @@ public final class BlazeCommandDispatcherTest {
     assertThat(crash.getCauses(0).getStackTrace(0)).contains("BlazeCommandDispatcherTest.java");
     assertThat(directResult.getExitCode()).isEqualTo(ExitCode.OOM_ERROR);
     assertThat(directResult.shutdown()).isTrue();
-    assertThrows(OutOfMemoryError.class, BugReport::maybePropagateUnprocessedThrowableIfInTest);
+    assertThat(BugReport.getAndResetLastCrashingThrowableIfInTest())
+        .isInstanceOf(OutOfMemoryError.class);
   }
 
   @Test
@@ -474,11 +485,14 @@ public final class BlazeCommandDispatcherTest {
                     InvocationPolicy.getDefaultInstance(),
                     ImmutableList.of("bar"),
                     outErr,
-                    LockingMode.WAIT,
+                    Duration.ofMillis(Long.MAX_VALUE),
+                    UiVerbosity.NORMAL,
                     "test client",
                     runtime.getClock().currentTimeMillis(),
-                    /*startupOptionsTaggedWithBazelRc=*/ Optional.empty(),
-                    /*commandExtensions=*/ ImmutableList.of()));
+                    /* startupOptionsTaggedWithBazelRc= */ Optional.empty(),
+                    /* idleTaskResultsSupplier= */ () -> ImmutableList.of(),
+                    /* commandExtensions= */ ImmutableList.of(),
+                    /* commandExtensionReporter= */ (ext) -> {}));
 
     try {
       blockCommandThread.start();
@@ -497,6 +511,45 @@ public final class BlazeCommandDispatcherTest {
       // We don't care what happened on the threads, don't assert state to make sure we join both.
       blockCommandThread.join();
       blockedCommandThread.join();
+    }
+  }
+
+  @Test
+  public void testBlockForLockTimeoutExpires() throws Exception {
+    BlockCommand blockCommand = new BlockCommand();
+    runtime.overrideCommands(ImmutableList.of(blockCommand, bar));
+    BlazeCommandDispatcher dispatch = new BlazeCommandDispatcher(runtime, /* serverPid= */ 42);
+
+    Thread blockCommandThread =
+        new TestThread(
+            () ->
+                dispatch.exec(ImmutableList.of("block"), "blocking client", new RecordingOutErr()));
+    try {
+      blockCommandThread.start();
+      blockCommand.awaitRunning();
+
+      BlazeCommandResult result =
+          dispatch.exec(
+              InvocationPolicy.getDefaultInstance(),
+              ImmutableList.of("bar"),
+              outErr,
+              Duration.ofMillis(50),
+              UiVerbosity.NORMAL,
+              "test client",
+              runtime.getClock().currentTimeMillis(),
+              /* startupOptionsTaggedWithBazelRc= */ Optional.empty(),
+              /* idleTaskResultsSupplier= */ () -> ImmutableList.of(),
+              /* commandExtensions= */ ImmutableList.of(),
+              /* commandExtensionReporter= */ (ext) -> {});
+
+      assertThat(result.getExitCode()).isEqualTo(ExitCode.LOCK_HELD_NOBLOCK_FOR_LOCK);
+      assertThat(outErr.errAsLatin1())
+          .contains(
+              "Another command (blocking client) is running. Exiting because --block_for_lock=50ms"
+                  + " timeout expired.");
+    } finally {
+      blockCommand.unblock();
+      blockCommandThread.join();
     }
   }
 
@@ -557,7 +610,7 @@ public final class BlazeCommandDispatcherTest {
     assertThat(outErr.outAsLatin1()).isEqualTo("stdout");
     // TODO(bazel-team): Fix inconsistent line breaks that make the regex match necessary.
     assertThat(outErr.errAsLatin1())
-        .matches(
+        .containsMatch(
             "INFO: Reading rc options for 'foo' from /home/jrluser/.blazerc:\\s+"
                 + "  'foo' options: --stdout stdout --stderr stderr\\s+"
                 + "stderr");
@@ -577,7 +630,11 @@ public final class BlazeCommandDispatcherTest {
     assertThat(result.getExitCode()).isEqualTo(ExitCode.COMMAND_LINE_ERROR);
   }
 
-  @Command(name = "wiz", inherits = {FooCommand.class}, shortDescription = "", help = "")
+  @Command(
+      name = "wiz",
+      inheritsOptionsFrom = {FooCommand.class},
+      shortDescription = "",
+      help = "")
   private static class WizCommand extends FooCommand {}
 
   @Test
@@ -600,7 +657,7 @@ public final class BlazeCommandDispatcherTest {
     assertThat(outErr.outAsLatin1()).isEqualTo("stdout");
     // TODO(bazel-team): Fix inconsistent line breaks that make the regex match necessary.
     assertThat(outErr.errAsLatin1())
-        .matches(
+        .containsMatch(
             "INFO: Reading rc options for 'wiz' from /home/jrluser/.blazerc:\\s+"
                 + "  Inherited 'foo' options: --stdout stdout --stderr stderr\\s+"
                 + "stderr");
@@ -700,6 +757,118 @@ public final class BlazeCommandDispatcherTest {
     dispatcher.exec(ImmutableList.of("retain_out_err"), "test", outErr);
 
     GcFinalization.awaitClear(cmd.reporterRef);
+  }
+
+  @Test
+  public void useHighestPriorityExitCode() throws Exception {
+    DetailedExitCode arbitraryError1 =
+        DetailedExitCode.of(
+            FailureDetail.newBuilder()
+                .setMessage("This error message should be overwritten.")
+                .setCommand(
+                    FailureDetails.Command.newBuilder()
+                        .setCode(FailureDetails.Command.Code.COMMAND_NOT_FOUND))
+                .build());
+    DetailedExitCode infrastructureFailure =
+        DetailedExitCode.of(
+            FailureDetail.newBuilder()
+                .setMessage("This is an infrastructure failure so this error should take priority.")
+                .setCommand(
+                    FailureDetails.Command.newBuilder()
+                        .setCode(
+                            FailureDetails.Command.Code
+                                .STARLARK_CPU_PROFILE_FILE_INITIALIZATION_FAILURE))
+                .build());
+    DetailedExitCode arbitraryError2 =
+        DetailedExitCode.of(
+            FailureDetail.newBuilder()
+                .setMessage("This error message should be overrwritten.")
+                .setCommand(
+                    FailureDetails.Command.newBuilder()
+                        .setCode(FailureDetails.Command.Code.INVOCATION_POLICY_INVALID))
+                .build());
+    initializeRuntimeInternal(
+        new BlazeModule() {
+          @Override
+          public void beforeCommand(CommandEnvironment env) throws AbruptExitException {
+            throw new AbruptExitException(arbitraryError1);
+          }
+        },
+        new BlazeModule() {
+          @Override
+          public void beforeCommand(CommandEnvironment env) throws AbruptExitException {
+            throw new AbruptExitException(infrastructureFailure);
+          }
+        },
+        new BlazeModule() {
+          @Override
+          public void beforeCommand(CommandEnvironment env) throws AbruptExitException {
+            throw new AbruptExitException(arbitraryError2);
+          }
+        });
+    runtime.overrideCommands(ImmutableList.of(foo));
+    BlazeCommandDispatcher dispatch = new BlazeCommandDispatcher(runtime);
+    BlazeCommandResult result =
+        dispatch.exec(Arrays.asList("foo", "--config=UNDEFINED_CONFIG_VALUE"), "test", outErr);
+    assertThat(result.getExitCode()).isEqualTo(ExitCode.LOCAL_ENVIRONMENTAL_ERROR);
+    assertThat(result.getExitCode().isInfrastructureFailure()).isTrue();
+    assertThat(result.getDetailedExitCode()).isEqualTo(infrastructureFailure);
+    assertThat(outErr.errAsLatin1())
+        .contains("This is an infrastructure failure so this error should take priority.");
+  }
+
+  @Test
+  public void useFirstExitCodeIfAllHaveEquivalentPriority() throws Exception {
+    // The options parsing failure should be encountered first.
+    DetailedExitCode optionsParseFailure =
+        DetailedExitCode.of(
+            FailureDetail.newBuilder()
+                .setMessage(
+                    "Error parsing options: Config value \'UNDEFINED_CONFIG_VALUE\' is not defined"
+                        + " in any .rc file")
+                .setCommand(
+                    FailureDetails.Command.newBuilder()
+                        .setCode(FailureDetails.Command.Code.OPTIONS_PARSE_FAILURE))
+                .build());
+    DetailedExitCode arbitraryError1 =
+        DetailedExitCode.of(
+            FailureDetail.newBuilder()
+                .setMessage("This error message should be overrwritten.")
+                .setCommand(
+                    FailureDetails.Command.newBuilder()
+                        // Arbitrarily chosen error code.
+                        .setCode(FailureDetails.Command.Code.INVOCATION_POLICY_INVALID))
+                .build());
+    DetailedExitCode arbitraryError2 =
+        DetailedExitCode.of(
+            FailureDetail.newBuilder()
+                .setMessage("This error message should be overwritten.")
+                .setCommand(
+                    FailureDetails.Command.newBuilder()
+                        // Arbitrarily chosen error code.
+                        .setCode(FailureDetails.Command.Code.COMMAND_NOT_FOUND))
+                .build());
+    initializeRuntimeInternal(
+        new BlazeModule() {
+          @Override
+          public void beforeCommand(CommandEnvironment env) throws AbruptExitException {
+            throw new AbruptExitException(arbitraryError1);
+          }
+        },
+        new BlazeModule() {
+          @Override
+          public void beforeCommand(CommandEnvironment env) throws AbruptExitException {
+            throw new AbruptExitException(arbitraryError2);
+          }
+        });
+    runtime.overrideCommands(ImmutableList.of(foo));
+    BlazeCommandDispatcher dispatch = new BlazeCommandDispatcher(runtime);
+    BlazeCommandResult result =
+        dispatch.exec(Arrays.asList("foo", "--config=UNDEFINED_CONFIG_VALUE"), "test", outErr);
+    assertThat(result.getExitCode()).isEqualTo(ExitCode.COMMAND_LINE_ERROR);
+    assertThat(result.getDetailedExitCode()).isEqualTo(optionsParseFailure);
+    assertThat(outErr.errAsLatin1())
+        .contains("Config value 'UNDEFINED_CONFIG_VALUE' is not defined in any .rc file");
   }
 
   @Command(

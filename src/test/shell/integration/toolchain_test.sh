@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright 2017 The Bazel Authors. All rights reserved.
 #
@@ -44,9 +44,9 @@ source "$(rlocation "io_bazel/src/test/shell/integration_test_setup.sh")" \
 
 function set_up() {
   create_new_workspace
-  # Clean out the WORKSPACE file.
-  rm WORKSPACE
-  touch WORKSPACE
+  # Clean out the MODULE.bazel file.
+  rm -f $TOOLCHAIN_REGISTRATION_FILE
+  setup_module_dot_bazel "MODULE.bazel"
 
   # Create shared report rule for printing toolchain info.
   mkdir -p report
@@ -91,9 +91,14 @@ ${toolchain_name} = rule(
 )
 EOF
 
+  if [[ ! -e "${pkg}/toolchain/BUILD" ]]; then
+    cat > "${pkg}/toolchain/BUILD" <<EOF
+package(default_visibility = ["//visibility:public"])
+EOF
+  fi
+
   cat >> "${pkg}/toolchain/BUILD" <<EOF
-toolchain_type(name = '${toolchain_name}',
-    visibility = ['//visibility:public'])
+toolchain_type(name = '${toolchain_name}')
 EOF
 }
 
@@ -143,6 +148,7 @@ ${aspect_name} = aspect(
     implementation = _impl,
     attrs = {},
     toolchains = ['//${pkg}/toolchain:${toolchain_name}'],
+    apply_to_generating_rules = True,
 )
 EOF
 }
@@ -150,12 +156,20 @@ EOF
 function write_register_toolchain() {
   local pkg="${1}"
   local toolchain_name="${2:-test_toolchain}"
+  local exec_compatible_with="${3:-"[]"}"
+  local target_compatible_with="${4:-"[]"}"
 
-  cat >> WORKSPACE <<EOF
+  cat >> $TOOLCHAIN_REGISTRATION_FILE <<EOF
 register_toolchains('//register/${pkg}:${toolchain_name}_1')
 EOF
 
   mkdir -p "register/${pkg}"
+
+  if [[ ! -e "register/${pkg}/BUILD" ]]; then
+    cat > "register/${pkg}/BUILD" <<EOF
+package(default_visibility = ["//visibility:public"])
+EOF
+  fi
   cat >> "register/${pkg}/BUILD" <<EOF
 load('//${pkg}/toolchain:toolchain_${toolchain_name}.bzl', '${toolchain_name}')
 
@@ -165,16 +179,16 @@ ${toolchain_name}(
     name = '${toolchain_name}_impl_1',
     extra_label = ':dep_rule_${toolchain_name}',
     extra_str = 'foo from ${toolchain_name}',
-    visibility = ['//visibility:public'])
+)
 
 # Declare the toolchain.
 toolchain(
     name = '${toolchain_name}_1',
     toolchain_type = '//${pkg}/toolchain:${toolchain_name}',
-    exec_compatible_with = [],
-    target_compatible_with = [],
+    exec_compatible_with = ${exec_compatible_with},
+    target_compatible_with = ${target_compatible_with},
     toolchain = ':${toolchain_name}_impl_1',
-    visibility = ['//visibility:public'])
+)
 EOF
 }
 
@@ -186,6 +200,8 @@ function test_toolchain_provider() {
   cat > "${pkg}/BUILD" <<EOF
 load('//${pkg}/toolchain:toolchain_test_toolchain.bzl', 'test_toolchain')
 load('//report:report.bzl', 'report_toolchain')
+
+package(default_visibility = ["//visibility:public"])
 
 filegroup(name = 'dep_rule')
 test_toolchain(
@@ -201,7 +217,7 @@ report_toolchain(
 EOF
 
   bazel build "//${pkg}:report" &> $TEST_log || fail "Build failed"
-  expect_log "extra_label = \"//${pkg}:dep_rule\""
+  expect_log "extra_label = \"@@\?//${pkg}:dep_rule\""
   expect_log 'extra_str = "bar"'
 }
 
@@ -214,6 +230,7 @@ function test_toolchain_use_in_rule {
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+package(default_visibility = ["//visibility:public"])
 # Use the toolchain.
 use_toolchain(
     name = 'use',
@@ -233,17 +250,19 @@ function test_toolchain_alias_use_in_rule {
   cat > "${pkg}/BUILD" <<EOF
 load('//${pkg}/toolchain:toolchain_test_toolchain.bzl', 'test_toolchain')
 
+package(default_visibility = ["//visibility:public"])
+
 # Define the toolchain.
 filegroup(name = 'dep_rule_test_toolchain')
 test_toolchain(
     name = 'test_toolchain_impl_1',
     extra_label = ':dep_rule_test_toolchain',
     extra_str = 'foo from test_toolchain',
-    visibility = ['//visibility:public'])
+)
 alias(
     name = 'test_toolchain_impl_1_alias',
     actual = ':test_toolchain_impl_1',
-    visibility = ['//visibility:public'])
+)
 
 # Declare the toolchain.
 toolchain(
@@ -252,12 +271,15 @@ toolchain(
     exec_compatible_with = [],
     target_compatible_with = [],
     toolchain = ':test_toolchain_impl_1_alias',
-    visibility = ['//visibility:public'])
+)
 EOF
 
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 use_toolchain(
     name = 'use',
@@ -279,21 +301,23 @@ function test_toolchain_alias_chain_use_in_rule {
   cat > "${pkg}/BUILD" <<EOF
 load('//${pkg}/toolchain:toolchain_test_toolchain.bzl', 'test_toolchain')
 
+package(default_visibility = ["//visibility:public"])
+
 # Define the toolchain.
 filegroup(name = 'dep_rule_test_toolchain')
 test_toolchain(
     name = 'test_toolchain_impl_1',
     extra_label = ':dep_rule_test_toolchain',
     extra_str = 'foo from test_toolchain',
-    visibility = ['//visibility:public'])
+)
 alias(
     name = 'test_toolchain_impl_1_alias_alpha',
     actual = ':test_toolchain_impl_1',
-    visibility = ['//visibility:public'])
+)
 alias(
     name = 'test_toolchain_impl_1_alias_beta',
     actual = ':test_toolchain_impl_1_alias_alpha',
-    visibility = ['//visibility:public'])
+)
 
 # Declare the toolchain.
 toolchain(
@@ -302,12 +326,15 @@ toolchain(
     exec_compatible_with = [],
     target_compatible_with = [],
     toolchain = ':test_toolchain_impl_1_alias_beta',
-    visibility = ['//visibility:public'])
+)
 EOF
 
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 use_toolchain(
     name = 'use',
@@ -328,10 +355,12 @@ function test_toolchain_type_alias_use_in_toolchain {
   # Create an alias for the toolchain type.
   mkdir -p "${pkg}/alias"
   cat > "${pkg}/alias/BUILD" <<EOF
+package(default_visibility = ["//visibility:public"])
+
 alias(
     name = 'toolchain_type',
     actual = '//${pkg}/toolchain:test_toolchain',
-    visibility = ['//visibility:public'])
+)
 EOF
 
   # Use the alias.
@@ -339,13 +368,15 @@ EOF
   cat > "${pkg}/BUILD" <<EOF
 load('//${pkg}/toolchain:toolchain_test_toolchain.bzl', 'test_toolchain')
 
+package(default_visibility = ["//visibility:public"])
+
 # Define the toolchain.
 filegroup(name = 'dep_rule_test_toolchain')
 test_toolchain(
     name = 'test_toolchain_impl_1',
     extra_label = ':dep_rule_test_toolchain',
     extra_str = 'foo from test_toolchain',
-    visibility = ['//visibility:public'])
+)
 
 # Declare the toolchain.
 toolchain(
@@ -354,13 +385,16 @@ toolchain(
     exec_compatible_with = [],
     target_compatible_with = [],
     toolchain = ':test_toolchain_impl_1',
-    visibility = ['//visibility:public'])
+)
 EOF
 
   # The rule uses the original, non-aliased type.
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 use_toolchain(
     name = 'use',
@@ -381,10 +415,12 @@ function test_toolchain_type_alias_use_in_rule {
   # Create an alias for the toolchain type.
   mkdir -p "${pkg}/alias"
   cat > "${pkg}/alias/BUILD" <<EOF
+package(default_visibility = ["//visibility:public"])
+
 alias(
     name = 'toolchain_type',
     actual = '//${pkg}/toolchain:test_toolchain',
-    visibility = ['//visibility:public'])
+)
 EOF
 
   # Use the alias in a rule.
@@ -409,6 +445,9 @@ EOF
 
   cat > "${pkg}/demo/BUILD" <<EOF
 load(':aliased_rule.bzl', 'aliased_rule')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 aliased_rule(
     name = 'use',
@@ -429,6 +468,9 @@ function test_toolchain_use_in_rule_missing {
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 use_toolchain(
     name = 'use',
@@ -436,7 +478,74 @@ use_toolchain(
 EOF
 
   bazel build "//${pkg}/demo:use" &> $TEST_log && fail "Build failure expected"
-  expect_log "While resolving toolchains for target //${pkg}/demo:use: no matching toolchains found for types //${pkg}/toolchain:test_toolchain"
+  expect_log "While resolving toolchains for target //${pkg}/demo:use"
+  expect_log "No matching toolchains found for target platform"
+  expect_log "  //${pkg}/toolchain:test_toolchain$"
+}
+
+function test_toolchain_use_in_rule_missing_with_custom_toolchain_type_error {
+  local -r pkg="${FUNCNAME[0]}"
+  write_test_toolchain "${pkg}" test_toolchain_with_message
+  cat > "${pkg}/toolchain/BUILD" <<EOF
+toolchain_type(
+    name = 'test_toolchain_with_message',
+    no_match_error = 'Go register a toolchain!',
+)
+EOF
+  write_test_rule "${pkg}" use_toolchain test_toolchain_with_message
+  # Do not register test_toolchain_with_message to trigger the error.
+
+  mkdir -p "${pkg}/demo"
+  cat > "${pkg}/demo/BUILD" <<EOF
+load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
+# Use the toolchain.
+use_toolchain(
+    name = 'use',
+    message = 'this is the rule')
+EOF
+
+  bazel build "//${pkg}/demo:use" &> $TEST_log && fail "Build failure expected"
+  expect_log "While resolving toolchains for target //${pkg}/demo:use"
+  expect_log "No matching toolchains found for target platform"
+  expect_log "//${pkg}/toolchain:test_toolchain_with_message: Go register a toolchain!"
+}
+
+function test_toolchain_use_in_rule_missing_with_custom_platform_error {
+  local -r pkg="${FUNCNAME[0]}"
+  write_test_toolchain "${pkg}"
+  write_test_rule "${pkg}"
+  #rite_register_toolchain
+  # Do not register test_toolchain to trigger the error.
+
+  # Use a custom platform.
+  mkdir -p "${pkg}/platforms"
+  cat > "${pkg}/platforms/BUILD" <<EOF
+platform(
+    name = "custom_message",
+    missing_toolchain_error = "Check custom docs for setup instructions",
+)
+EOF
+
+  mkdir -p "${pkg}/demo"
+  cat > "${pkg}/demo/BUILD" <<EOF
+load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
+# Use the toolchain.
+use_toolchain(
+    name = 'use',
+    message = 'this is the rule')
+EOF
+
+  bazel build \
+    --platforms="//${pkg}/platforms:custom_message" \
+    "//${pkg}/demo:use" &> $TEST_log && fail "Build failure expected"
+  expect_log "Check custom docs for setup instructions"
+  expect_not_log "see https://bazel.build/concepts/platforms-intro"
 }
 
 function test_multiple_toolchain_use_in_rule {
@@ -474,6 +583,9 @@ EOF
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchains.bzl', 'use_toolchains')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 use_toolchains(
     name = 'use',
@@ -482,6 +594,53 @@ EOF
 
   bazel build "//${pkg}/demo:use" &> $TEST_log || fail "Build failed"
   expect_log 'Using toolchain: rule message: "this is the rule", toolchain 1 extra_str: "foo from test_toolchain_1", toolchain 2 extra_str: "foo from test_toolchain_2"'
+}
+
+function test_multiple_toolchain_use_in_rule_with_optional_missing {
+  local -r pkg="${FUNCNAME[0]}"
+  write_test_toolchain "${pkg}" test_toolchain_1
+  write_test_toolchain "${pkg}" test_toolchain_2
+
+  write_register_toolchain "${pkg}" test_toolchain_1
+
+  # The rule uses two separate toolchains.
+  mkdir -p "${pkg}/toolchain"
+  cat > "${pkg}/toolchain/rule_use_toolchains.bzl" <<EOF
+def _impl(ctx):
+  toolchain_1 = ctx.toolchains['//${pkg}/toolchain:test_toolchain_1']
+  toolchain_2 = ctx.toolchains['//${pkg}/toolchain:test_toolchain_2']
+  message = ctx.attr.message
+  print(
+      'Using toolchain: rule message: "%s", toolchain 1 extra_str: "%s", toolchain 2 is none: %s' %
+         (message, toolchain_1.extra_str, toolchain_2 == None))
+  return []
+
+use_toolchains = rule(
+    implementation = _impl,
+    attrs = {
+        'message': attr.string(),
+    },
+    toolchains = [
+        '//${pkg}/toolchain:test_toolchain_1',
+        config_common.toolchain_type('//${pkg}/toolchain:test_toolchain_2', mandatory = False),
+    ],
+)
+EOF
+
+  mkdir -p "${pkg}/demo"
+  cat > "${pkg}/demo/BUILD" <<EOF
+load('//${pkg}/toolchain:rule_use_toolchains.bzl', 'use_toolchains')
+
+package(default_visibility = ["//visibility:public"])
+
+# Use the toolchain.
+use_toolchains(
+    name = 'use',
+    message = 'this is the rule')
+EOF
+
+  bazel build "//${pkg}/demo:use" &> $TEST_log || fail "Build failed"
+  expect_log 'Using toolchain: rule message: "this is the rule", toolchain 1 extra_str: "foo from test_toolchain_1", toolchain 2 is none: True'
 }
 
 function test_multiple_toolchain_use_in_rule_one_missing {
@@ -519,6 +678,9 @@ EOF
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchains.bzl', 'use_toolchains')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 use_toolchains(
     name = 'use',
@@ -526,7 +688,9 @@ use_toolchains(
 EOF
 
   bazel build "//${pkg}/demo:use" &> $TEST_log && fail "Build failure expected"
-  expect_log "While resolving toolchains for target //${pkg}/demo:use: no matching toolchains found for types //${pkg}/toolchain:test_toolchain_2"
+  expect_log "While resolving toolchains for target //${pkg}/demo:use"
+  expect_log "No matching toolchains found for target platform"
+  expect_log "//${pkg}/toolchain:test_toolchain_2"
 }
 
 function test_toolchain_use_in_rule_non_required_toolchain {
@@ -559,6 +723,9 @@ EOF
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 use_toolchain(
     name = 'use',
@@ -578,6 +745,24 @@ function test_toolchain_debug_messages {
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+load('//${pkg}/toolchain:toolchain_test_toolchain.bzl', 'test_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
+# Define a toolchain that can't be used due to the target_settings
+test_toolchain(
+    name = 'toolchain_impl_invalid',
+)
+config_setting(
+    name = "optimized",
+    values = {"compilation_mode": "opt"}
+)
+toolchain(
+    name = 'toolchain_invalid',
+    toolchain_type = '//${pkg}/toolchain:test_toolchain',
+    target_settings = [":optimized"],
+    toolchain = ':toolchain_impl_invalid')
+
 # Use the toolchain.
 use_toolchain(
     name = 'use',
@@ -585,11 +770,17 @@ use_toolchain(
 EOF
 
   bazel build \
+    --extra_toolchains="//${pkg}/demo:toolchain_invalid" \
     --toolchain_resolution_debug=toolchain:test_toolchain \
-    --incompatible_auto_configure_host_platform \
+    --platform_mappings= \
     "//${pkg}/demo:use" &> $TEST_log || fail "Build failed"
-  expect_log "ToolchainResolution:   Type //${pkg}/toolchain:test_toolchain: target platform ${default_host_platform}: execution ${default_host_platform}: Selected toolchain //register/${pkg}:test_toolchain_impl_1"
-  expect_log "ToolchainResolution: Target platform ${default_host_platform}: Selected execution platform ${default_host_platform}, type //${pkg}/toolchain:test_toolchain -> toolchain //register/${pkg}:test_toolchain_impl_1"
+  expect_log "Performing resolution of //${pkg}/toolchain:test_toolchain for target platform ${default_host_platform}"
+  expect_log "Rejected toolchain //${pkg}/demo:toolchain_invalid; mismatching target_settings: optimized"
+  expect_log "Toolchain //register/${pkg}:test_toolchain_1 (resolves to //register/${pkg}:test_toolchain_impl_1) is compatible with target platform, searching for execution platforms:"
+  expect_log "Compatible execution platform ${default_host_platform}"
+  expect_log "Recap of selected //${pkg}/toolchain:test_toolchain toolchains for target platform ${default_host_platform}:"
+  expect_log "Selected //register/${pkg}:test_toolchain_impl_1 to run on execution platform ${default_host_platform}"
+  expect_log "Target platform ${default_host_platform}: Selected execution platform ${default_host_platform}, type //${pkg}/toolchain:test_toolchain -> toolchain //register/${pkg}:test_toolchain_impl_1"
   expect_log 'Using toolchain: rule message: "this is the rule", toolchain extra_str: "foo from test_toolchain"'
 }
 
@@ -602,6 +793,9 @@ function test_toolchain_debug_messages_target {
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 use_toolchain(
     name = 'use',
@@ -610,9 +804,13 @@ EOF
 
   bazel build \
     --toolchain_resolution_debug=demo:use \
-    --incompatible_auto_configure_host_platform \
+    --platform_mappings= \
     "//${pkg}/demo:use" &> $TEST_log || fail "Build failed"
-  expect_log "ToolchainResolution:   Type //${pkg}/toolchain:test_toolchain: target platform ${default_host_platform}: execution ${default_host_platform}: Selected toolchain //register/${pkg}:test_toolchain_impl_1"
+  expect_log "Performing resolution of //${pkg}/toolchain:test_toolchain for target platform ${default_host_platform}"
+  expect_log "Toolchain //register/${pkg}:test_toolchain_1 (resolves to //register/${pkg}:test_toolchain_impl_1) is compatible with target platform, searching for execution platforms:"
+  expect_log "Compatible execution platform ${default_host_platform}"
+  expect_log "Recap of selected //${pkg}/toolchain:test_toolchain toolchains for target platform ${default_host_platform}:"
+  expect_log "Selected //register/${pkg}:test_toolchain_impl_1 to run on execution platform ${default_host_platform}"
   expect_log "ToolchainResolution: Target platform ${default_host_platform}: Selected execution platform ${default_host_platform}, type //${pkg}/toolchain:test_toolchain -> toolchain //register/${pkg}:test_toolchain_impl_1"
   expect_log 'Using toolchain: rule message: "this is the rule", toolchain extra_str: "foo from test_toolchain"'
 }
@@ -637,6 +835,9 @@ demo = rule(
 EOF
   cat > "${pkg}/demo/BUILD" <<EOF
 load(':demo.bzl', 'demo')
+
+package(default_visibility = ["//visibility:public"])
+
 demo(
     name = 'use',
     message = 'bar from demo')
@@ -645,6 +846,45 @@ EOF
   bazel build \
     --aspects //${pkg}/toolchain:aspect_use_toolchain.bzl%use_toolchain \
     "//${pkg}/demo:use" &> $TEST_log || fail "Build failed"
+  expect_log 'Using toolchain in aspect: rule message: "bar from demo", toolchain extra_str: "foo from test_toolchain"'
+}
+
+function test_toolchain_use_in_aspect_with_output_file {
+  local -r pkg="${FUNCNAME[0]}"
+  write_test_toolchain "${pkg}"
+  write_test_aspect "${pkg}"
+  write_register_toolchain "${pkg}"
+
+  mkdir -p "${pkg}/demo"
+  cat > "${pkg}/demo/demo.bzl" <<EOF
+def _impl(ctx):
+    output = ctx.outputs.out
+    ctx.actions.write(output = output, content = ctx.attr.message)
+
+demo = rule(
+    implementation = _impl,
+    attrs = {
+        'message': attr.string(),
+        'out': attr.output(),
+    }
+)
+EOF
+  cat > "${pkg}/demo/BUILD" <<EOF
+load(':demo.bzl', 'demo')
+
+package(default_visibility = ["//visibility:public"])
+
+demo(
+    name = 'use',
+    message = 'bar from demo',
+    out = 'use.log',
+)
+EOF
+
+  # Also test aspects executing on an output file.
+  bazel build \
+    --aspects //${pkg}/toolchain:aspect_use_toolchain.bzl%use_toolchain \
+    "//${pkg}/demo:use.log" &> $TEST_log || fail "Build failed"
   expect_log 'Using toolchain in aspect: rule message: "bar from demo", toolchain extra_str: "foo from test_toolchain"'
 }
 
@@ -687,6 +927,9 @@ demo = rule(
 EOF
   cat > "${pkg}/demo/BUILD" <<EOF
 load(':demo.bzl', 'demo')
+
+package(default_visibility = ["//visibility:public"])
+
 demo(
     name = 'use',
     message = 'bar from demo')
@@ -703,13 +946,16 @@ function test_toolchain_constraints() {
   write_test_toolchain "${pkg}"
   write_test_rule "${pkg}"
 
-  cat > WORKSPACE <<EOF
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
 register_toolchains('//${pkg}:toolchain_1')
 register_toolchains('//${pkg}:toolchain_2')
 EOF
 
   cat > "${pkg}/BUILD" <<EOF
 load('//${pkg}/toolchain:toolchain_test_toolchain.bzl', 'test_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
 
 # Define constraints.
 constraint_setting(name = 'setting')
@@ -719,11 +965,11 @@ constraint_value(name = 'value2', constraint_setting = ':setting')
 platform(
     name = 'platform1',
     constraint_values = [':value1'],
-    visibility = ['//visibility:public'])
+)
 platform(
     name = 'platform2',
     constraint_values = [':value2'],
-    visibility = ['//visibility:public'])
+)
 
 # Define the toolchain.
 filegroup(name = 'dep_rule')
@@ -731,12 +977,12 @@ test_toolchain(
     name = 'toolchain_impl_1',
     extra_label = ':dep_rule',
     extra_str = 'foo from 1',
-    visibility = ['//visibility:public'])
+)
 test_toolchain(
     name = 'toolchain_impl_2',
     extra_label = ':dep_rule',
     extra_str = 'foo from 2',
-    visibility = ['//visibility:public'])
+)
 
 # Declare the toolchain.
 toolchain(
@@ -756,6 +1002,9 @@ EOF
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 use_toolchain(
     name = 'use',
@@ -781,7 +1030,9 @@ EOF
     --host_platform="//${pkg}:platform1" \
     --platforms="//${pkg}:platform1" \
     "//${pkg}/demo:use" &> $TEST_log && fail "Build failure expected"
-  expect_log "While resolving toolchains for target //${pkg}/demo:use: no matching toolchains found for types //${pkg}/toolchain:test_toolchain"
+  expect_log "While resolving toolchains for target //${pkg}/demo:use"
+  expect_log "No matching toolchains found for target platform"
+  expect_log "//${pkg}/toolchain:test_toolchain"
   expect_not_log 'Using toolchain: rule message:'
 }
 
@@ -791,13 +1042,16 @@ function test_register_toolchain_error_invalid_label() {
   write_test_rule "${pkg}"
   write_register_toolchain "${pkg}"
 
-  cat > WORKSPACE <<EOF
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
 register_toolchains('/:invalid:label:syntax')
 EOF
 
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 use_toolchain(
     name = 'use',
@@ -805,7 +1059,10 @@ use_toolchain(
 EOF
 
   bazel build "//${pkg}/demo:use" &> $TEST_log && fail "Build failure expected"
-  expect_log "error parsing target pattern \"/:invalid:label:syntax\": not a valid absolute pattern"
+
+  expect_log "Expected absolute target patterns (must begin with '//'"
+  # Bazel's error message has an extra "or '@'" here
+  expect_log ") for 'register_toolchains' argument, but got '/:invalid:label:syntax'"
 }
 
 function test_register_toolchain_error_invalid_target() {
@@ -813,13 +1070,16 @@ function test_register_toolchain_error_invalid_target() {
   write_test_toolchain "${pkg}"
   write_test_rule "${pkg}"
 
-  cat > WORKSPACE <<EOF
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
 register_toolchains('//${pkg}/demo:not_a_target')
 EOF
 
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 use_toolchain(
     name = 'use',
@@ -827,7 +1087,10 @@ use_toolchain(
 EOF
 
   bazel build "//${pkg}/demo:use" &> $TEST_log && fail "Build failure expected"
-  expect_log "While resolving toolchains for target //${pkg}/demo:use: invalid registered toolchain '//${pkg}/demo:not_a_target': no such target '//${pkg}/demo:not_a_target': target 'not_a_target' not declared in package '${pkg}/demo'"
+  expect_log "While resolving toolchains for target //${pkg}/demo:use"
+  expect_log "invalid registered toolchain '//${pkg}/demo:not_a_target'"
+  expect_log "no such target '//${pkg}/demo:not_a_target'"
+  expect_log "target 'not_a_target' not declared in package '${pkg}/demo'"
 }
 
 function test_register_toolchain_error_target_not_a_toolchain() {
@@ -835,7 +1098,7 @@ function test_register_toolchain_error_target_not_a_toolchain() {
   write_test_toolchain "${pkg}"
   write_test_rule "${pkg}"
 
-  cat > WORKSPACE <<EOF
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
 register_toolchains('//${pkg}/demo:invalid')
 EOF
 
@@ -844,6 +1107,8 @@ EOF
 INVALID
 EOF
   cat > "${pkg}/demo/BUILD" <<EOF
+package(default_visibility = ["//visibility:public"])
+
 filegroup(
     name = "invalid",
     srcs = ["out.log"],
@@ -857,13 +1122,15 @@ use_toolchain(
 EOF
 
   bazel build "//${pkg}/demo:use" &> $TEST_log && fail "Build failure expected"
-  expect_log "While resolving toolchains for target //${pkg}/demo:use: invalid registered toolchain '//${pkg}/demo:invalid': target does not provide the DeclaredToolchainInfo provider"
+  expect_log "While resolving toolchains for target //${pkg}/demo:use"
+  expect_log "invalid registered toolchain '//${pkg}/demo:invalid'"
+  expect_log "target does not provide the DeclaredToolchainInfo provider"
 }
 
 
 function test_register_toolchain_error_invalid_pattern() {
   local -r pkg="${FUNCNAME[0]}"
-  cat > WORKSPACE <<EOF
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
 register_toolchains('//${pkg}:bad1')
 register_toolchains('//${pkg}:bad2')
 EOF
@@ -882,13 +1149,64 @@ EOF
 
   cat > "${pkg}/BUILD" <<EOF
 load(":rules.bzl", "foo")
+
+package(default_visibility = ["//visibility:public"])
+
 toolchain_type(name = 'dummy')
 foo(name = "foo")
 EOF
 
   bazel build "//${pkg}:foo" &> $TEST_log && fail "Build failure expected"
   # It's uncertain which error will happen first, so handle either.
-  expect_log "While resolving toolchains for target //${pkg}:foo: invalid registered toolchain '//${pkg}:bad[12]': no such target"
+  expect_log "While resolving toolchains for target //${pkg}:foo"
+  expect_log "invalid registered toolchain '//${pkg}:bad[12]'"
+  expect_log "no such target"
+}
+
+function test_transitive_toolchain_error_multiline_hierarchy() {
+  local -r pkg="${FUNCNAME[0]}"
+  write_test_toolchain "${pkg}"
+  write_test_rule "${pkg}"
+
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
+register_toolchains('//${pkg}/toolchain_pkg:my_toolchain')
+EOF
+
+  mkdir -p "${pkg}/toolchain_pkg"
+  cat > "${pkg}/toolchain_pkg/BUILD" <<EOF
+load(':defs.bzl', 'my_toolchain_rule')
+package(default_visibility = ["//visibility:public"])
+
+my_toolchain_rule(name = 'my_toolchain')
+EOF
+
+  cat > "${pkg}/toolchain_pkg/defs.bzl" <<EOF
+load(':bad.bzl', 'bad_symbol')
+def _impl(ctx):
+  pass
+my_toolchain_rule = rule(implementation = _impl)
+EOF
+
+  cat > "${pkg}/toolchain_pkg/bad.bzl" <<EOF
+1 // 0
+EOF
+
+  mkdir -p "${pkg}/demo"
+  cat > "${pkg}/demo/BUILD" <<EOF
+load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+package(default_visibility = ["//visibility:public"])
+
+use_toolchain(
+    name = 'use',
+    message = 'demo')
+EOF
+
+  bazel build "//${pkg}/demo:use" &> $TEST_log && fail "Build failure expected"
+  expect_log "While resolving toolchains for target //${pkg}/demo:use"
+  expect_log "invalid registered toolchain '//${pkg}/toolchain_pkg:my_toolchain'"
+  expect_log "error loading package '${pkg}/toolchain_pkg'"
+  expect_log "${pkg}/toolchain_pkg/defs.bzl:1:6"
+  expect_log "initialization of module '${pkg}/toolchain_pkg/bad.bzl' failed"
 }
 
 
@@ -900,22 +1218,27 @@ function test_toolchain_error_invalid_target() {
   # Write toolchain with an invalid target.
   mkdir -p "${pkg}/invalid"
   cat > "${pkg}/invalid/BUILD" <<EOF
+package(default_visibility = ["//visibility:public"])
+
 toolchain(
     name = 'invalid_toolchain',
     toolchain_type = '//${pkg}/toolchain:test_toolchain',
     exec_compatible_with = [],
     target_compatible_with = [],
     toolchain = '//${pkg}/toolchain:does_not_exist',
-    visibility = ['//visibility:public'])
+)
 EOF
 
-  cat > WORKSPACE <<EOF
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
 register_toolchains('//${pkg}/invalid:invalid_toolchain')
 EOF
 
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 use_toolchain(
     name = 'use',
@@ -923,7 +1246,8 @@ use_toolchain(
 EOF
 
   bazel build "//${pkg}/demo:use" &> $TEST_log && fail "Build failure expected"
-  expect_log "Target '//${pkg}/demo:use' depends on toolchain '//${pkg}/toolchain:does_not_exist', which cannot be found: no such target '//${pkg}/toolchain:does_not_exist': target 'does_not_exist' not declared in package '${pkg}/toolchain'"
+  expect_log "Target '//${pkg}/demo:use' depends on toolchain '//${pkg}/toolchain:does_not_exist', which cannot be found: no such target '//${pkg}/toolchain:does_not_exist'"
+  expect_log "target 'does_not_exist' not declared in package '${pkg}/toolchain'"
 }
 
 
@@ -936,6 +1260,9 @@ function test_platforms_options_error_invalid_target() {
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 use_toolchain(
     name = 'use',
@@ -945,18 +1272,21 @@ EOF
   # Write an invalid rule to be the platform.
   mkdir -p "${pkg}/platform"
   cat > "${pkg}/platform/BUILD" <<EOF
+
+package(default_visibility = ["//visibility:public"])
+
 filegroup(name = 'not_a_platform')
 EOF
 
   bazel build \
     --platforms="//${pkg}/platform:not_a_platform" \
     "//${pkg}/demo:use" &> $TEST_log && fail "Build failure expected"
-  expect_log "While resolving toolchains for target //${pkg}/demo:use: Target //${pkg}/platform:not_a_platform was referenced as a platform, but does not provide PlatformInfo"
+  expect_log "Target //${pkg}/platform:not_a_platform was referenced as a platform, but does not provide PlatformInfo"
 
   bazel build \
     --host_platform="//${pkg}/platform:not_a_platform" \
     "//${pkg}/demo:use" &> $TEST_log && fail "Build failure expected"
-  expect_log "While resolving toolchains for target //${pkg}/demo:use: Target //${pkg}/platform:not_a_platform was referenced as a platform, but does not provide PlatformInfo"
+  expect_log "Target //${pkg}/platform:not_a_platform was referenced as a platform, but does not provide PlatformInfo"
 }
 
 
@@ -965,6 +1295,7 @@ function test_native_rule_target_exec_constraints() {
   mkdir -p "${pkg}/platform"
   cat > "${pkg}/platform/BUILD" <<EOF
 package(default_visibility = ["//visibility:public"])
+
 constraint_setting(name = "test")
 
 constraint_value(
@@ -982,6 +1313,8 @@ EOF
 
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
+package(default_visibility = ["//visibility:public"])
+
 genrule(
     name = "target",
     outs = ["out.txt"],
@@ -998,7 +1331,8 @@ EOF
   bazel build \
     --toolchain_resolution_debug=.* \
     "//${pkg}/demo:target" &> $TEST_log && fail "Build failure expected"
-  expect_log "While resolving toolchains for target //${pkg}/demo:target: .* from available execution platforms \[\]"
+    expect_log "While resolving toolchains for target //${pkg}/demo:target"
+    expect_log "from available execution platforms \[\]"
 
   # When the platform exists, it is used.
   bazel build \
@@ -1017,6 +1351,8 @@ function test_rule_with_default_execution_constraints() {
   # Add test platforms.
   mkdir -p "${pkg}/platforms"
   cat > "${pkg}/platforms/BUILD" <<EOF
+package(default_visibility = ["//visibility:public"])
+
 constraint_setting(name = 'setting')
 constraint_value(name = 'value1', constraint_setting = ':setting')
 constraint_value(name = 'value2', constraint_setting = ':setting')
@@ -1024,11 +1360,11 @@ constraint_value(name = 'value2', constraint_setting = ':setting')
 platform(
     name = 'platform1',
     constraint_values = [':value1'],
-    visibility = ['//visibility:public'])
+)
 platform(
     name = 'platform2',
     constraint_values = [':value2'],
-    visibility = ['//visibility:public'])
+)
 EOF
 
   # Add a rule with default execution constraints.
@@ -1051,6 +1387,8 @@ EOF
   cat > "${pkg}/demo/BUILD" <<EOF
 load(':rule.bzl', 'sample_rule')
 
+package(default_visibility = ["//visibility:public"])
+
 sample_rule(name = 'use')
 EOF
 
@@ -1072,6 +1410,7 @@ function test_target_with_execution_constraints() {
   mkdir -p "${pkg}/platforms"
   cat > "${pkg}/platforms/BUILD" <<EOF
 package(default_visibility = ['//visibility:public'])
+
 constraint_setting(name = 'setting')
 constraint_value(name = 'value1', constraint_setting = ':setting')
 constraint_value(name = 'value2', constraint_setting = ':setting')
@@ -1079,11 +1418,11 @@ constraint_value(name = 'value2', constraint_setting = ':setting')
 platform(
     name = 'platform1',
     constraint_values = [':value1'],
-    visibility = ['//visibility:public'])
+)
 platform(
     name = 'platform2',
     constraint_values = [':value2'],
-    visibility = ['//visibility:public'])
+)
 EOF
 
   # Add a rule with default execution constraints.
@@ -1102,6 +1441,8 @@ EOF
   # Use the new rule.
   cat > "${pkg}/demo/BUILD" <<EOF
 load(':rule.bzl', 'sample_rule')
+
+package(default_visibility = ["//visibility:public"])
 
 sample_rule(
   name = 'use',
@@ -1128,6 +1469,7 @@ function test_rule_and_target_with_execution_constraints() {
   mkdir -p "${pkg}/platforms"
   cat > "${pkg}/platforms/BUILD" <<EOF
 package(default_visibility = ['//visibility:public'])
+
 constraint_setting(name = 'setting1')
 constraint_value(name = 'value1', constraint_setting = ':setting1')
 constraint_value(name = 'value2', constraint_setting = ':setting1')
@@ -1139,19 +1481,19 @@ constraint_value(name = 'value4', constraint_setting = ':setting2')
 platform(
     name = 'platform1_3',
     constraint_values = [':value1', ':value3'],
-    visibility = ['//visibility:public'])
+)
 platform(
     name = 'platform1_4',
     constraint_values = [':value1', ':value4'],
-    visibility = ['//visibility:public'])
+)
 platform(
     name = 'platform2_3',
     constraint_values = [':value2', ':value3'],
-    visibility = ['//visibility:public'])
+)
 platform(
     name = 'platform2_4',
     constraint_values = [':value2', ':value4'],
-    visibility = ['//visibility:public'])
+)
 EOF
 
   # Add a rule with default execution constraints.
@@ -1174,6 +1516,8 @@ EOF
   cat > "${pkg}/demo/BUILD" <<EOF
 load(':rule.bzl', 'sample_rule')
 
+package(default_visibility = ["//visibility:public"])
+
 sample_rule(
   name = 'use',
   exec_compatible_with = [
@@ -1195,7 +1539,7 @@ function test_target_setting() {
   write_test_toolchain "${pkg}"
   write_test_rule "${pkg}"
 
-  cat > WORKSPACE <<EOF
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
 register_toolchains('//${pkg}:toolchain_1')
 register_toolchains('//${pkg}:toolchain_2')
 EOF
@@ -1203,22 +1547,24 @@ EOF
   cat > "${pkg}/BUILD" <<EOF
 load('//${pkg}/toolchain:toolchain_test_toolchain.bzl', 'test_toolchain')
 
+package(default_visibility = ["//visibility:public"])
+
 # Define the toolchain.
 filegroup(name = 'dep_rule')
 test_toolchain(
     name = 'toolchain_impl_1',
     extra_label = ':dep_rule',
     extra_str = 'foo from 1',
-    visibility = ['//visibility:public'])
+)
 test_toolchain(
     name = 'toolchain_impl_2',
     extra_label = ':dep_rule',
     extra_str = 'foo from 2',
-    visibility = ['//visibility:public'])
+)
 
 # Define config setting
 config_setting(
-    name = "optimised",
+    name = "optimized",
     values = {"compilation_mode": "opt"}
 )
 
@@ -1226,7 +1572,7 @@ config_setting(
 toolchain(
     name = 'toolchain_1',
     toolchain_type = '//${pkg}/toolchain:test_toolchain',
-    target_settings = [":optimised"],
+    target_settings = [":optimized"],
     toolchain = ':toolchain_impl_1')
 toolchain(
     name = 'toolchain_2',
@@ -1237,6 +1583,9 @@ EOF
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 use_toolchain(
     name = 'use',
@@ -1266,14 +1615,27 @@ function test_target_setting_with_transition() {
   write_test_toolchain "${pkg}"
   write_test_rule "${pkg}"
 
-  cat > WORKSPACE <<EOF
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
 register_toolchains('//${pkg}:toolchain_1')
 register_toolchains('//${pkg}:toolchain_2')
 EOF
 
   mkdir -p "{$pkg}"
+
+  cat > "${pkg}/flags.bzl" <<EOF
+def _impl(ctx):
+  pass
+
+string_flag = rule(
+    implementation = _impl,
+    build_setting = config.string(flag = True),
+)
+EOF
+
   cat > "${pkg}/BUILD" <<EOF
 load('//${pkg}/toolchain:toolchain_test_toolchain.bzl', 'test_toolchain')
+
+package(default_visibility = ["//visibility:public"])
 
 # Define the toolchain.
 filegroup(name = 'dep_rule')
@@ -1281,24 +1643,24 @@ test_toolchain(
     name = 'toolchain_impl_1',
     extra_label = ':dep_rule',
     extra_str = 'foo from 1',
-    visibility = ['//visibility:public'])
+)
 test_toolchain(
     name = 'toolchain_impl_2',
     extra_label = ':dep_rule',
     extra_str = 'foo from 2',
-    visibility = ['//visibility:public'])
+)
 
 # Define config setting
 config_setting(
-    name = "optimised",
-    values = {"compilation_mode": "opt"}
+    name = "prod_version",
+    flag_values = {"//${pkg}/demo:version": "production"}
 )
 
 # Declare the toolchain.
 toolchain(
     name = 'toolchain_1',
     toolchain_type = '//${pkg}/toolchain:test_toolchain',
-    target_settings = [":optimised"],
+    target_settings = [":prod_version"],
     toolchain = ':toolchain_impl_1')
 toolchain(
     name = 'toolchain_2',
@@ -1321,7 +1683,10 @@ EOF
 
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+load('//${pkg}:flags.bzl', 'string_flag')
 load(':rule.bzl', 'sample_rule')
+
+package(default_visibility = ["//visibility:public"])
 
 # Use the toolchain.
 use_toolchain(
@@ -1333,23 +1698,24 @@ sample_rule(
     name = 'sample',
     dep = ':use',
 )
+
+string_flag(
+  name = 'version',
+  build_setting_default = 'production'
+)
 EOF
 
-  # This should use toolchain_1 (because default host_compilation_mode = opt).
+  # This should use toolchain_1 (because default --//${pkg}/demo:version=production).
+  # Pass --experimental_propagate_custom_flag to make sure the flag is
+  # propagated to the exec configuration.
   bazel build \
-    "//${pkg}/demo:sample" &> $TEST_log || fail "Build failed"
+    "//${pkg}/demo:sample" "--experimental_propagate_custom_flag=//${pkg}/demo:version" &> $TEST_log || fail "Build failed"
   expect_log 'Using toolchain: rule message: "this is the rule", toolchain extra_str: "foo from 1"'
 
   # This should use toolchain_2.
   bazel build \
-    --compilation_mode=opt --host_compilation_mode=dbg \
-    "//${pkg}/demo:sample" &> $TEST_log || fail "Build failed"
-  expect_log 'Using toolchain: rule message: "this is the rule", toolchain extra_str: "foo from 2"'
-
-  # This should use toolchain_2.
-  bazel build \
-    --host_compilation_mode=dbg \
-    "//${pkg}/demo:sample" &> $TEST_log || fail "Build failed"
+    "//${pkg}/demo:sample" "--experimental_propagate_custom_flag=//${pkg}/demo:version" \
+    --//${pkg}/demo:version=dev &> $TEST_log || fail "Build failed"
   expect_log 'Using toolchain: rule message: "this is the rule", toolchain extra_str: "foo from 2"'
 }
 
@@ -1359,6 +1725,7 @@ function test_default_constraint_values {
   mkdir -p "${pkg}/platforms"
   cat > "${pkg}/platforms/BUILD" <<EOF
 package(default_visibility = ['//visibility:public'])
+
 constraint_setting(name = 'setting1', default_constraint_value = ':value_foo')
 constraint_value(name = 'value_foo', constraint_setting = ':setting1')
 constraint_value(name = 'value_bar', constraint_setting = ':setting1')
@@ -1385,16 +1752,18 @@ EOF
   cat > "${pkg}/BUILD" <<EOF
 load('//${pkg}/toolchain:toolchain_test_toolchain.bzl', 'test_toolchain')
 
+package(default_visibility = ["//visibility:public"])
+
 # Define the toolchains.
 test_toolchain(
     name = 'test_toolchain_impl_foo',
     extra_str = 'foo',
-    visibility = ['//visibility:public'])
+)
 
 test_toolchain(
     name = 'test_toolchain_impl_bar',
     extra_str = 'bar',
-    visibility = ['//visibility:public'])
+)
 
 # Declare the toolchains.
 toolchain(
@@ -1405,7 +1774,7 @@ toolchain(
       '//${pkg}/platforms:value_foo',
     ],
     toolchain = ':test_toolchain_impl_foo',
-    visibility = ['//visibility:public'])
+)
 toolchain(
     name = 'test_toolchain_bar',
     toolchain_type = '//${pkg}/toolchain:test_toolchain',
@@ -1414,11 +1783,11 @@ toolchain(
       '//${pkg}/platforms:value_bar',
     ],
     toolchain = ':test_toolchain_impl_bar',
-    visibility = ['//visibility:public'])
+)
 EOF
 
   # Register the toolchains
-  cat > WORKSPACE <<EOF
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
 register_toolchains('//${pkg}:test_toolchain_foo', '//${pkg}:test_toolchain_bar')
 EOF
 
@@ -1426,6 +1795,9 @@ EOF
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use the toolchain.
 use_toolchain(
     name = 'use',
@@ -1451,8 +1823,10 @@ function test_make_variables_custom_rule() {
   # Create a toolchain rule that also exposes make variables.
   mkdir -p "${pkg}/toolchain"
   cat > "${pkg}/toolchain/BUILD" <<EOF
+package(default_visibility = ["//visibility:public"])
+
 toolchain_type(name = 'toolchain_var',
-    visibility = ['//visibility:public'])
+)
 EOF
   cat > "${pkg}/toolchain/toolchain_var.bzl" <<EOF
 def _impl(ctx):
@@ -1484,18 +1858,20 @@ rule_var = rule(
 EOF
 
   # Create and register a toolchain
-  cat > WORKSPACE <<EOF
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
 register_toolchains('//${pkg}:toolchain_var_1')
 EOF
 
   cat > "${pkg}/BUILD" <<EOF
 load('//${pkg}/toolchain:toolchain_var.bzl', 'toolchain_var')
 
+package(default_visibility = ["//visibility:public"])
+
 # Define the toolchain.
 toolchain_var(
     name = 'toolchain_var_impl_1',
     value = 'foo',
-    visibility = ['//visibility:public'])
+)
 
 # Declare the toolchain.
 toolchain(
@@ -1504,27 +1880,21 @@ toolchain(
     exec_compatible_with = [],
     target_compatible_with = [],
     toolchain = ':toolchain_var_impl_1',
-    visibility = ['//visibility:public'])
+)
 EOF
 
   # Instantiate the rule and verify the output.
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_var.bzl', 'rule_var')
+
+package(default_visibility = ["//visibility:public"])
+
 rule_var(name = 'demo')
 EOF
 
   bazel build "//${pkg}/demo:demo" &> $TEST_log || fail "Build failed"
   expect_log 'Using toolchain: value "foo"'
-}
-
-function test_local_config_platform() {
-  if [ "${PRODUCT_NAME}" != "bazel" ]; then
-    # Tests of external repositories only work under bazel.
-    return 0
-  fi
-  bazel query @local_config_platform//... &> $TEST_log || fail "Build failed"
-  expect_log '@local_config_platform//:host'
 }
 
 # Test cycles in registered toolchains, which can only happen when
@@ -1595,6 +1965,8 @@ EOF
 load('//${pkg}:lower.bzl', 'lower_toolchain', 'lower_library')
 load('//${pkg}:upper.bzl', 'upper_toolchain', 'upper_library')
 
+package(default_visibility = ["//visibility:public"])
+
 toolchain_type(name = 'lower')
 toolchain_type(name = 'upper')
 
@@ -1627,8 +1999,8 @@ toolchain(
 )
 EOF
 
-  # Finally, set up the misconfigured WORKSPACE file.
-  cat >WORKSPACE <<EOF
+  # Finally, set up the misconfigured MODULE.bazel file.
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
 register_toolchains(
     '//${pkg}:upper_toolchain', # Not a toolchain() target!
     '//${pkg}:lower_toolchain_impl',
@@ -1645,6 +2017,7 @@ EOF
 # Catch the error when a target platform requires a configuration which contains the same target platform.
 # This can only happen when the target platform is not actually a platform.
 function test_target_platform_cycle() {
+  add_rules_shell "MODULE.bazel"
   local -r pkg="${FUNCNAME[0]}"
   mkdir -p "${pkg}"
   cat > "${pkg}/hello.sh" <<EOF
@@ -1658,6 +2031,10 @@ EOF
   chmod +x "${pkg}/hello.sh"
   chmod +x "${pkg}/target.sh"
   cat > "${pkg}/BUILD" <<EOF
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+package(default_visibility = ["//visibility:public"])
+
 sh_binary(
   name = "hello",
   srcs = ["hello.sh"],
@@ -1668,10 +2045,11 @@ sh_binary(
 )
 EOF
 
+  echo "START DEBUGGING"
   bazel build \
     --platforms="//${pkg}:hello" \
     "//${pkg}:target" &> $TEST_log && fail "Build succeeded unexpectedly"
-  expect_log "While resolving toolchains for target //${pkg}:target: Target //${pkg}:hello was referenced as a platform, but does not provide PlatformInfo"
+  expect_log "Target //${pkg}:hello was referenced as a platform, but does not provide PlatformInfo"
 }
 
 
@@ -1680,6 +2058,8 @@ function test_platform_duplicate_constraint_error() {
   # Write a platform with duplicate constraint values for the same setting.
   mkdir -p "${pkg}/platform"
   cat > "${pkg}/platform/BUILD" <<EOF
+package(default_visibility = ["//visibility:public"])
+
 constraint_setting(name = 'foo')
 constraint_value(name = 'val1', constraint_setting = ':foo')
 constraint_value(name = 'val2', constraint_setting = ':foo')
@@ -1701,6 +2081,8 @@ function test_toolchain_duplicate_constraint_error() {
   # Write a toolchain with duplicate constraint values for the same setting.
   mkdir -p "${pkg}/toolchain"
   cat > "${pkg}/toolchain/BUILD" <<EOF
+package(default_visibility = ["//visibility:public"])
+
 constraint_setting(name = 'foo')
 constraint_value(name = 'val1', constraint_setting = ':foo')
 constraint_value(name = 'val2', constraint_setting = ':foo')
@@ -1737,6 +2119,7 @@ function test_exec_transition() {
   mkdir -p "${pkg}/platforms"
   cat > "${pkg}/platforms/BUILD" <<EOF
 package(default_visibility = ['//visibility:public'])
+
 constraint_setting(name = 'setting')
 constraint_value(name = 'value1', constraint_setting = ':setting')
 constraint_value(name = 'value2', constraint_setting = ':setting')
@@ -1744,11 +2127,11 @@ constraint_value(name = 'value2', constraint_setting = ':setting')
 platform(
     name = 'platform1',
     constraint_values = [':value1'],
-    visibility = ['//visibility:public'])
+)
 platform(
     name = 'platform2',
     constraint_values = [':value2'],
-    visibility = ['//visibility:public'])
+)
 EOF
 
   # Add a rule with default execution constraints.
@@ -1779,6 +2162,8 @@ EOF
   cat > "${pkg}/demo/BUILD" <<EOF
 load(':rule.bzl', 'sample_rule', 'display_platform')
 
+package(default_visibility = ["//visibility:public"])
+
 sample_rule(
   name = 'use',
   dep = ":dep",
@@ -1794,13 +2179,15 @@ EOF
   bazel build \
     --extra_execution_platforms="//${pkg}/platforms:all" \
     "//${pkg}/demo:use" &> $TEST_log || fail "Build failed"
-  expect_log "//${pkg}/demo:dep target platform: //${pkg}/platforms:platform2"
+  expect_log "@@\?//${pkg}/demo:dep target platform: @@\?//${pkg}/platforms:platform2"
 }
 
 function test_config_setting_with_constraints {
   local -r pkg="${FUNCNAME[0]}"
   mkdir -p "${pkg}"
   cat > "${pkg}/BUILD" <<EOF
+package(default_visibility = ["//visibility:public"])
+
 constraint_setting(name = "setting1")
 constraint_value(name = "value1", constraint_setting = ":setting1")
 constraint_value(name = "value2", constraint_setting = ":setting1")
@@ -1844,6 +2231,8 @@ function test_config_setting_with_constraints_alias {
   local -r pkg="${FUNCNAME[0]}"
   mkdir -p "${pkg}"
   cat > "${pkg}/BUILD" <<EOF
+package(default_visibility = ["//visibility:public"])
+
 constraint_setting(name = "setting1")
 constraint_value(name = "value1", constraint_setting = ":setting1")
 constraint_value(name = "value2", constraint_setting = ":setting1")
@@ -1908,6 +2297,8 @@ load('//${pkg}/toolchain:toolchain_foo_toolchain.bzl', 'foo_toolchain')
 load('//${pkg}/toolchain:rule_test_rule.bzl', 'test_rule')
 load('//${pkg}/project:flags.bzl', 'string_flag')
 
+package(default_visibility = ["//visibility:public"])
+
 string_flag(
   name = 'version',
   build_setting_default = 'production'
@@ -1955,7 +2346,7 @@ test_rule(
 )
 EOF
 
-  cat > WORKSPACE <<EOF
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
 register_toolchains('//${pkg}/project:toolchain')
 EOF
 
@@ -1969,73 +2360,6 @@ EOF
   expect_log 'Using toolchain: rule message: "hello", toolchain extra_str: "unstable"'
 }
 
-function test_add_exec_constraints_to_targets() {
-  local -r pkg="${FUNCNAME[0]}"
-  # Add test platforms.
-  mkdir -p "${pkg}/platforms"
-  cat > "${pkg}/platforms/BUILD" <<EOF
-package(default_visibility = ['//visibility:public'])
-constraint_setting(name = 'setting')
-constraint_value(name = 'value1', constraint_setting = ':setting')
-constraint_value(name = 'value2', constraint_setting = ':setting')
-
-platform(
-    name = 'platform1',
-    constraint_values = [':value1'],
-    visibility = ['//visibility:public'])
-platform(
-    name = 'platform2',
-    constraint_values = [':value2'],
-    visibility = ['//visibility:public'])
-EOF
-
-  # Add a rule with default execution constraints.
-  mkdir -p "${pkg}/demo"
-  cat > "${pkg}/demo/rule.bzl" <<EOF
-def _sample_rule_impl(ctx):
-  return []
-
-sample_rule = rule(
-  implementation = _sample_rule_impl,
-  attrs = {
-    "tool": attr.label(cfg = 'exec'),
-  }
-)
-
-def _display_platform_impl(ctx):
-  print("%s target platform: %s" % (ctx.label, ctx.fragments.platform.platforms[0]))
-  return []
-
-display_platform = rule(
-  implementation = _display_platform_impl,
-  attrs = {},
-  fragments = ['platform'],
-)
-EOF
-
-  # Use the new rule.
-  cat > "${pkg}/demo/BUILD" <<EOF
-load(':rule.bzl', 'sample_rule', 'display_platform')
-
-sample_rule(
-  name = 'sample',
-  tool = ":tool",
-)
-
-display_platform(name = 'tool')
-EOF
-
-  bazel build \
-    --extra_execution_platforms="//${pkg}/platforms:platform1,//${pkg}/platforms:platform2" \
-    "//${pkg}/demo:sample" &> $TEST_log || fail "Build failed"
-  expect_log "//${pkg}/demo:tool target platform: //${pkg}/platforms:platform1"
-
-  bazel build \
-      --extra_execution_platforms="//${pkg}/platforms:platform1,//${pkg}/platforms:platform2" \
-      --experimental_add_exec_constraints_to_targets "//${pkg}/demo:sample=//${pkg}/platforms:value2" \
-      "//${pkg}/demo:sample" &> $TEST_log || fail "Build failed"
-  expect_log "//${pkg}/demo:tool target platform: //${pkg}/platforms:platform2"
-}
 
 function test_deps_includes_exec_group_toolchain() {
   local -r pkg="${FUNCNAME[0]}"
@@ -2064,6 +2388,8 @@ EOF
   cat > "${pkg}/demo/BUILD" <<EOF
 load("//${pkg}/toolchain:rule_use_toolchain.bzl", "use_toolchain")
 
+package(default_visibility = ["//visibility:public"])
+
 use_toolchain(name = "use")
 EOF
 
@@ -2078,25 +2404,27 @@ function test_two_toolchain_types_resolve_to_same_label() {
   local -r pkg="${FUNCNAME[0]}"
   write_test_toolchain "${pkg}"
 
-  cat > WORKSPACE <<EOF
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
 register_toolchains('//${pkg}:toolchain_1')
 register_toolchains('//${pkg}:toolchain_2')
 EOF
 
   mkdir -p "${pkg}/toolchain"
   cat > "${pkg}/toolchain/BUILD" <<EOF
+package(default_visibility = ["//visibility:public"])
+
 toolchain_type(
     name = 'test_toolchain_1',
-    visibility = ['//visibility:public']
 )
 toolchain_type(
     name = 'test_toolchain_2',
-    visibility = ['//visibility:public']
 )
 EOF
 
   cat > "${pkg}/BUILD" <<EOF
 load('//${pkg}/toolchain:toolchain_test_toolchain.bzl', 'test_toolchain')
+
+package(default_visibility = ["//visibility:public"])
 
 # Define the toolchain.
 test_toolchain(
@@ -2139,6 +2467,9 @@ EOF
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/toolchain:rule_use_toolchains.bzl', 'use_toolchains')
+
+package(default_visibility = ["//visibility:public"])
+
 # Use both toolchains.
 use_toolchains(
     name = 'use',
@@ -2156,6 +2487,8 @@ function test_invalid_toolchain_type() {
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load(":rule.bzl", "sample_rule")
+
+package(default_visibility = ["//visibility:public"])
 
 sample_rule(name = "demo")
 EOF
@@ -2195,6 +2528,7 @@ inner_toolchain = rule(
 EOF
   cat > "${pkg}/inner/BUILD" <<EOF
 package(default_visibility = ["//visibility:public"])
+
 load(":toolchain.bzl", "inner_toolchain")
 toolchain_type(name = "toolchain_type")
 
@@ -2222,11 +2556,11 @@ def _impl(ctx):
 outer_toolchain = rule(
     implementation = _impl,
     toolchains = ["//${pkg}/inner:toolchain_type"],
-    incompatible_use_toolchain_transition = True,
 )
 EOF
   cat > "${pkg}/outer/BUILD" <<EOF
 package(default_visibility = ["//visibility:public"])
+
 load(":toolchain.bzl", "outer_toolchain")
 toolchain_type(name = "toolchain_type")
 
@@ -2239,7 +2573,7 @@ toolchain(
 EOF
 
   # Register all the toolchains.
-  cat >WORKSPACE <<EOF
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
 register_toolchains("//${pkg}/inner:all")
 register_toolchains("//${pkg}/outer:all")
 EOF
@@ -2256,22 +2590,25 @@ def _impl(ctx):
 demo_rule = rule(
     implementation = _impl,
     toolchains = ["//${pkg}/outer:toolchain_type"],
-    incompatible_use_toolchain_transition = True,
 )
 EOF
   cat > "${pkg}/rule/BUILD" <<EOF
 package(default_visibility = ["//visibility:public"])
+
 exports_files(["rule.bzl"])
 EOF
 
   mkdir -p "${pkg}/demo"
   cat > "${pkg}/demo/BUILD" <<EOF
 load('//${pkg}/rule:rule.bzl', 'demo_rule')
+
+package(default_visibility = ["//visibility:public"])
+
 demo_rule(name = "demo")
 EOF
 
   bazel build "//${pkg}/demo:demo" &> $TEST_log || fail "Build failed"
-  expect_log "Inner toolchain //${pkg}/inner:impl"
+  expect_log "Inner toolchain @@\?//${pkg}/inner:impl"
 }
 
 # Test that toolchain type labels are correctly resolved relative to the
@@ -2286,7 +2623,7 @@ function test_repository_relative_toolchain_type() {
   # Create a repository that defines a toolchain type and simple rule.
   # The toolchain type used in the repository is relative to the repository.
   mkdir -p "${pkg}/external/rules_foo"
-  touch "${pkg}/external/rules_foo/WORKSPACE"
+  touch "${pkg}/external/rules_foo/REPO.bazel"
   mkdir -p "${pkg}/external/rules_foo/rule"
   touch "${pkg}/external/rules_foo/rule/BUILD"
   cat > "${pkg}/external/rules_foo/rule/rule.bzl" <<EOF
@@ -2303,14 +2640,14 @@ EOF
   cat > "${pkg}/external/rules_foo/toolchain/BUILD" <<EOF
 load(":toolchain.bzl", "foo_toolchain")
 
+package(default_visibility = ["//visibility:public"])
+
 toolchain_type(
   name = "foo_toolchain_type",
-  visibility = ["//visibility:public"],
 )
 
 foo_toolchain(
     name = "foo_toolchain",
-    visibility = ["//visibility:public"],
 )
 
 toolchain(
@@ -2339,10 +2676,13 @@ foo_toolchain = rule(
 EOF
   mkdir -p "${pkg}/external"/rules_foo/foo_tools
   cat > "${pkg}/external/rules_foo/foo_tools/BUILD" <<EOF
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+package(default_visibility = ["//visibility:public"])
+
 sh_binary(
   name = "foo_tool",
   srcs = ["foo_tool.sh"],
-  visibility = ["//visibility:public"],
 )
 EOF
   cat > "${pkg}/external/rules_foo/foo_tools/foo_tool.sh" <<EOF
@@ -2356,11 +2696,14 @@ EOF
   cat > "${pkg}/demo/BUILD" <<EOF
 load("@rules_foo//rule:rule.bzl", "foo_rule")
 
+package(default_visibility = ["//visibility:public"])
+
 foo_rule(name = "demo")
 EOF
 
-  # Set up the WORKSPACE.
-  cat > WORKSPACE <<EOF
+  # Set up the MODULE.bazel.
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
+local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
 local_repository(
   name = "rules_foo",
   path = "${pkg}/external/rules_foo",
@@ -2370,13 +2713,459 @@ register_toolchains(
   "@rules_foo//toolchain:foo_default_toolchain",
 )
 EOF
+  add_rules_shell "$TOOLCHAIN_REGISTRATION_FILE"
 
   # Test the build.
   bazel build \
     "//${pkg}/demo:demo" &> $TEST_log || fail "Build failed"
-  expect_log "foo_tool = <target @rules_foo//foo_tools:foo_tool>"
+  expect_log "foo_tool = <target @@+local_repository+rules_foo//foo_tools:foo_tool>"
+}
+
+function test_exec_platform_order_with_mandatory_toolchains {
+  local -r pkg="${FUNCNAME[0]}"
+
+  # Add two possible execution platforms.
+  mkdir -p "${pkg}/platforms"
+  cat > "${pkg}/platforms/BUILD" <<EOF
+package(default_visibility = ['//visibility:public'])
+
+constraint_setting(name = 'setting')
+constraint_value(name = 'value1', constraint_setting = ':setting')
+constraint_value(name = 'value2', constraint_setting = ':setting')
+
+platform(
+    name = 'platform1',
+    constraint_values = [':value1'],
+)
+platform(
+    name = 'platform2',
+    constraint_values = [':value2'],
+)
+EOF
+  # Register them in order.
+  cat >> $TOOLCHAIN_REGISTRATION_FILE <<EOF
+register_execution_platforms("//${pkg}/platforms:platform1", "//${pkg}/platforms:platform2")
+EOF
+
+  # Create a toolchain that only works with platform2
+  write_test_toolchain "${pkg}" test_toolchain
+  write_register_toolchain "${pkg}" test_toolchain "['//${pkg}/platforms:value2']"
+
+  # The rule must receive the toolchain.
+  mkdir -p "${pkg}/toolchain"
+  cat > "${pkg}/toolchain/rule_use_toolchains.bzl" <<EOF
+def _impl(ctx):
+  toolchain = ctx.toolchains['//${pkg}/toolchain:test_toolchain']
+  message = ctx.attr.message
+  print(
+      'Using toolchain: rule message: "%s", toolchain is none: %s' %
+         (message, toolchain == None))
+  return []
+
+use_toolchains = rule(
+    implementation = _impl,
+    attrs = {
+        'message': attr.string(),
+    },
+    toolchains = [
+        config_common.toolchain_type('//${pkg}/toolchain:test_toolchain', mandatory = True),
+    ],
+)
+EOF
+
+  mkdir -p "${pkg}/demo"
+  cat > "${pkg}/demo/BUILD" <<EOF
+load('//${pkg}/toolchain:rule_use_toolchains.bzl', 'use_toolchains')
+
+package(default_visibility = ["//visibility:public"])
+
+# Use the toolchain.
+use_toolchains(
+    name = 'use',
+    message = 'this is the rule')
+EOF
+
+  bazel build "//${pkg}/demo:use" &> $TEST_log || fail "Build failed"
+  bazel build \
+    --toolchain_resolution_debug=.* \
+    "//${pkg}/demo:use" &> $TEST_log || fail "Build failed"
+  # Verify that a toolchain was provided.
+  expect_log 'Using toolchain: rule message: "this is the rule", toolchain is none: False'
+  # Verify that the exec platform is platform2.
+  expect_log "Selected execution platform //${pkg}/platforms:platform2"
+}
+
+function test_exec_platform_order_with_optional_toolchains {
+  local -r pkg="${FUNCNAME[0]}"
+
+  # Add two possible execution platforms.
+  mkdir -p "${pkg}/platforms"
+  cat > "${pkg}/platforms/BUILD" <<EOF
+package(default_visibility = ['//visibility:public'])
+
+constraint_setting(name = 'setting')
+constraint_value(name = 'value1', constraint_setting = ':setting')
+constraint_value(name = 'value2', constraint_setting = ':setting')
+
+platform(
+    name = 'platform1',
+    constraint_values = [':value1'],
+)
+platform(
+    name = 'platform2',
+    constraint_values = [':value2'],
+)
+EOF
+  # Register them in order.
+  cat >> $TOOLCHAIN_REGISTRATION_FILE <<EOF
+register_execution_platforms("//${pkg}/platforms:platform1", "//${pkg}/platforms:platform2")
+EOF
+
+  # Create a toolchain that only works with platform2
+  write_test_toolchain "${pkg}" test_toolchain
+  write_register_toolchain "${pkg}" test_toolchain "['//${pkg}/platforms:value2']"
+
+  # The rule can optionally use the toolchain.
+  mkdir -p "${pkg}/toolchain"
+  cat > "${pkg}/toolchain/rule_use_toolchains.bzl" <<EOF
+def _impl(ctx):
+  toolchain = ctx.toolchains['//${pkg}/toolchain:test_toolchain']
+  message = ctx.attr.message
+  print(
+      'Using toolchain: rule message: "%s", toolchain is none: %s' %
+         (message, toolchain == None))
+  return []
+
+use_toolchains = rule(
+    implementation = _impl,
+    attrs = {
+        'message': attr.string(),
+    },
+    toolchains = [
+        config_common.toolchain_type('//${pkg}/toolchain:test_toolchain', mandatory = False),
+    ],
+)
+EOF
+
+  mkdir -p "${pkg}/demo"
+  cat > "${pkg}/demo/BUILD" <<EOF
+load('//${pkg}/toolchain:rule_use_toolchains.bzl', 'use_toolchains')
+
+package(default_visibility = ["//visibility:public"])
+
+# Use the toolchain.
+use_toolchains(
+    name = 'use',
+    message = 'this is the rule')
+EOF
+
+  bazel build "//${pkg}/demo:use" &> $TEST_log || fail "Build failed"
+  bazel build \
+    --toolchain_resolution_debug=.* \
+    "//${pkg}/demo:use" &> $TEST_log || fail "Build failed"
+
+  # Verify that the exec platform is platform2.
+  expect_log "Selected execution platform //${pkg}/platforms:platform2"
+}
+
+function setup_toolchain_precedence_tests() {
+  local pkg="$1"
+  shift
+
+  write_test_toolchain "${pkg}"
+  write_test_rule "${pkg}"
+
+  cat > $TOOLCHAIN_REGISTRATION_FILE <<EOF
+register_toolchains('//${pkg}:toolchain_1')
+EOF
+
+  cat > "${pkg}/BUILD" <<EOF
+load('//${pkg}/toolchain:toolchain_test_toolchain.bzl', 'test_toolchain')
+
+package(default_visibility = ["//visibility:public"])
+
+# Define and declare four identical toolchains.
+[
+  [
+    test_toolchain(
+      name = 'toolchain_impl_' + str(i),
+      extra_str = 'foo from toolchain_' + str(i),
+    ),
+    toolchain(
+      name = 'toolchain_' + str(i),
+      toolchain_type = '//${pkg}/toolchain:test_toolchain',
+      toolchain = ':toolchain_impl_' + str(i)
+    ),
+  ]
+  for i in range(1, 5)
+]
+EOF
+
+  mkdir -p "${pkg}/demo"
+  cat > "${pkg}/demo/BUILD" <<EOF
+load('//${pkg}/toolchain:rule_use_toolchain.bzl', 'use_toolchain')
+package(default_visibility = ["//visibility:public"])
+
+# Use the toolchain.
+use_toolchain(
+    name = 'use',
+    message = 'this is the rule')
+EOF
+}
+
+# Regression tests for https://github.com/bazelbuild/bazel/issues/19945 and https://github.com/bazelbuild/bazel/issues/22912
+function test_extra_toolchain_precedence_basic {
+  local -r pkg="${FUNCNAME[0]}"
+  setup_toolchain_precedence_tests "${pkg}"
+
+  # Even with other toolchains defined, only one is registered
+  bazel \
+    build \
+    "//${pkg}/demo:use" &> $TEST_log || fail "Build failed"
+  expect_log 'Using toolchain: rule message: "this is the rule", toolchain extra_str: "foo from toolchain_1"'
+}
+
+function test_extra_toolchain_precedence_from_bazelrc {
+  local -r pkg="${FUNCNAME[0]}"
+  setup_toolchain_precedence_tests "${pkg}"
+
+  cat > "${pkg}/toolchain_rc" <<EOF
+import ${bazelrc}
+build --extra_toolchains=//${pkg}:toolchain_2
+EOF
+
+  # Test that bazelrc options take precedence over registered toolchains
+  bazel \
+    --${PRODUCT_NAME}rc="${pkg}/toolchain_rc" \
+    build \
+    "//${pkg}/demo:use" &> $TEST_log || fail "Build failed"
+  expect_log 'Using toolchain: rule message: "this is the rule", toolchain extra_str: "foo from toolchain_2"'
+}
+
+function test_extra_toolchain_precedence_from_flag {
+  local -r pkg="${FUNCNAME[0]}"
+  setup_toolchain_precedence_tests "${pkg}"
+
+  # Test that command-line options take precedence over other toolchains
+  bazel \
+    build \
+    --extra_toolchains=//${pkg}:toolchain_3 \
+    "//${pkg}/demo:use" &> $TEST_log || fail "Build failed"
+  expect_log 'Using toolchain: rule message: "this is the rule", toolchain extra_str: "foo from toolchain_3"'
+}
+
+function test_extra_toolchain_precedence_multiple {
+  local -r pkg="${FUNCNAME[0]}"
+  setup_toolchain_precedence_tests "${pkg}"
+
+  # Test that the last --extra_toolchains takes precedence
+  bazel \
+    build \
+    --extra_toolchains=//${pkg}:toolchain_3,//${pkg}:toolchain_4 \
+    "//${pkg}/demo:use" &> $TEST_log || fail "Build failed"
+  expect_log 'Using toolchain: rule message: "this is the rule", toolchain extra_str: "foo from toolchain_4"'
+}
+
+function test_extra_toolchain_precedence_multiple_repeated {
+  local -r pkg="${FUNCNAME[0]}"
+  setup_toolchain_precedence_tests "${pkg}"
+
+  # Test that the last --extra_toolchains takes precedence even when repeated
+  bazel \
+    build \
+    --extra_toolchains=//${pkg}:toolchain_3,//${pkg}:toolchain_4,//${pkg}:toolchain_3 \
+    "//${pkg}/demo:use" &> $TEST_log || fail "Build failed"
+  # Since toolchain_3 is last, it should still have highest precedence
+  expect_log 'Using toolchain: rule message: "this is the rule", toolchain extra_str: "foo from toolchain_3"'
 }
 
 # TODO(katre): Test using toolchain-provided make variables from a genrule.
+
+function test_invalid_cpu() {
+  local -r pkg="${FUNCNAME[0]}"
+  mkdir -p "${pkg}"
+  cat > "${pkg}/BUILD" <<EOF
+filegroup(name = "demo")
+EOF
+  bazel \
+    build \
+    --allowed_cpu_values=foo,bar \
+    --cpu=quux \
+    "//${pkg}:demo" &> $TEST_log && fail "Build failure expected"
+  expect_log "Invalid --cpu value \"quux\": allowed values are bar, foo."
+}
+
+function write_exec_platform_required_setting {
+  local pkg="$1"
+
+  add_rules_shell "MODULE.bazel"
+  # Add test platforms.
+  mkdir -p "${pkg}/platforms"
+  cat > "${pkg}/platforms/BUILD" <<EOF
+package(default_visibility = ['//visibility:public'])
+
+config_setting(
+    name = "optimized",
+    values = {"compilation_mode": "opt"}
+)
+
+# Define a platform that requires a specific configuration to be eligible as an
+# execution platform.
+platform(
+    name = 'platform_opt',
+    required_settings = [
+        ":optimized",
+    ],
+)
+platform(
+    name = 'platform_basic',
+)
+EOF
+
+  # Define a build target.
+  mkdir -p "${pkg}/demo"
+  cat > "${pkg}/demo/hello.sh" <<EOF
+echo hello
+EOF
+  chmod +x "${pkg}/demo/hello.sh"
+  cat > "${pkg}/demo/BUILD" <<EOF
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+sh_binary(
+  name = 'sample',
+  srcs = ["hello.sh"],
+)
+EOF
+}
+
+function test_exec_platform_required_setting {
+  local -r pkg="${FUNCNAME[0]}"
+  write_exec_platform_required_setting "${pkg}"
+
+  # Use the new exec platforms, with the reqired_settings version first.
+  # Do not enable the config_setting.
+  bazel build \
+    --extra_execution_platforms="//${pkg}/platforms:platform_opt,//${pkg}/platforms:platform_basic" \
+    --toolchain_resolution_debug="//${pkg}/demo:sample" \
+    --compilation_mode=fastbuild \
+    "//${pkg}/demo:sample" &> $TEST_log || fail "Build failed"
+  expect_log "Selected execution platform //${pkg}/platforms:platform_basic"
+
+  # Verify the debug log.
+  expect_log "Rejected execution platform //${pkg}/platforms:platform_opt; mismatching required_settings: optimized"
+
+  # Use the new exec platforms, with the reqired_settings version first.
+  # Enable the config_setting.
+  bazel build \
+    --extra_execution_platforms="//${pkg}/platforms:platform_opt,//${pkg}/platforms:platform_basic" \
+    --toolchain_resolution_debug="//${pkg}/demo:sample" \
+    --compilation_mode=opt\
+    "//${pkg}/demo:sample" &> $TEST_log || fail "Build failed"
+  expect_log "Selected execution platform //${pkg}/platforms:platform_opt"
+
+  # Verify the debug log.
+  expect_not_log "Rejected execution platform"
+}
+
+function test_exec_platform_required_setting_cycle {
+  local -r pkg="${FUNCNAME[0]}"
+
+  add_rules_shell "MODULE.bazel"
+  # Add test platforms.
+  mkdir -p "${pkg}/platforms"
+  cat > "${pkg}/platforms/BUILD" <<EOF
+package(default_visibility = ['//visibility:public'])
+
+# Create a cycle by using a constraint_value instead of a flag.
+constraint_setting(name = "cycle_setting")
+constraint_value(name = "cycle_value", constraint_setting = ":cycle_setting")
+config_setting(
+    name = "cycle",
+    constraint_values = [":cycle_value"],
+)
+
+platform(
+    name = 'platform_cycle',
+    required_settings = [
+        ":cycle",
+    ],
+)
+platform(
+    name = 'platform_basic',
+)
+EOF
+
+  # Define a build target.
+  mkdir -p "${pkg}/demo"
+  cat > "${pkg}/demo/hello.sh" <<EOF
+echo hello
+EOF
+  chmod +x "${pkg}/demo/hello.sh"
+  cat > "${pkg}/demo/BUILD" <<EOF
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+sh_binary(
+  name = 'sample',
+  srcs = ["hello.sh"],
+)
+EOF
+  # Use the new exec platforms, with the reqired_settings version first.
+  bazel build \
+    --extra_execution_platforms="//${pkg}/platforms:platform_cycle,//${pkg}/platforms:platform_basic" \
+    --toolchain_resolution_debug="//${pkg}/demo:sample" \
+    --compilation_mode=fastbuild \
+    "//${pkg}/demo:sample" &> $TEST_log && fail "Unexpected success"
+  expect_not_log "Cycle detected but could not be properly displayed due to an internal problem"
+  expect_log "Misconfigured execution platforms: //${pkg}/platforms:platform_cycle is declared as a platform but has inappropriate dependencies"
+}
+
+# Regression test for https://github.com/bazelbuild/bazel/issues/29159
+function test_cross_compile_test_without_matching_exec_platform {
+  local -r pkg="${FUNCNAME[0]}"
+
+  add_rules_shell "MODULE.bazel"
+
+  # A target platform whose constraints aren't satisfied by any execution platform.
+  mkdir -p "${pkg}/platforms"
+  cat > "${pkg}/platforms/BUILD" <<EOF
+package(default_visibility = ['//visibility:public'])
+
+constraint_setting(name = 'setting')
+constraint_value(name = 'value', constraint_setting = ':setting')
+
+platform(
+    name = 'target_platform',
+    constraint_values = [':value'],
+)
+EOF
+
+  mkdir -p "${pkg}/demo"
+  cat > "${pkg}/demo/hello.sh" <<EOF
+echo hello
+EOF
+  chmod +x "${pkg}/demo/hello.sh"
+  cat > "${pkg}/demo/BUILD" <<EOF
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+sh_test(
+  name = 'sample_test',
+  srcs = ["hello.sh"],
+)
+EOF
+
+  # The test can be built even though it can't be run.
+  bazel build \
+    --platforms="//${pkg}/platforms:target_platform" \
+    "//${pkg}/demo:sample_test" &> $TEST_log || fail "Build failed"
+
+  # Running the test fails with an actionable error message.
+  bazel test \
+    --platforms="//${pkg}/platforms:target_platform" \
+    "//${pkg}/demo:sample_test" &> $TEST_log && fail "Unexpected success"
+  # The toolchain type is rendered in display form, except for the value of
+  # --toolchain_resolution_debug, which is matched against the canonical form.
+  expect_log "No matching toolchain found for type .*//tools/test:default_test_toolchain_type, which is required to run tests for target platform //${pkg}/platforms:target_platform"
+  expect_log "rerun with --toolchain_resolution_debug='.*//tools/test:default_test_toolchain_type'"
+}
 
 run_suite "toolchain tests"

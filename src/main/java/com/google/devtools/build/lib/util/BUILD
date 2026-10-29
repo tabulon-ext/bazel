@@ -1,23 +1,42 @@
 load("@rules_java//java:defs.bzl", "java_library")
 
 package(
-    default_visibility = ["//src:__subpackages__"],
+    default_applicable_licenses = ["//:license"],
+    default_visibility = ["//src/main/java/com/google/devtools/build/lib:build_lib"],
 )
 
 filegroup(
     name = "srcs",
     srcs = glob(["**"]) + [
         "//src/main/java/com/google/devtools/build/lib/util/io:srcs",
+        "//src/main/java/com/google/devtools/build/lib/util/regex:srcs",
     ],
-    visibility = ["//src:__subpackages__"],
+    visibility = ["//src/main/java/com/google/devtools/build/lib:__pkg__"],
+)
+
+java_library(
+    name = "bucket",
+    srcs = ["Bucket.java"],
+    deps = ["//src/main/java/com/google/devtools/build/lib/skybridge:skybridge_interface"],
+)
+
+java_library(
+    name = "decimal_bucketer",
+    srcs = ["DecimalBucketer.java"],
+    deps = [
+        ":bucket",
+        "//third_party/java/guava:annotations",
+        "//third_party/java/guava:collect",
+    ],
 )
 
 java_library(
     name = "logging",
     srcs = ["LoggingUtil.java"],
     deps = [
-        "//src/main/java/com/google/devtools/build/lib/concurrent",
-        "//third_party:guava",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:concurrent",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
@@ -29,35 +48,55 @@ java_library(
 )
 
 java_library(
-    name = "execution_detailed_exit_code_helper",
-    srcs = ["ExecutionDetailedExitCodeHelper.java"],
-    deps = [
-        ":detailed_exit_code",
-        "//src/main/java/com/google/devtools/build/skyframe",
-        "//src/main/protobuf:failure_details_java_proto",
-        "//third_party:flogger",
-    ],
-)
-
-java_library(
     name = "os",
     srcs = ["OS.java"],
+    visibility = [
+        "//src/main/java/com/google/devtools/build/lib:build_lib",
+        "//src/main/java/com/google/devtools/build/lib:full_access",  # exposed to jcg/devtools/build/rpcs
+    ],
 )
 
 java_library(
     name = "classpath",
     srcs = ["Classpath.java"],
-    deps = ["//third_party:guava"],
+    visibility = [
+        "//src/main/java/com/google/devtools/build/docgen:__pkg__",
+        "//src/main/java/com/google/devtools/build/lib:build_lib",
+        "//src/test/java/com/google/devtools/build/lib/testutil:__pkg__",
+        "//src/test/java/com/google/devtools/common/options:__pkg__",
+    ],
+    deps = ["//third_party/java/guava:reflect"],
 )
 
 java_library(
-    name = "process",
-    srcs = ["ProcessUtils.java"],
+    name = "env_var",
+    srcs = ["EnvVar.java"],
+    visibility = [
+        "//src/main/java/com/google/devtools/build/lib:build_lib",
+    ],
     deps = [
-        ":os",
-        "//src/main/java/com/google/devtools/build/lib/concurrent",
-        "//src/main/java/com/google/devtools/build/lib/unix",
-        "//src/main/java/com/google/devtools/build/lib/windows:processes",
+        "//src/main/java/com/google/devtools/build/lib/skyframe/serialization/autocodec",
+        "//src/main/java/com/google/devtools/common/options",
+    ],
+)
+
+java_library(
+    name = "file_system_lock",
+    srcs = ["FileSystemLock.java"],
+    deps = [
+        ":string_encoding",
+        "//src/main/java/com/google/devtools/build/lib/concurrent:thread_safety",
+        "//src/main/java/com/google/devtools/build/lib/vfs",
+        "//third_party/java/guava:annotations",
+    ],
+)
+
+java_library(
+    name = "file_channels",
+    srcs = ["FileChannels.java"],
+    add_exports = ["java.base/sun.nio.ch"],
+    deps = [
+        "//third_party/java/flogger",
     ],
 )
 
@@ -65,7 +104,7 @@ java_library(
     name = "single_line_formatter",
     srcs = ["SingleLineFormatter.java"],
     deps = [
-        "//third_party:guava",
+        "//third_party/java/guava:collect",
     ],
 )
 
@@ -75,24 +114,59 @@ java_library(
     deps = [
         ":os",
         ":single_line_formatter",
+        ":string_encoding",
         ":util",
-        "//third_party:guava",
-        "//third_party:jsr305",
+        "//third_party/java/error_prone:annotations",
+        "//third_party/java/guava:annotations",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:io",
+        "//third_party/java/guava:net",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
 java_library(
     name = "debug-logger-configurator",
     srcs = ["DebugLoggerConfigurator.java"],
-    deps = [":util"],
+)
+
+java_library(
+    name = "server_log_path_service",
+    srcs = ["ServerLogPathService.java"],
+    deps = [
+        "//src/main/java/com/google/devtools/build/lib/runtime:blaze_service",
+        "//src/main/java/com/google/devtools/build/lib/skybridge:skybridge_interface",
+    ],
+)
+
+java_library(
+    name = "server_log_path_service_impl",
+    srcs = ["ServerLogPathServiceImpl.java"],
+    deps = [
+        ":server_log_path_service",
+        ":util",
+        "//src/main/java/com/google/devtools/build/lib/skybridge:sc_only",
+    ],
 )
 
 java_library(
     name = "describable_execution_unit",
     srcs = ["DescribableExecutionUnit.java"],
     deps = [
-        "//third_party:guava",
-        "//third_party:jsr305",
+        "//src/main/java/com/google/devtools/build/lib/cmdline",
+        "//third_party/java/guava:collect",
+        "//third_party/java/jsr305_annotations",
+    ],
+)
+
+java_library(
+    name = "script_util",
+    srcs = ["ScriptUtil.java"],
+    deps = [
+        ":os",
+        ":shell_escaper",
+        "//third_party/java/guava:collect",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
@@ -100,18 +174,44 @@ java_library(
     name = "command",
     srcs = [
         "CommandBuilder.java",
-        "CommandDescriptionForm.java",
-        "CommandFailureUtils.java",
         "CommandUtils.java",
     ],
     deps = [
-        ":describable_execution_unit",
+        ":command_failure_utils",
         ":os",
-        ":shell_escaper",
         "//src/main/java/com/google/devtools/build/lib/shell",
         "//src/main/java/com/google/devtools/build/lib/vfs",
-        "//third_party:guava",
-        "//third_party:jsr305",
+        "//third_party/java/error_prone:annotations",
+        "//third_party/java/guava:annotations",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:collect",
+        "//third_party/java/jsr305_annotations",
+    ],
+)
+
+java_library(
+    name = "command_failure_utils",
+    srcs = [
+        "CommandDescriptionForm.java",
+        "CommandFailureUtils.java",
+    ],
+    deps = [
+        ":describable_execution_unit",
+        ":script_util",
+        "//src/main/java/com/google/devtools/build/lib/cmdline",
+        "//third_party/java/guava:annotations",
+        "//third_party/java/guava:base",
+        "//third_party/java/jsr305_annotations",
+    ],
+)
+
+java_library(
+    name = "maybe_complete_set",
+    srcs = ["MaybeCompleteSet.java"],
+    deps = [
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:collect",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
@@ -121,10 +221,12 @@ java_library(
         "ResourceConverter.java",
     ],
     deps = [
-        "//src/main/java/com/google/devtools/build/lib/actions:localhost_capacity",
+        "//src/main/java/com/google/devtools/build/lib/actions:localhost_compute_resources",
         "//src/main/java/com/google/devtools/common/options",
-        "//third_party:guava",
-        "//third_party:jsr305",
+        "//third_party/java/error_prone:annotations",
+        "//third_party/java/guava:collect",
+        "//third_party/java/guava:primitives",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
@@ -135,8 +237,33 @@ java_library(
     ],
     deps = [
         ":resource_converter",
-        "//src/main/java/com/google/devtools/build/lib/actions:localhost_capacity",
-        "//third_party:guava",
+        "//third_party/java/guava:collect",
+    ],
+)
+
+java_library(
+    name = "shallow_object_size_computer",
+    srcs = ["ShallowObjectSizeComputer.java"],
+)
+
+java_library(
+    name = "object_graph_traverser",
+    srcs = ["ObjectGraphTraverser.java"],
+    deps = [
+        "//src/main/java/com/google/devtools/build/lib/collect:concurrent_identity_set",
+        "//third_party/java/flogger",
+        "//third_party/java/guava:collect",
+        "//third_party/java/jsr305_annotations",
+    ],
+)
+
+java_library(
+    name = "memory_accountant",
+    srcs = ["MemoryAccountant.java"],
+    deps = [
+        ":object_graph_traverser",
+        ":shallow_object_size_computer",
+        "//third_party/java/guava:collect",
     ],
 )
 
@@ -147,64 +274,109 @@ java_library(
     ],
     deps = [
         ":resource_converter",
-        "//src/main/java/com/google/devtools/build/lib/actions:localhost_capacity",
-        "//third_party:guava",
+        "//third_party/java/guava:collect",
+    ],
+)
+
+java_library(
+    name = "pair",
+    srcs = [
+        "Pair.java",
+    ],
+    deps = [
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
 java_library(
     name = "util",
     srcs = [
-        "AbstractIndexer.java",
         "AnsiStrippingOutputStream.java",
-        "BigIntegerFingerprintUtils.java",
+        "BytesSink.java",
         "CPU.java",
-        "CanonicalStringIndexer.java",
         "ClassName.java",
         "DependencySet.java",
         "Either.java",
         "FileHandlerQuerier.java",
         "Fingerprint.java",
-        "GroupedList.java",
         "JavaSleeper.java",
+        "LatestObjectMetricExporter.java",
         "LogHandlerQuerier.java",
         "LoggingUtil.java",
         "LongArrayList.java",
+        "MapCodec.java",
         "NetUtil.java",
         "OnDemandString.java",
         "OptionsUtils.java",
         "OrderedSetMultimap.java",
         "OsUtils.java",
-        "Pair.java",
         "PathFragmentFilter.java",
         "PersistentMap.java",
         "RegexFilter.java",
         "ResourceFileLoader.java",
         "Sleeper.java",
-        "StreamWriter.java",
         "StringIndexer.java",
         "ThreadUtils.java",
         "TimeUtilities.java",
         "UserUtils.java",
     ],
+    exports = [
+        # vfs depends on the profiler and creates a cycle since we use Pair in profiler
+        ":pair",
+        ":deterministic_writer",
+    ],
     deps = [
         ":os",
         ":shell_escaper",
-        ":string",
+        ":string_encoding",
+        ":thread_dump_analyzer",
+        ":thread_dumper",
         "//src/main/java/com/google/devtools/build/lib/bugreport",
-        "//src/main/java/com/google/devtools/build/lib/collect/compacthashset",
-        "//src/main/java/com/google/devtools/build/lib/concurrent",
-        "//src/main/java/com/google/devtools/build/lib/skyframe/serialization/autocodec",
-        "//src/main/java/com/google/devtools/build/lib/skyframe/serialization/autocodec:serialization-constant",
+        "//src/main/java/com/google/devtools/build/lib/concurrent:thread_safety",
+        "//src/main/java/com/google/devtools/build/lib/unsafe:string",
+        "//src/main/java/com/google/devtools/build/lib/util/io",
         "//src/main/java/com/google/devtools/build/lib/vfs",
         "//src/main/java/com/google/devtools/build/lib/vfs:pathfragment",
         "//src/main/java/com/google/devtools/common/options",
-        "//third_party:checker_framework_annotations",
-        "//third_party:error_prone_annotations",
-        "//third_party:flogger",
-        "//third_party:guava",
-        "//third_party:jsr305",
-        "//third_party/protobuf:protobuf_java",
+        "//third_party/java/error_prone:annotations",
+        "//third_party/java/flogger",
+        "//third_party/java/guava:annotations",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:collect",
+        "//third_party/java/guava:concurrent",
+        "//third_party/java/guava:io",
+        "//third_party/java/jsr305_annotations",
+        "//third_party/java/protobuf:protobuf_lite",
+    ],
+)
+
+java_library(
+    name = "deterministic_writer",
+    srcs = [
+        "DeterministicWriter.java",
+        "DeterministicWriterInputStream.java",
+    ],
+    deps = [
+        "//third_party/java/guava:io",
+        "//third_party/java/protobuf",
+    ],
+)
+
+java_library(
+    name = "byte_string_deterministic_writer",
+    srcs = ["ByteStringDeterministicWriter.java"],
+    deps = [
+        ":deterministic_writer",
+        "//third_party/java/protobuf",
+    ],
+)
+
+java_library(
+    name = "proto_deterministic_writer",
+    srcs = ["ProtoDeterministicWriter.java"],
+    deps = [
+        ":deterministic_writer",
+        "//third_party/java/protobuf",
     ],
 )
 
@@ -215,12 +387,14 @@ java_library(
         "FileTypeSet.java",
     ],
     deps = [
+        ":os",
         ":string",
+        "//src/main/java/com/google/devtools/build/lib/skyframe/serialization:visible-for-serialization",
         "//src/main/java/com/google/devtools/build/lib/skyframe/serialization/autocodec",
         "//src/main/java/com/google/devtools/build/lib/skyframe/serialization/autocodec:serialization-constant",
-        "//src/main/java/com/google/devtools/build/lib/vfs:ospathpolicy",
-        "//third_party:guava",
-        "//third_party:jsr305",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:collect",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
@@ -234,7 +408,11 @@ java_library(
     srcs = [
         "ResourceUsage.java",
     ],
-    deps = ["//third_party:guava"],
+    deps = [
+        "//src/main/java/com/google/devtools/build/lib/unix:procmeminfo_parser",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:io",
+    ],
 )
 
 java_library(
@@ -242,23 +420,38 @@ java_library(
     srcs = [
         "GccParamFileEscaper.java",
         "ShellEscaper.java",
+        "WindowsParamFileEscaper.java",
     ],
     deps = [
-        "//src/main/java/com/google/devtools/build/lib/concurrent",
-        "//third_party:guava",
+        "//src/main/java/com/google/devtools/build/lib/concurrent:thread_safety",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:collect",
+        "//third_party/java/guava:escape",
+        "//third_party/java/jsr305_annotations",
+    ],
+)
+
+java_library(
+    name = "string_encoding",
+    srcs = ["StringEncoding.java"],
+    deps = [
+        ":os",
+        "//src/main/java/com/google/devtools/build/lib/unsafe:string",
+        "//third_party/java/guava:base",
     ],
 )
 
 java_library(
     name = "string",
     srcs = [
-        "StringCanonicalizer.java",
         "StringUtil.java",
         "StringUtilities.java",
     ],
     deps = [
-        "//src/main/java/com/google/devtools/build/lib/concurrent",
-        "//third_party:guava",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:collect",
+        "//third_party/java/guava:escape",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
@@ -268,18 +461,26 @@ java_library(
     deps = [
         ":detailed_exit_code",
         ":exit_code",
+        ":serialized_abrupt_exit_exception",
+        "//src/main/protobuf:failure_details_java_proto",
+        "//third_party/java/jsr305_annotations",
+        "//third_party/java/protobuf:protobuf_lite",
     ],
 )
 
 java_library(
+    name = "serialized_abrupt_exit_exception",
+    srcs = ["SerializedAbruptExitException.java"],
+    deps = ["//src/main/java/com/google/devtools/build/lib/skybridge:skybridge_interface"],
+)
+
+java_library(
     name = "exit_code",
-    srcs = [
-        "ExitCode.java",
-    ],
+    srcs = ["ExitCode.java"],
     deps = [
-        "//third_party:error_prone_annotations",
-        "//third_party:guava",
-        "//third_party:jsr305",
+        "//src/main/java/com/google/devtools/build/lib/skybridge:skybridge_interface",
+        "//third_party/java/error_prone:annotations",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
@@ -287,8 +488,9 @@ java_library(
     name = "custom_exit_code_publisher",
     srcs = ["CustomExitCodePublisher.java"],
     deps = [
-        "//third_party:guava",
-        "//third_party:jsr305",
+        "//third_party/java/flogger",
+        "//third_party/java/guava:annotations",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
@@ -297,8 +499,8 @@ java_library(
     srcs = ["CustomFailureDetailPublisher.java"],
     deps = [
         "//src/main/protobuf:failure_details_java_proto",
-        "//third_party:guava",
-        "//third_party:jsr305",
+        "//third_party/java/guava:annotations",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
@@ -308,9 +510,9 @@ java_library(
     deps = [
         ":exit_code",
         "//src/main/protobuf:failure_details_java_proto",
-        "//third_party:guava",
-        "//third_party:jsr305",
-        "//third_party/protobuf:protobuf_java",
+        "//third_party/java/guava:base",
+        "//third_party/java/jsr305_annotations",
+        "//third_party/java/protobuf",
     ],
 )
 
@@ -318,9 +520,29 @@ java_library(
     name = "crash_failure_details",
     srcs = ["CrashFailureDetails.java"],
     deps = [
-        "//src/main/java/com/google/devtools/build/lib/util:detailed_exit_code",
+        ":detailed_exit_code",
         "//src/main/protobuf:failure_details_java_proto",
-        "//third_party:guava",
+        "//third_party/java/flogger",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:collect",
+    ],
+)
+
+java_library(
+    name = "hash_codes",
+    srcs = ["HashCodes.java"],
+    deps = ["//third_party/java/jsr305_annotations"],
+)
+
+java_library(
+    name = "heap_offset_helper",
+    srcs = ["HeapOffsetHelper.java"],
+    deps = [
+        ":TestType",
+        "//src/main/java/com/google/devtools/build/lib/bugreport",
+        "//third_party/java/flogger",
+        "//third_party/java/guava:annotations",
+        "//third_party/java/guava:base",
     ],
 )
 
@@ -331,5 +553,66 @@ java_library(
         ":abrupt_exit_exception",
         ":detailed_exit_code",
         "//src/main/protobuf:failure_details_java_proto",
+        "//third_party/java/jsr305_annotations",
+    ],
+)
+
+java_library(
+    name = "concurrency_meter",
+    srcs = ["ConcurrencyMeter.java"],
+    deps = [
+        "//src/main/java/com/google/devtools/build/lib/clock",
+        "//third_party/java/error_prone:annotations",
+        "//third_party/java/guava:annotations",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:concurrent",
+        "//third_party/java/jsr305_annotations",
+    ],
+)
+
+java_library(
+    name = "blocker",
+    srcs = ["Blocker.java"],
+    add_exports = ["java.base/jdk.internal.misc"],
+)
+
+java_library(
+    name = "thread_dumper",
+    srcs = ["ThreadDumper.java"],
+    add_exports = ["java.base/jdk.internal.vm"],
+)
+
+java_library(
+    name = "thread_dump_analyzer",
+    srcs = ["ThreadDumpAnalyzer.java"],
+)
+
+java_library(
+    name = "value_or_exception",
+    srcs = ["ValueOrException.java"],
+    deps = [
+        "//third_party/java/guava:base",
+    ],
+)
+
+java_library(
+    name = "temp_path_generator",
+    srcs = ["TempPathGenerator.java"],
+    deps = [
+        "//src/main/java/com/google/devtools/build/lib/vfs",
+        "//third_party/java/jsr305_annotations",
+    ],
+)
+
+java_library(
+    name = "cleaner",
+    srcs = ["BazelCleaner.java"],
+)
+
+java_library(
+    name = "markdown",
+    srcs = ["Markdown.java"],
+    deps = [
+        "//third_party/java/commonmark",
     ],
 )

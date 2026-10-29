@@ -18,14 +18,18 @@ import com.google.devtools.build.lib.actions.ActionKeyContext;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
 import com.google.devtools.build.lib.analysis.WorkspaceStatusAction.Factory;
 import com.google.devtools.build.lib.bugreport.BugReporter;
+import com.google.devtools.build.lib.compress.CompressionService;
 import com.google.devtools.build.lib.packages.PackageFactory;
 import com.google.devtools.build.lib.vfs.FileSystem;
+import com.google.devtools.build.lib.vfs.Path;
+import com.google.devtools.build.lib.vfs.SyscallCache;
 import com.google.devtools.build.skyframe.SkyFunction;
 import com.google.devtools.build.skyframe.SkyFunctionName;
-import javax.annotation.Nullable;
+import java.util.function.Supplier;
 
 /** A factory of SkyframeExecutors that returns SequencedSkyframeExecutor. */
 public final class SequencedSkyframeExecutorFactory implements SkyframeExecutorFactory {
+
   @Override
   public SkyframeExecutor create(
       PackageFactory pkgFactory,
@@ -35,10 +39,13 @@ public final class SequencedSkyframeExecutorFactory implements SkyframeExecutorF
       Factory workspaceStatusActionFactory,
       Iterable<? extends DiffAwareness.Factory> diffAwarenessFactories,
       ImmutableMap<SkyFunctionName, SkyFunction> extraSkyFunctions,
-      @Nullable SkyframeExecutorRepositoryHelpersHolder repositoryHelpersHolder,
+      SyscallCache syscallCache,
+      boolean allowExternalRepositories,
+      Supplier<Path> repoContentsCachePathSupplier,
       SkyframeExecutor.SkyKeyStateReceiver skyKeyStateReceiver,
+      CompressionService compressionService,
       BugReporter bugReporter) {
-    return BazelSkyframeExecutorConstants.newBazelSkyframeExecutorBuilder()
+    return SequencedSkyframeExecutor.newBazelSkyframeExecutorBuilder()
         .setPkgFactory(pkgFactory)
         .setFileSystem(fileSystem)
         .setDirectories(directories)
@@ -46,8 +53,11 @@ public final class SequencedSkyframeExecutorFactory implements SkyframeExecutorF
         .setWorkspaceStatusActionFactory(workspaceStatusActionFactory)
         .setDiffAwarenessFactories(diffAwarenessFactories)
         .setExtraSkyFunctions(extraSkyFunctions)
-        .setRepositoryHelpersHolder(repositoryHelpersHolder)
+        .setSyscallCache(syscallCache)
+        .allowExternalRepositories(allowExternalRepositories)
+        .setRepoContentsCachePathSupplier(repoContentsCachePathSupplier)
         .setSkyKeyStateReceiver(skyKeyStateReceiver)
+        .setCompressionService(compressionService)
         .setBugReporter(bugReporter)
         .build();
   }

@@ -22,9 +22,11 @@ import com.google.common.collect.Iterables;
 import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Multimap;
 import com.google.devtools.build.lib.actions.FileStateValue;
+import com.google.devtools.build.lib.actions.FileValue;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.cmdline.LabelConstants;
 import com.google.devtools.build.lib.cmdline.PackageIdentifier;
+import com.google.devtools.build.lib.cmdline.RepositoryName;
 import com.google.devtools.build.lib.collect.compacthashset.CompactHashSet;
 import com.google.devtools.build.lib.packages.Target;
 import com.google.devtools.build.lib.query2.ParallelVisitorUtils.ParallelQueryVisitor;
@@ -32,12 +34,13 @@ import com.google.devtools.build.lib.query2.engine.Callback;
 import com.google.devtools.build.lib.query2.engine.QueryException;
 import com.google.devtools.build.lib.query2.engine.QueryExpressionContext;
 import com.google.devtools.build.lib.query2.engine.Uniquifier;
-import com.google.devtools.build.lib.rules.repository.WorkspaceFileHelper;
 import com.google.devtools.build.lib.skyframe.ContainingPackageLookupFunction;
+import com.google.devtools.build.lib.skyframe.DirectoryListingStateValue;
+import com.google.devtools.build.lib.skyframe.DirectoryListingValue;
 import com.google.devtools.build.lib.skyframe.PackageLookupValue;
-import com.google.devtools.build.lib.skyframe.PackageValue;
+import com.google.devtools.build.lib.skyframe.RepositoryMappingValue;
 import com.google.devtools.build.lib.skyframe.SkyFunctions;
-import com.google.devtools.build.lib.skyframe.WorkspaceNameValue;
+import com.google.devtools.build.lib.vfs.FileStateKey;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.RootedPath;
 import com.google.devtools.build.skyframe.SkyFunctionName;
@@ -46,14 +49,19 @@ import com.google.devtools.build.skyframe.SkyValue;
 import com.google.devtools.build.skyframe.WalkableGraph;
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import javax.annotation.Nullable;
 
-/** A helper class that computes 'rbuildfiles(<blah>)' via BFS. */
+/**
+ * A helper class that visits packages of affected files by BFS and is represented by the
+ * queryfunction 'rbuildfiles'. Other query functions may also use functionality provided by this
+ * visitor.
+ */
 public class RBuildFilesVisitor extends ParallelQueryVisitor<SkyKey, PackageIdentifier, Target> {
 
-  // Each target in the full output of 'rbuildfiles' corresponds to BUILD file InputFile of a
+  // Each target in the full output of this visitor corresponds to BUILD file InputFile of a
   // unique package. So the processResultsBatchSize we choose to pass to the ParallelVisitor ctor
   // influences how many packages each leaf task doing processPartialResults will have to
   // deal with at once. A value of 100 was chosen experimentally.
@@ -65,15 +73,12 @@ public class RBuildFilesVisitor extends ParallelQueryVisitor<SkyKey, PackageIden
       ImmutableSet.of(
           Label.TRANSITIVE_TRAVERSAL,
           SkyFunctions.COLLECT_TARGETS_IN_PACKAGE,
-          SkyFunctions.COLLECT_TEST_SUITES_IN_PACKAGE,
           SkyFunctions.PREPARE_DEPS_OF_TARGETS_UNDER_DIRECTORY,
-          SkyFunctions.PREPARE_TEST_SUITES_UNDER_DIRECTORY,
           SkyFunctions.PACKAGE_ERROR_MESSAGE,
           SkyFunctions.PREPARE_DEPS_OF_PATTERN,
           SkyFunctions.PREPARE_DEPS_OF_PATTERNS);
 
-  private static final SkyKey EXTERNAL_PACKAGE_KEY =
-      PackageValue.key(LabelConstants.EXTERNAL_PACKAGE_IDENTIFIER);
+  private static final SkyKey EXTERNAL_PACKAGE_KEY = LabelConstants.EXTERNAL_PACKAGE_IDENTIFIER;
   private final SkyQueryEnvironment env;
   private final QueryExpressionContext<Target> context;
   private final Uniquifier<SkyKey> visitUniquifier;
@@ -139,7 +144,8 @@ public class RBuildFilesVisitor extends ParallelQueryVisitor<SkyKey, PackageIden
     // globs, but these cannot be included in load statements and so we don't traverse
     // through these either.
     if (!rdep.functionName().equals(SkyFunctions.PACKAGE_LOOKUP)
-        && !rdep.functionName().equals(SkyFunctions.GLOB)) {
+        && !rdep.functionName().equals(SkyFunctions.GLOB)
+        && !rdep.functionName().equals(SkyFunctions.GLOBS)) {
       keysToVisitNext.add(rdep);
     }
   }
@@ -160,7 +166,15 @@ public class RBuildFilesVisitor extends ParallelQueryVisitor<SkyKey, PackageIden
   public void visitFileIdentifiersAndWaitForCompletion(
       WalkableGraph graph, Iterable<PathFragment> fileKeys)
       throws QueryException, InterruptedException {
-    visitAndWaitForCompletion(getSkyKeysForFileFragments(graph, fileKeys));
+    visitAndWaitForCompletion(
+        getSkyKeysForFileFragments(graph, fileKeys, /* includeAncestorKeys= */ false));
+  }
+
+  public void visitFileAndDirectoryKeysAndWaitForCompletion(
+      WalkableGraph graph, Iterable<PathFragment> fileKeys)
+      throws QueryException, InterruptedException {
+    visitAndWaitForCompletion(
+        getSkyKeysForFileFragments(graph, fileKeys, /* includeAncestorKeys= */ true));
   }
 
   /**
@@ -179,9 +193,17 @@ public class RBuildFilesVisitor extends ParallelQueryVisitor<SkyKey, PackageIden
    *
    * <p>Note also that we assume there'll be a PackageLookupValue node for some ancestor directory
    * of every file to which a symlink could possibly point otherwise the file will not be included.
+   *
+   * <p>If includeAncestorKeys is true, we will include a directory listing state of the first
+   * ancestor directory that exists and file states for non-existent ancestors.
    */
-  private static Collection<SkyKey> getSkyKeysForFileFragments(
-      WalkableGraph graph, Iterable<PathFragment> pathFragments) throws InterruptedException {
+  public static Set<SkyKey> getSkyKeysForFileFragments(
+      WalkableGraph graph, Iterable<PathFragment> pathFragments, boolean includeAncestorKeys)
+      throws InterruptedException {
+    if (Iterables.isEmpty(pathFragments)) {
+      return ImmutableSet.of();
+    }
+
     Set<SkyKey> result = new HashSet<>();
     ListMultimap<PathFragment, PathFragment> currentAncestorToOriginalPath =
         ArrayListMultimap.create();
@@ -192,6 +214,9 @@ public class RBuildFilesVisitor extends ParallelQueryVisitor<SkyKey, PackageIden
         currentAncestorToOriginalPath.put(parentPathFragment, pathFragment);
       }
     }
+
+    // Used to find directories that have been added in the diff.
+    Set<RootedPath> pathsToCheckForNewlyAddedDirectories = new HashSet<>();
 
     // We look at each ancestor directory of every file, and use the currentAncestorToOriginalPath
     // map to avoid doing unnecessary work with common ancestors. If we don't find a package
@@ -209,18 +234,37 @@ public class RBuildFilesVisitor extends ParallelQueryVisitor<SkyKey, PackageIden
           SkyKey packageLookupKey = entry.getKey();
           PathFragment currentFragment =
               ((PackageIdentifier) packageLookupKey.argument()).getPackageFragment();
-          Collection<PathFragment> originalFiles =
-              currentAncestorToOriginalPath.get(currentFragment);
+          List<PathFragment> originalFiles = currentAncestorToOriginalPath.get(currentFragment);
           Preconditions.checkState(!originalFiles.isEmpty(), entry);
           for (PathFragment fileName : originalFiles) {
-            result.add(
-                FileStateValue.key(
-                    RootedPath.toRootedPath(packageLookupValue.getRoot(), fileName)));
+            RootedPath rootedPath = RootedPath.toRootedPath(packageLookupValue.getRoot(), fileName);
+            result.add(FileStateValue.key(rootedPath));
+            // Include the File key too in case the FileState is never considered due to a
+            // missing parent directory.
+            result.add(FileValue.key(rootedPath));
+
+            if (includeAncestorKeys) {
+              RootedPath parentPath = rootedPath.getParentDirectory();
+              result.add(DirectoryListingStateValue.key(parentPath));
+              // Include the DirectoryListing key too in case the DirectoryListingState is never
+              // considered due to a missing parent directory.
+              result.add(DirectoryListingValue.key(parentPath));
+              for (PathFragment pathToCheckIfNewlyAdded = fileName;
+                  pathToCheckIfNewlyAdded.getPathString().length()
+                      > currentFragment.getPathString().length();
+                  pathToCheckIfNewlyAdded = pathToCheckIfNewlyAdded.getParentDirectory()) {
+                pathsToCheckForNewlyAddedDirectories.add(
+                    RootedPath.toRootedPath(packageLookupValue.getRoot(), pathToCheckIfNewlyAdded));
+              }
+            }
           }
           currentAncestorToOriginalPath.removeAll(currentFragment);
         }
       }
       currentAncestorToOriginalPath = goUpOneDirectory(currentAncestorToOriginalPath);
+    }
+    if (includeAncestorKeys) {
+      includeAncestorKeysInResult(graph, result, pathsToCheckForNewlyAddedDirectories);
     }
     return result;
   }
@@ -240,15 +284,49 @@ public class RBuildFilesVisitor extends ParallelQueryVisitor<SkyKey, PackageIden
   private static void checkWorkspaceFile(Set<SkyKey> result, PathFragment file) {
     // The WORKSPACE file is a transitive dependency of every package. Unfortunately, there is
     // no specific SkyValue that we can use to figure out under which package path entries it
-    // lives so we add a dependency on the WorkspaceNameValue key.
-    if (WorkspaceFileHelper.matchWorkspaceFileName(file)) {
+    // lives so we add a dependency on the main repo mapping key.
+    if (file.equals(LabelConstants.WORKSPACE_FILE_NAME)
+        || file.equals(LabelConstants.WORKSPACE_DOT_BAZEL_FILE_NAME)) {
       // TODO(mschaller): this should not be checked at runtime. These are constants!
       Preconditions.checkState(
           LabelConstants.WORKSPACE_FILE_NAME
               .getParentDirectory()
               .equals(PathFragment.EMPTY_FRAGMENT),
           LabelConstants.WORKSPACE_FILE_NAME);
-      result.add(WorkspaceNameValue.key());
+      result.add(RepositoryMappingValue.key(RepositoryName.MAIN));
+    }
+  }
+
+  private static void includeAncestorKeysInResult(
+      WalkableGraph graph, Set<SkyKey> result, Set<? extends FileStateKey> fileStateKeysToFetch)
+      throws InterruptedException {
+    // Do a single batch fetch of all FileState's corresponding to directories with
+    // failed package lookups.
+    Map<SkyKey, SkyValue> fileStateValues = graph.getSuccessfulValues(fileStateKeysToFetch);
+    for (SkyKey fileStateKey : fileStateKeysToFetch) {
+      if (fileStateValues.containsKey(fileStateKey)) {
+        FileStateValue fsv = (FileStateValue) fileStateValues.get(fileStateKey);
+        if (!fsv.getType().exists() && !fsv.getType().isDirectory()) {
+          processFileStateKeyForMissingDirectory(result, (FileStateKey) fileStateKey);
+        }
+      } else {
+        processFileStateKeyForMissingDirectory(result, (FileStateKey) fileStateKey);
+      }
+    }
+  }
+
+  private static void processFileStateKeyForMissingDirectory(Set<SkyKey> result, FileStateKey key) {
+    RootedPath rootedPath = key.argument();
+    result.add(key);
+    result.add(FileValue.key(rootedPath));
+    // Add a DirectoryListingState node to our traversal even if the ancestor path too didn't exist
+    // prior to the diff. This will have no effect on the results if the ancestor directory was also
+    // newly created doesn't exist but has the consequence that the first ancestor path that did
+    // exist prior to the diff will be correctly marked as having a changed directory listing state.
+    RootedPath parentPath = rootedPath.getParentDirectory();
+    if (parentPath != null) {
+      result.add(DirectoryListingStateValue.key(parentPath));
+      result.add(DirectoryListingValue.key(parentPath));
     }
   }
 

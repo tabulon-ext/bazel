@@ -16,9 +16,14 @@ package com.google.devtools.build.lib.vfs;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
+import com.github.benmanes.caffeine.cache.stats.ConcurrentStatsCounter;
+import com.github.benmanes.caffeine.cache.stats.StatsCounter;
 import com.google.common.base.Preconditions;
-import com.google.common.primitives.Longs;
+import com.google.protobuf.ByteString;
+import com.google.protobuf.UnsafeByteOperations;
 import java.io.IOException;
+import java.util.HexFormat;
+import javax.annotation.Nullable;
 
 /**
  * Utility class for getting digests of files.
@@ -28,75 +33,58 @@ import java.io.IOException;
  * the {@link #configureCache(long)} function, but note that enabling this cache might have an
  * impact on correctness because not all changes to files can be purely detected from their
  * metadata.
- *
- * <p>Note that this class is responsible for digesting file metadata in an order-independent
- * manner. Care must be taken to do this properly. The digest must be a function of the set of
- * (path, metadata) tuples. While the order of these pairs must not matter, it would <b>not</b> be
- * safe to make the digest be a function of the set of paths and the set of metadata.
- *
- * <p>Note that the (path, metadata) tuples must be unique, otherwise the XOR-based approach will
- * fail.
  */
 public class DigestUtils {
   // Typical size for a digest byte array.
   public static final int ESTIMATED_SIZE = 32;
 
+  private static final HexFormat HEX_FORMAT = HexFormat.of();
+
   /**
-   * Keys used to cache the values of the digests for files where we don't have fast digests.
+   * The digest of a file together with the metadata of the file it was computed from, for files
+   * where we don't have fast digests.
    *
-   * <p>The cache keys are derived from many properties of the file metadata in an attempt to be
-   * able to detect most file changes.
+   * <p>The cache holds one such value per file. A lookup only uses the digest if the file's current
+   * metadata still matches, which is derived from many properties of the file metadata in an
+   * attempt to detect most file changes.
+   *
+   * <p>The metadata lives in the value rather than the key so that a file that changes does not
+   * leave a stale entry behind. The change time only moves forward, so a file's old metadata can
+   * never be observed again.
    */
-  private static class CacheKey {
-    /** Path to the file. */
-    private final PathFragment path;
-
-    /** File system identifier of the file (typically the inode number). */
+  private static final class CachedDigest {
     private final long nodeId;
-
-    /** Last modification time of the file. */
-    private final long modifiedTime;
-
-    /** Size of the file. */
+    private final long changeTime;
     private final long size;
+    private final byte[] digest;
 
-    /**
-     * Constructs a new cache key.
-     *
-     * @param path path to the file
-     * @param status file status data from which to obtain the cache key properties
-     * @throws IOException if reading the file status data fails
-     */
-    public CacheKey(Path path, FileStatus status) throws IOException {
-      this.path = path.asFragment();
+    private CachedDigest(FileStatus status, byte[] digest) throws IOException {
       this.nodeId = status.getNodeId();
-      this.modifiedTime = status.getLastModifiedTime();
+      this.changeTime = status.getLastChangeTimeNanos();
       this.size = status.getSize();
+      this.digest = digest;
     }
 
-    @Override
-    public boolean equals(Object object) {
-      if (object == this) {
-        return true;
-      } else if (!(object instanceof CacheKey)) {
-        return false;
-      } else {
-        CacheKey key = (CacheKey) object;
-        return path.equals(key.path)
-            && nodeId == key.nodeId
-            && modifiedTime == key.modifiedTime
-            && size == key.size;
-      }
+    /** Returns whether the digest is still valid for a file with the given metadata. */
+    private boolean matches(FileStatus status) throws IOException {
+      return nodeId == status.getNodeId()
+          && changeTime == status.getLastChangeTimeNanos()
+          && size == status.getSize();
     }
+  }
 
-    @Override
-    public int hashCode() {
-      int result = 17;
-      result = 31 * result + path.hashCode();
-      result = 31 * result + Longs.hashCode(nodeId);
-      result = 31 * result + Longs.hashCode(modifiedTime);
-      result = 31 * result + Longs.hashCode(size);
-      return result;
+  /**
+   * The cache together with its statistics counter.
+   *
+   * <p>Hits and misses are recorded by {@link #manuallyComputeDigest} itself, through {@code
+   * stats}, so that a present but stale entry counts as a miss. The cache records evictions into
+   * the same counter.
+   */
+  private record DigestCache(Cache<PathFragment, CachedDigest> cache, StatsCounter stats) {
+    private static DigestCache create(long maximumSize) {
+      var stats = new ConcurrentStatsCounter();
+      return new DigestCache(
+          Caffeine.newBuilder().maximumSize(maximumSize).recordStats(() -> stats).build(), stats);
     }
   }
 
@@ -106,11 +94,11 @@ public class DigestUtils {
    * <p>This is null when the cache is disabled.
    *
    * <p>Note that we do not use a {@link com.github.benmanes.caffeine.cache.LoadingCache} because
-   * our keys represent the paths as strings, not as {@link Path} instances. As a result, the
+   * our keys represent the paths as path fragments, not as {@link Path} instances. As a result, the
    * loading function cannot actually compute the digests of the files so we have to handle this
    * externally.
    */
-  private static Cache<CacheKey, byte[]> globalCache = null;
+  @Nullable private static DigestCache globalCache = null;
 
   /** Private constructor to prevent instantiation of utility class. */
   private DigestUtils() {}
@@ -124,10 +112,17 @@ public class DigestUtils {
    * @param maximumSize maximumSize of the cache in number of entries
    */
   public static void configureCache(long maximumSize) {
-    if (maximumSize == 0) {
-      globalCache = null;
-    } else {
-      globalCache = Caffeine.newBuilder().maximumSize(maximumSize).recordStats().build();
+    globalCache = maximumSize == 0 ? null : DigestCache.create(maximumSize);
+  }
+
+  /**
+   * Clears the cache contents without changing its size. No-op if the cache hasn't yet been
+   * initialized.
+   */
+  public static void clearCache() {
+    DigestCache cache = globalCache;
+    if (cache != null) {
+      cache.cache().invalidateAll();
     }
   }
 
@@ -139,9 +134,9 @@ public class DigestUtils {
    * @return an immutable snapshot of the cache statistics
    */
   public static CacheStats getCacheStats() {
-    Cache<CacheKey, byte[]> cache = globalCache;
+    DigestCache cache = globalCache;
     Preconditions.checkNotNull(cache, "configureCache() must have been called with a size >= 0");
-    return cache.stats();
+    return cache.cache().stats();
   }
 
   /**
@@ -151,72 +146,78 @@ public class DigestUtils {
    * <p>If {@link Path#getFastDigest} has already been attempted and was not available, call {@link
    * #manuallyComputeDigest} to skip an additional attempt to obtain the fast digest.
    *
-   * @param path Path of the file.
-   * @param fileSize Size of the file. Used to determine if digest calculation should be done
-   *     serially or in parallel. Files larger than a certain threshold will be read serially, in
-   *     order to avoid excessive disk seeks.
+   * @param path the file path
+   * @param status a recently obtained file status, if available. Used to skip a stat.
    */
-  public static byte[] getDigestWithManualFallback(Path path, long fileSize, SyscallCache syscalls)
-      throws IOException {
-    byte[] digest = syscalls.getFastDigest(path);
-    return digest != null ? digest : manuallyComputeDigest(path, fileSize);
+  public static byte[] getDigestWithManualFallback(
+      Path path, XattrProvider xattrProvider, @Nullable FileStatus status) throws IOException {
+    byte[] digest = xattrProvider.getFastDigest(path);
+    return digest != null ? digest : manuallyComputeDigest(path, status);
   }
 
   /**
-   * Gets the digest of {@code path}, using a constant-time xattr call if the filesystem supports
-   * it, and calculating the digest manually otherwise.
+   * Calculates a digest manually (i.e., assuming that a fast digest can't obtained).
    *
-   * <p>Unlike {@link #getDigestWithManualFallback}, will not rate-limit manual digesting of files,
-   * so only use this method if the file size is truly unknown and you don't expect many concurrent
-   * manual digests of large files.
-   *
-   * @param path Path of the file.
+   * @param path the file path
+   * @param status a recently obtained file status, if available. Used to skip a stat.
    */
-  public static byte[] getDigestWithManualFallbackWhenSizeUnknown(Path path, SyscallCache syscalls)
+  public static byte[] manuallyComputeDigest(Path path, @Nullable FileStatus status)
       throws IOException {
-    return getDigestWithManualFallback(path, -1, syscalls);
-  }
-
-  /**
-   * Calculates the digest manually.
-   *
-   * @param path Path of the file.
-   * @param fileSize Size of the file. Used to determine if digest calculation should be done
-   *     serially or in parallel. Files larger than a certain threshold will be read serially, in
-   *     order to avoid excessive disk seeks.
-   */
-  public static byte[] manuallyComputeDigest(Path path, long fileSize) throws IOException {
-    byte[] digest;
-
     // Attempt a cache lookup if the cache is enabled.
-    Cache<CacheKey, byte[]> cache = globalCache;
-    CacheKey key = null;
+    DigestCache cache = globalCache;
+    PathFragment key = null;
     if (cache != null) {
-      key = new CacheKey(path, path.stat());
-      digest = cache.getIfPresent(key);
-      if (digest != null) {
-        return digest;
+      if (status == null) {
+        status = path.stat();
       }
+      key = path.asFragment();
+      // Look up through the map view, which informs the eviction policy but does not record
+      // statistics, so that only a usable digest counts as a hit.
+      CachedDigest cached = cache.cache().asMap().get(key);
+      if (cached != null && cached.matches(status)) {
+        cache.stats().recordHits(1);
+        return cached.digest;
+      }
+      cache.stats().recordMisses(1);
     }
 
-    digest = path.getDigest();
+    byte[] digest = path.getDigest();
 
-    Preconditions.checkNotNull(digest, "Missing digest for %s (size %s)", path, fileSize);
+    Preconditions.checkNotNull(digest, "Missing digest for %s", path);
     if (cache != null) {
-      cache.put(key, digest);
+      cache.cache().put(key, new CachedDigest(status, digest));
     }
     return digest;
   }
 
-  /** Compute lhs ^= rhs bitwise operation of the arrays. May clobber either argument. */
-  public static byte[] xor(byte[] lhs, byte[] rhs) {
+  /**
+   * Combines two digests into one such that swapping the arguments results in the same result. May
+   * clobber either argument.
+   */
+  public static byte[] combineUnordered(byte[] lhs, byte[] rhs) {
     int n = rhs.length;
     if (lhs.length >= n) {
       for (int i = 0; i < n; i++) {
-        lhs[i] ^= rhs[i];
+        // Use + as in Guava's Hashing.combineUnordered.
+        // This has a number of advantages over XOR, which was used in the past:
+        // * Identical inputs will not cancel each other out.
+        // * Due to the carry, addition isn't a linear operation on the level of bit vectors.
+        //   This prevents adversaries from producing linear combinations (i.e., subsets of input
+        //   sets) that collide with other inputs.
+        lhs[i] += rhs[i];
       }
       return lhs;
     }
-    return xor(rhs, lhs);
+    return combineUnordered(rhs, lhs);
+  }
+
+  /** Returns the lowercase hex encoding of the given bytes. */
+  public static ByteString toHexByteString(byte[] bytes) {
+    byte[] hex = new byte[2 * bytes.length];
+    for (int i = 0; i < bytes.length; i++) {
+      hex[2 * i] = (byte) HEX_FORMAT.toHighHexDigit(bytes[i]);
+      hex[2 * i + 1] = (byte) HEX_FORMAT.toLowHexDigit(bytes[i]);
+    }
+    return UnsafeByteOperations.unsafeWrap(hex);
   }
 }

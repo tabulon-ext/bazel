@@ -14,14 +14,15 @@
 
 package com.google.devtools.build.lib.analysis.config;
 
+import static com.google.devtools.common.options.OptionsParser.getOptionDefinitionByName;
+import static java.util.Arrays.stream;
+
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.devtools.build.lib.analysis.config.FragmentOptions.SelectRestriction;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.common.options.OptionDefinition;
 import com.google.devtools.common.options.OptionMetadataTag;
-import com.google.devtools.common.options.OptionsParser;
 import java.util.Map;
 import javax.annotation.Nullable;
 
@@ -55,51 +56,40 @@ public final class BuildOptionDetails {
   static BuildOptionDetails forOptions(
       Iterable<? extends FragmentOptions> buildOptions, Map<Label, Object> starlarkOptions) {
     ImmutableMap.Builder<String, OptionDetails> map = ImmutableMap.builder();
-    try {
-      for (FragmentOptions options : buildOptions) {
-        ImmutableList<OptionDefinition> optionDefinitions =
-            OptionsParser.getOptionDefinitions(options.getClass());
-        Map<OptionDefinition, SelectRestriction> selectRestrictions =
-            options.getSelectRestrictions();
+    ImmutableMap.Builder<String, String> oldNameToCanonicalName = ImmutableMap.builder();
+    for (FragmentOptions options : buildOptions) {
+      ImmutableList<? extends OptionDefinition> optionDefinitions =
+          OptionDefinition.getOptionDefinitions(options.getOptionsClass());
 
-        for (OptionDefinition optionDefinition : optionDefinitions) {
-          if (ImmutableList.copyOf(optionDefinition.getOptionMetadataTags())
-              .contains(OptionMetadataTag.INTERNAL)) {
-            // ignore internal options
-            continue;
-          }
-          Object value = optionDefinition.getField().get(options);
-          if (value == null && !optionDefinition.isSpecialNullDefault()) {
-              // See {@link Option#defaultValue} for an explanation of default "null" strings.
-              value = optionDefinition.getUnparsedDefaultValue();
-          }
-          map.put(
-              optionDefinition.getOptionName(),
-              new OptionDetails(
-                  options.getClass(),
-                  value,
-                  optionDefinition.allowsMultiple(),
-                  selectRestrictions.get(optionDefinition)));
+      for (OptionDefinition optionDefinition : optionDefinitions) {
+        if (ImmutableList.copyOf(optionDefinition.getOptionMetadataTags())
+            .contains(OptionMetadataTag.INTERNAL)) {
+          // ignore internal options
+          continue;
         }
+        if (!optionDefinition.getOldOptionName().isEmpty()) {
+          oldNameToCanonicalName.put(
+              optionDefinition.getOldOptionName(), optionDefinition.getOptionName());
+        }
+        Object value = optionDefinition.getValue(options);
+        map.put(
+            optionDefinition.getOptionName(),
+            optionDefinition.allowsMultiple()
+                ? new MultiValueOptionDetails(options.getOptionsClass(), value)
+                : new OptionDetails(options.getOptionsClass(), value));
       }
-    } catch (IllegalAccessException e) {
-      throw new IllegalStateException(
-          "Unexpected illegal access trying to create this configuration's options map: ", e);
     }
-    return new BuildOptionDetails(map.buildOrThrow(), ImmutableMap.copyOf(starlarkOptions));
+    return new BuildOptionDetails(
+        map.buildOrThrow(),
+        oldNameToCanonicalName.buildOrThrow(),
+        ImmutableMap.copyOf(starlarkOptions));
   }
 
-  private static final class OptionDetails {
+  private static class OptionDetails {
 
-    private OptionDetails(
-        Class<? extends FragmentOptions> optionsClass,
-        Object value,
-        boolean allowsMultiple,
-        @Nullable SelectRestriction selectRestriction) {
+    private OptionDetails(Class<? extends FragmentOptions> optionsClass, Object value) {
       this.optionsClass = optionsClass;
       this.value = value;
-      this.allowsMultiple = allowsMultiple;
-      this.selectRestriction = selectRestriction;
     }
 
     /** The {@link FragmentOptions} class that defines this option. */
@@ -107,15 +97,13 @@ public final class BuildOptionDetails {
 
     /** The value of the given option (either explicitly defined or default). May be null. */
     @Nullable private final Object value;
+  }
 
-    /** Whether or not this option supports multiple values. */
-    private final boolean allowsMultiple;
-
-    /**
-     * Information on whether this option is permitted to appear in {@code config_setting}s. Null if
-     * there is no such restriction.
-     */
-    @Nullable private final SelectRestriction selectRestriction;
+  // A subtype avoids the padded boolean field in each option snapshot.
+  private static final class MultiValueOptionDetails extends OptionDetails {
+    private MultiValueOptionDetails(Class<? extends FragmentOptions> optionsClass, Object value) {
+      super(optionsClass, value);
+    }
   }
 
   /**
@@ -130,13 +118,21 @@ public final class BuildOptionDetails {
    */
   private final ImmutableMap<String, OptionDetails> nativeOptionsMap;
 
+  /**
+   * For options with {@link Option#oldName()}, maps the old name to the canonical name. Options
+   * with no old name aren't in this map.
+   */
+  private final ImmutableMap<String, String> oldNameToCanonicalName;
+
   /** Maps Starlark option labels to values */
   private final ImmutableMap<Label, Object> starlarkOptionsMap;
 
   private BuildOptionDetails(
       ImmutableMap<String, OptionDetails> nativeOptionsMap,
+      ImmutableMap<String, String> oldNameToCanonicalName,
       ImmutableMap<Label, Object> starlarkOptionsMap) {
     this.nativeOptionsMap = nativeOptionsMap;
+    this.oldNameToCanonicalName = oldNameToCanonicalName;
     this.starlarkOptionsMap = starlarkOptionsMap;
   }
 
@@ -174,6 +170,14 @@ public final class BuildOptionDetails {
   }
 
   /**
+   * If this is an {@link Option#oldName()} alias for a canonical option name, returns the canonical
+   * name. Else returns the original name (since there's only one).
+   */
+  public String getCanonicalName(String optionName) {
+    return oldNameToCanonicalName.getOrDefault(optionName, optionName);
+  }
+
+  /**
    * Returns whether or not the given option supports multiple values at the command line (e.g.
    * "--myoption value1 --myOption value2 ..."). Returns false for unrecognized options. Use {@link
    * #getOptionClass} to distinguish between those and legitimate single-value options.
@@ -183,17 +187,20 @@ public final class BuildOptionDetails {
    */
   public boolean allowsMultipleValues(String optionName) {
     OptionDetails optionDetails = nativeOptionsMap.get(optionName);
-    return optionDetails != null && optionDetails.allowsMultiple;
+    return optionDetails instanceof MultiValueOptionDetails;
   }
 
-  /**
-   * Returns information about whether an option may appear in a {@code config_setting}.
-   *
-   * <p>Returns null for unrecognized options or options that have no restriction.
-   */
-  @Nullable
-  public SelectRestriction getSelectRestriction(String optionName) {
+  public boolean isNonConfigurable(String optionName) {
     OptionDetails optionDetails = nativeOptionsMap.get(optionName);
-    return optionDetails == null ? null : optionDetails.selectRestriction;
+    if (optionDetails == null) {
+      return false;
+    }
+    OptionDefinition optionDefinition =
+        getOptionDefinitionByName(optionDetails.optionsClass, optionName);
+    if (optionDefinition == null) {
+      return false;
+    }
+    return stream(optionDefinition.getOptionMetadataTags())
+        .anyMatch(OptionMetadataTag.NON_CONFIGURABLE::equals);
   }
 }

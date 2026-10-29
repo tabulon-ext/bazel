@@ -1,9 +1,18 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("//tools/res:win_res.bzl", "windows_resources")
+load(":launcher_maker_test.bzl", "launcher_maker_test")
 load(":win_rules.bzl", "win_cc_binary", "win_cc_library")
 
 filegroup(
     name = "srcs",
     srcs = glob(["**"]) + ["//src/tools/launcher/util:srcs"],
     visibility = ["//src:__pkg__"],
+)
+
+windows_resources(
+    name = "win_resources",
+    rc_files = ["win_resources.rc"],
+    resources = ["win_manifest.xml"],
 )
 
 win_cc_binary(
@@ -18,6 +27,7 @@ win_cc_binary(
         ":java_launcher",
         ":launcher_base",
         ":python_launcher",
+        ":win_resources",
         "//src/tools/launcher/util",
         "//src/tools/launcher/util:data_parser",
     ],
@@ -29,6 +39,7 @@ win_cc_library(
     hdrs = ["launcher.h"],
     deps = [
         "//src/main/cpp/util:filesystem",
+        "//src/main/native/windows:lib-process",
         "//src/tools/launcher/util",
         "//src/tools/launcher/util:data_parser",
     ],
@@ -41,6 +52,7 @@ win_cc_library(
     deps = [
         ":launcher_base",
         "//src/main/native/windows:lib-process",
+        "//src/tools/launcher/util",
     ],
 )
 
@@ -60,3 +72,15 @@ win_cc_library(
     hdrs = ["bash_launcher.h"],
     deps = [":launcher_base"],
 )
+
+cc_binary(
+    name = "launcher_maker",
+    srcs = ["launcher_maker.cc"],
+    visibility = [
+        "//src:__pkg__",
+        "//tools/launcher:__pkg__",
+    ],
+    deps = ["//src/main/cpp/util:filesystem"],
+)
+
+launcher_maker_test(name = "launcher_maker_test")

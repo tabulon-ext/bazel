@@ -13,8 +13,11 @@
 // limitations under the License.
 package com.google.devtools.build.lib.remote.util;
 
+import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Strings.isNullOrEmpty;
 import static com.google.common.base.Throwables.getStackTraceAsString;
+import static com.google.common.util.concurrent.Futures.immediateFailedFuture;
+import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static java.util.stream.Collectors.joining;
 
 import build.bazel.remote.execution.v2.Action;
@@ -22,37 +25,31 @@ import build.bazel.remote.execution.v2.ActionResult;
 import build.bazel.remote.execution.v2.Digest;
 import build.bazel.remote.execution.v2.Platform;
 import com.google.common.base.Ascii;
-import com.google.common.base.Preconditions;
 import com.google.common.base.Throwables;
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.ImmutableSet;
 import com.google.common.util.concurrent.AsyncCallable;
 import com.google.common.util.concurrent.FluentFuture;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
-import com.google.common.util.concurrent.MoreExecutors;
 import com.google.devtools.build.lib.actions.ActionInput;
-import com.google.devtools.build.lib.actions.ExecutionRequirements;
-import com.google.devtools.build.lib.actions.Spawn;
+import com.google.devtools.build.lib.actions.EnvironmentalExecException;
+import com.google.devtools.build.lib.actions.ExecException;
 import com.google.devtools.build.lib.actions.SpawnMetrics;
 import com.google.devtools.build.lib.actions.SpawnResult;
-import com.google.devtools.build.lib.actions.Spawns;
 import com.google.devtools.build.lib.authandtls.CallCredentialsProvider;
+import com.google.devtools.build.lib.authandtls.credentialhelper.CredentialHelperException;
 import com.google.devtools.build.lib.remote.ExecutionStatusException;
-import com.google.devtools.build.lib.remote.common.BulkTransferException;
+import com.google.devtools.build.lib.remote.common.ActionKey;
 import com.google.devtools.build.lib.remote.common.CacheNotFoundException;
 import com.google.devtools.build.lib.remote.common.OutputDigestMismatchException;
-import com.google.devtools.build.lib.remote.common.RemoteCacheClient.ActionKey;
-import com.google.devtools.build.lib.remote.options.RemoteOptions;
-import com.google.devtools.build.lib.remote.options.RemoteOutputsMode;
+import com.google.devtools.build.lib.remote.common.RemoteExecutionCapabilitiesException;
 import com.google.devtools.build.lib.server.FailureDetails;
 import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
-import com.google.devtools.build.lib.vfs.PathFragment;
+import com.google.devtools.build.lib.server.FailureDetails.RemoteExecution;
 import com.google.protobuf.Any;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Duration;
 import com.google.protobuf.InvalidProtocolBufferException;
+import com.google.protobuf.Timestamp;
 import com.google.protobuf.util.Durations;
 import com.google.rpc.BadRequest;
 import com.google.rpc.Code;
@@ -65,17 +62,12 @@ import com.google.rpc.RequestInfo;
 import com.google.rpc.ResourceInfo;
 import com.google.rpc.RetryInfo;
 import com.google.rpc.Status;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
-import java.text.DecimalFormat;
-import java.text.DecimalFormatSymbols;
+import java.time.Instant;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.Locale;
-import java.util.Map;
 import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
 import java.util.function.BiFunction;
 import javax.annotation.Nullable;
 
@@ -84,67 +76,16 @@ public final class Utils {
 
   private Utils() {}
 
-  /**
-   * Returns the result of a {@link ListenableFuture} if successful, or throws any checked {@link
-   * Exception} directly if it's an {@link IOException} or else wraps it in an {@link IOException}.
-   *
-   * <p>Cancel the future on {@link InterruptedException}
-   */
-  public static <T> T getFromFuture(ListenableFuture<T> f)
-      throws IOException, InterruptedException {
-    return getFromFuture(f, /* cancelOnInterrupt */ true);
-  }
-
-  /**
-   * Returns the result of a {@link ListenableFuture} if successful, or throws any checked {@link
-   * Exception} directly if it's an {@link IOException} or else wraps it in an {@link IOException}.
-   *
-   * @param cancelOnInterrupt cancel the future on {@link InterruptedException} if {@code true}.
-   */
-  public static <T> T getFromFuture(ListenableFuture<T> f, boolean cancelOnInterrupt)
-      throws IOException, InterruptedException {
-    try {
-      return f.get();
-    } catch (ExecutionException e) {
-      Throwable cause = e.getCause();
-      if (cause instanceof InterruptedException) {
-        throw (InterruptedException) cause;
-      }
-      if (cause instanceof IOException) {
-        throw (IOException) cause;
-      }
-      if (cause instanceof RuntimeException) {
-        throw (RuntimeException) cause;
-      }
-      throw new IOException(cause);
-    } catch (InterruptedException e) {
-      if (cancelOnInterrupt) {
-        f.cancel(true);
-      }
-      throw e;
-    }
-  }
-
-  /**
-   * Returns the (exec root relative) path of a spawn output that should be made available via
-   * {@link SpawnResult#getInMemoryOutput(ActionInput)}.
-   */
-  @Nullable
-  public static PathFragment getInMemoryOutputPath(Spawn spawn) {
-    String outputPath =
-        spawn.getExecutionInfo().get(ExecutionRequirements.REMOTE_EXECUTION_INLINE_OUTPUTS);
-    if (outputPath != null) {
-      return PathFragment.create(outputPath);
-    }
-    return null;
-  }
-
   /** Constructs a {@link SpawnResult}. */
   public static SpawnResult createSpawnResult(
+      DigestUtil digestUtil,
+      ActionKey actionKey,
       int exitCode,
       boolean cacheHit,
       String runnerName,
       @Nullable InMemoryOutput inMemoryOutput,
+      Timestamp executionStartTimestamp,
+      Timestamp executionCompletedTimestamp,
       SpawnMetrics spawnMetrics,
       String mnemonic) {
     SpawnResult.Builder builder =
@@ -154,8 +95,16 @@ public final class Utils {
             .setExitCode(exitCode)
             .setRunnerName(cacheHit ? runnerName + " cache hit" : runnerName)
             .setCacheHit(cacheHit)
+            .setStartTime(timestampToInstant(executionStartTimestamp))
+            .setWallTimeInMs(
+                (int)
+                    java.time.Duration.between(
+                            timestampToInstant(executionStartTimestamp),
+                            timestampToInstant(executionCompletedTimestamp))
+                        .toMillis())
             .setSpawnMetrics(spawnMetrics)
-            .setRemote(true);
+            .setRemote(true)
+            .setDigest(digestUtil.asSpawnLogProto(actionKey));
     if (exitCode != 0) {
       builder.setFailureDetail(
           FailureDetail.newBuilder()
@@ -171,35 +120,8 @@ public final class Utils {
     return builder.build();
   }
 
-  /** Returns {@code true} if all spawn outputs should be downloaded to disk. */
-  public static boolean shouldDownloadAllSpawnOutputs(
-      RemoteOutputsMode remoteOutputsMode, int exitCode, boolean hasTopLevelOutputs) {
-    return remoteOutputsMode.downloadAllOutputs()
-        ||
-        // In case the action failed, download all outputs. It might be helpful for debugging
-        // and there is no point in injecting output metadata of a failed action.
-        exitCode != 0
-        ||
-        // If one output of a spawn is a top level output then download all outputs. Spawns
-        // are typically structured in a way that either all or no outputs are top level and
-        // it's much simpler to implement under this assumption.
-        (remoteOutputsMode.downloadToplevelOutputsOnly() && hasTopLevelOutputs);
-  }
-
-  /** Returns {@code true} if outputs contains one or more top level outputs. */
-  public static boolean hasFilesToDownload(
-      Collection<? extends ActionInput> outputs, ImmutableSet<PathFragment> filesToDownload) {
-    if (filesToDownload.isEmpty()) {
-      return false;
-    }
-
-    for (ActionInput output : outputs) {
-      if (filesToDownload.contains(output.getExecPath())) {
-        return true;
-      }
-    }
-
-    return false;
+  public static Instant timestampToInstant(Timestamp timestamp) {
+    return Instant.ofEpochSecond(timestamp.getSeconds(), timestamp.getNanos());
   }
 
   private static String statusName(int code) {
@@ -365,9 +287,10 @@ public final class Utils {
         + errorDetailsMessage(status.getDetailsList());
   }
 
-  public static String grpcAwareErrorMessage(IOException e) {
+  private static String grpcAwareErrorMessage(IOException e) {
     io.grpc.Status errStatus = io.grpc.Status.fromThrowable(e);
     if (e.getCause() instanceof ExecutionStatusException) {
+      // Display error message returned by the remote service.
       try {
         return "Remote Execution Failure:\n"
             + executionStatusExceptionErrorMessage((ExecutionStatusException) e.getCause());
@@ -379,17 +302,28 @@ public final class Utils {
       }
     }
     if (!errStatus.getCode().equals(io.grpc.Status.UNKNOWN.getCode())) {
-      // If the error originated in the gRPC library then display it as "STATUS: error message"
-      // to the user
-      return String.format("%s: %s", errStatus.getCode().name(), errStatus.getDescription());
+      // Display error message returned by the gRPC library, prefixed by the status code.
+      StringBuilder sb = new StringBuilder();
+      sb.append(errStatus.getCode().name());
+      sb.append(": ");
+      sb.append(errStatus.getDescription());
+      // If the error originated from a credential helper, print additional debugging information.
+      for (Throwable t = errStatus.getCause(); t != null; t = t.getCause()) {
+        if (t instanceof CredentialHelperException) {
+          sb.append(": ");
+          sb.append(t.getMessage());
+          break;
+        }
+      }
+      return sb.toString();
     }
     return e.getMessage();
   }
 
   public static String grpcAwareErrorMessage(Throwable error, boolean verboseFailures) {
     String errorMessage;
-    if (error instanceof IOException) {
-      errorMessage = grpcAwareErrorMessage((IOException) error);
+    if (error instanceof IOException ioException) {
+      errorMessage = grpcAwareErrorMessage(ioException);
     } else {
       errorMessage = error.getMessage();
     }
@@ -410,19 +344,19 @@ public final class Utils {
   public static ListenableFuture<ActionResult> downloadAsActionResult(
       ActionKey actionDigest,
       BiFunction<Digest, OutputStream, ListenableFuture<Void>> downloadFunction) {
-    ByteArrayOutputStream data = new ByteArrayOutputStream(/* size= */ 1024);
-    ListenableFuture<Void> download = downloadFunction.apply(actionDigest.getDigest(), data);
+    ByteString.Output data = ByteString.newOutput(/* initialCapacity= */ 1024);
+    ListenableFuture<Void> download = downloadFunction.apply(actionDigest.digest(), data);
     return FluentFuture.from(download)
         .transformAsync(
             (v) -> {
               try {
-                return Futures.immediateFuture(ActionResult.parseFrom(data.toByteArray()));
+                return Futures.immediateFuture(ActionResult.parseFrom(data.toByteString()));
               } catch (InvalidProtocolBufferException e) {
-                return Futures.immediateFailedFuture(e);
+                return immediateFailedFuture(e);
               }
             },
-            MoreExecutors.directExecutor())
-        .catching(CacheNotFoundException.class, (e) -> null, MoreExecutors.directExecutor());
+            directExecutor())
+        .catching(CacheNotFoundException.class, (e) -> null, directExecutor());
   }
 
   public static void verifyBlobContents(Digest expected, Digest actual) throws IOException {
@@ -442,7 +376,7 @@ public final class Utils {
     action.setCommandDigest(command);
     action.setInputRootDigest(inputRoot);
     if (!timeout.isZero()) {
-      action.setTimeout(Duration.newBuilder().setSeconds(timeout.getSeconds()));
+      action.setTimeout(Duration.newBuilder().setSeconds(timeout.toSeconds()));
     }
     if (!cacheable) {
       action.setDoNotCache(true);
@@ -484,15 +418,15 @@ public final class Utils {
    */
   public static <V> ListenableFuture<V> refreshIfUnauthenticatedAsync(
       AsyncCallable<V> call, CallCredentialsProvider callCredentialsProvider) {
-    Preconditions.checkNotNull(call);
-    Preconditions.checkNotNull(callCredentialsProvider);
+    checkNotNull(call);
+    checkNotNull(callCredentialsProvider);
 
     try {
       return Futures.catchingAsync(
           call.call(),
           Throwable.class,
           (e) -> refreshIfUnauthenticatedAsyncOnException(e, call, callCredentialsProvider),
-          MoreExecutors.directExecutor());
+          directExecutor());
     } catch (Throwable t) {
       return refreshIfUnauthenticatedAsyncOnException(t, call, callCredentialsProvider);
     }
@@ -512,15 +446,15 @@ public final class Utils {
       }
     }
 
-    return Futures.immediateFailedFuture(t);
+    return immediateFailedFuture(t);
   }
 
   /** Same as {@link #refreshIfUnauthenticatedAsync} but calling a synchronous code block. */
   public static <V> V refreshIfUnauthenticated(
       Callable<V> call, CallCredentialsProvider callCredentialsProvider)
       throws IOException, InterruptedException {
-    Preconditions.checkNotNull(call);
-    Preconditions.checkNotNull(callCredentialsProvider);
+    checkNotNull(call);
+    checkNotNull(callCredentialsProvider);
 
     try {
       return call.call();
@@ -544,154 +478,29 @@ public final class Utils {
     }
   }
 
-  private static final ImmutableList<String> UNITS = ImmutableList.of("KiB", "MiB", "GiB", "TiB");
-  // Format as single digit decimal number, but skipping the trailing .0.
-  private static final DecimalFormat BYTE_COUNT_FORMAT =
-      new DecimalFormat("0.#", new DecimalFormatSymbols(Locale.US));
-
-  /**
-   * Converts the number of bytes to a human readable string, e.g. 1024 -> 1 KiB.
-   *
-   * <p>Negative numbers are not allowed.
-   */
-  public static String bytesCountToDisplayString(long bytes) {
-    Preconditions.checkArgument(bytes >= 0);
-
-    if (bytes < 1024) {
-      return bytes + " B";
-    }
-
-    int unitIndex = 0;
-    long value = bytes;
-    while ((unitIndex + 1) < UNITS.size() && value >= (1 << 20)) {
-      value >>= 10;
-      unitIndex++;
-    }
-
-    return String.format("%s %s", BYTE_COUNT_FORMAT.format(value / 1024.0), UNITS.get(unitIndex));
+  public static ExecException createExecExceptionForCredentialHelperException(
+      CredentialHelperException e) {
+    return new EnvironmentalExecException(
+        e,
+        FailureDetail.newBuilder()
+            .setRemoteOptions(
+                FailureDetails.RemoteOptions.newBuilder()
+                    .setCode(FailureDetails.RemoteOptions.Code.CREDENTIALS_READ_FAILURE)
+                    .build())
+            .setMessage("Exec failed due to CredentialHelperException")
+            .build());
   }
 
-  public static boolean shouldAcceptCachedResultFromRemoteCache(
-      RemoteOptions remoteOptions, @Nullable Spawn spawn) {
-    return remoteOptions.remoteAcceptCached && (spawn == null || Spawns.mayBeCachedRemotely(spawn));
-  }
-
-  public static boolean shouldAcceptCachedResultFromDiskCache(
-      RemoteOptions remoteOptions, @Nullable Spawn spawn) {
-    if (remoteOptions.incompatibleRemoteResultsIgnoreDisk) {
-      return spawn == null || Spawns.mayBeCached(spawn);
-    } else {
-      return remoteOptions.remoteAcceptCached && (spawn == null || Spawns.mayBeCached(spawn));
-    }
-  }
-
-  public static boolean shouldAcceptCachedResultFromCombinedCache(
-      RemoteOptions remoteOptions, @Nullable Spawn spawn) {
-    if (remoteOptions.incompatibleRemoteResultsIgnoreDisk) {
-      // --incompatible_remote_results_ignore_disk is set. Disk cache is treated as local cache.
-      // Actions which are tagged with `no-remote-cache` can still hit the disk cache.
-      return spawn == null || Spawns.mayBeCached(spawn);
-    } else {
-      // Disk cache is treated as a remote cache and disabled for `no-remote-cache`.
-      return remoteOptions.remoteAcceptCached
-          && (spawn == null || Spawns.mayBeCachedRemotely(spawn));
-    }
-  }
-
-  public static boolean shouldUploadLocalResultsToRemoteCache(
-      RemoteOptions remoteOptions, Map<String, String> executionInfo) {
-    return remoteOptions.remoteUploadLocalResults
-        && Spawns.mayBeCachedRemotely(executionInfo)
-        && !executionInfo.containsKey(ExecutionRequirements.NO_REMOTE_CACHE_UPLOAD);
-  }
-
-  public static boolean shouldUploadLocalResultsToRemoteCache(
-      RemoteOptions remoteOptions, @Nullable Spawn spawn) {
-    ImmutableMap<String, String> executionInfo = null;
-    if (spawn != null) {
-      executionInfo = spawn.getExecutionInfo();
-    }
-    return shouldUploadLocalResultsToRemoteCache(remoteOptions, executionInfo);
-  }
-
-  public static boolean shouldUploadLocalResultsToDiskCache(
-      RemoteOptions remoteOptions, Map<String, String> executionInfo) {
-    if (remoteOptions.incompatibleRemoteResultsIgnoreDisk) {
-      return Spawns.mayBeCached(executionInfo);
-    } else {
-      return remoteOptions.remoteUploadLocalResults && Spawns.mayBeCached(executionInfo);
-    }
-  }
-
-  public static boolean shouldUploadLocalResultsToDiskCache(
-      RemoteOptions remoteOptions, @Nullable Spawn spawn) {
-    ImmutableMap<String, String> executionInfo = null;
-    if (spawn != null) {
-      executionInfo = spawn.getExecutionInfo();
-    }
-    return shouldUploadLocalResultsToDiskCache(remoteOptions, executionInfo);
-  }
-
-  public static boolean shouldUploadLocalResultsToCombinedDisk(
-      RemoteOptions remoteOptions, Map<String, String> executionInfo) {
-    if (remoteOptions.incompatibleRemoteResultsIgnoreDisk) {
-      // If --incompatible_remote_results_ignore_disk is set, we treat the disk cache part as local
-      // cache. Actions which are tagged with `no-remote-cache` can still hit the disk cache.
-      return shouldUploadLocalResultsToDiskCache(remoteOptions, executionInfo);
-    } else {
-      // Otherwise, it's treated as a remote cache and disabled for `no-remote-cache`.
-      return shouldUploadLocalResultsToRemoteCache(remoteOptions, executionInfo);
-    }
-  }
-
-  public static boolean shouldUploadLocalResultsToCombinedDisk(
-      RemoteOptions remoteOptions, @Nullable Spawn spawn) {
-    ImmutableMap<String, String> executionInfo = null;
-    if (spawn != null) {
-      executionInfo = spawn.getExecutionInfo();
-    }
-    return shouldUploadLocalResultsToCombinedDisk(remoteOptions, executionInfo);
-  }
-
-  public static void waitForBulkTransfer(
-      Iterable<? extends ListenableFuture<?>> transfers, boolean cancelRemainingOnInterrupt)
-      throws BulkTransferException, InterruptedException {
-    BulkTransferException bulkTransferException = null;
-    InterruptedException interruptedException = null;
-    boolean interrupted = Thread.currentThread().isInterrupted();
-    for (ListenableFuture<?> transfer : transfers) {
-      try {
-        if (interruptedException == null) {
-          // Wait for all transfers to finish.
-          getFromFuture(transfer, cancelRemainingOnInterrupt);
-        } else {
-          transfer.cancel(true);
-        }
-      } catch (IOException e) {
-        if (bulkTransferException == null) {
-          bulkTransferException = new BulkTransferException();
-        }
-        bulkTransferException.add(e);
-      } catch (InterruptedException e) {
-        interrupted = Thread.interrupted() || interrupted;
-        interruptedException = e;
-        if (!cancelRemainingOnInterrupt) {
-          // leave the rest of the transfers alone
-          break;
-        }
-      }
-    }
-    if (interrupted) {
-      Thread.currentThread().interrupt();
-    }
-    if (interruptedException != null) {
-      if (bulkTransferException != null) {
-        interruptedException.addSuppressed(bulkTransferException);
-      }
-      throw interruptedException;
-    }
-    if (bulkTransferException != null) {
-      throw bulkTransferException;
-    }
+  public static ExecException createExecExceptionFromRemoteExecutionCapabilitiesException(
+      RemoteExecutionCapabilitiesException e) {
+    return new EnvironmentalExecException(
+        e.getCause(),
+        FailureDetail.newBuilder()
+            .setRemoteExecution(
+                RemoteExecution.newBuilder()
+                    .setCode(RemoteExecution.Code.CAPABILITIES_QUERY_FAILURE)
+                    .build())
+            .setMessage("Failed to query remote execution capabilities")
+            .build());
   }
 }

@@ -15,16 +15,18 @@
 #define BAZEL_SRC_MAIN_CPP_BAZEL_STARTUP_OPTIONS_H_
 
 #include <string>
+#include <vector>
 
 #include "src/main/cpp/startup_options.h"
 #include "src/main/cpp/util/exit_code.h"
+#include "src/main/cpp/util/path_platform.h"
 
 namespace blaze {
 
 // BazelStartupOptions contains the startup options that are Bazel-specific.
 class BazelStartupOptions : public StartupOptions {
  public:
-  explicit BazelStartupOptions(const WorkspaceLayout *workspace_layout);
+  BazelStartupOptions();
 
   void AddExtraOptions(std::vector<std::string> *result) const override;
 
@@ -35,6 +37,8 @@ class BazelStartupOptions : public StartupOptions {
   void MaybeLogStartupOptionWarnings() const override;
 
  protected:
+  blaze_util::Path GetDefaultOutputRoot() const override;
+
   std::string GetRcFileBaseName() const override { return ".bazelrc"; }
 
  private:
@@ -42,8 +46,6 @@ class BazelStartupOptions : public StartupOptions {
   bool use_system_rc;
   bool use_workspace_rc;
   bool use_home_rc;
-  // TODO(b/36168162): Remove the master rc flag.
-  bool use_master_bazelrc_;
 };
 
 }  // namespace blaze

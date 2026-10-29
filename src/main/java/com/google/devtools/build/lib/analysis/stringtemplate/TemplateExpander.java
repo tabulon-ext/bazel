@@ -14,6 +14,7 @@
 package com.google.devtools.build.lib.analysis.stringtemplate;
 
 import com.google.common.collect.ImmutableSet;
+import javax.annotation.Nullable;
 
 /**
  * Simple string template expansion. String templates consist of text interspersed with
@@ -35,6 +36,7 @@ public final class TemplateExpander {
    * If the string contains a single variable, return the expansion of that variable. Otherwise,
    * return null.
    */
+  @Nullable
   public static String expandSingleVariable(String expression, TemplateContext context)
       throws ExpansionException {
     String var = new TemplateExpander(expression).getSingleVariable();
@@ -122,8 +124,9 @@ public final class TemplateExpander {
    */
   private String scanVariable() throws ExpansionException {
     char c = buffer[offset];
-    switch (c) {
-      case '(': { // looks like $(SRCS)
+    return switch (c) {
+      case '(' -> {
+        // looks like $(SRCS)
         offset++;
         int start = offset;
         while (offset < length && buffer[offset] != ')') {
@@ -132,10 +135,11 @@ public final class TemplateExpander {
         if (offset >= length) {
           throw new ExpansionException("unterminated variable reference");
         }
-        return new String(buffer, start, offset - start);
+        yield new String(buffer, start, offset - start);
+        // We only parse ${variable} syntax to provide a better error message.
       }
-      // We only parse ${variable} syntax to provide a better error message.
-      case '{': { // looks like ${SRCS}
+      case '{' -> {
+        // looks like ${SRCS}
         offset++;
         int start = offset;
         while (offset < length && buffer[offset] != '}') {
@@ -145,32 +149,38 @@ public final class TemplateExpander {
           throw new ExpansionException("unterminated variable reference");
         }
         String expr = new String(buffer, start, offset - start);
-        throw new ExpansionException("'${" + expr + "}' syntax is not supported; use '$(" + expr
-                                     + ")' instead for \"Make\" variables, or escape the '$' as "
-                                     + "'$$' if you intended this for the shell");
+        throw new ExpansionException(
+            "'${"
+                + expr
+                + "}' syntax is not supported; use '$("
+                + expr
+                + ")' instead for \"Make\" variables, or escape the '$' as "
+                + "'$$' if you intended this for the shell");
       }
-      case '@':
-      case '<':
-      case '^':
-        return String.valueOf(c);
-      default: {
+      case '@', '<', '^' -> String.valueOf(c);
+      default -> {
         int start = offset;
         while (offset + 1 < length && Character.isJavaIdentifierPart(buffer[offset + 1])) {
           offset++;
         }
         String expr = new String(buffer, start, offset + 1 - start);
-        throw new ExpansionException("'$" + expr + "' syntax is not supported; use '$(" + expr
-                                     + ")' instead for \"Make\" variables, or escape the '$' as "
-                                     + "'$$' if you intended this for the shell");
+        throw new ExpansionException(
+            "'$"
+                + expr
+                + "' syntax is not supported; use '$("
+                + expr
+                + ")' instead for \"Make\" variables, or escape the '$' as "
+                + "'$$' if you intended this for the shell");
       }
-    }
+    };
   }
 
   /**
    * @return the variable name if the variable spans from offset to the end of the buffer, otherwise
-   *         null
+   *     null
    * @throws ExpansionException if the variable reference was ill-formed
    */
+  @Nullable
   private String getSingleVariable() throws ExpansionException {
     if (buffer[offset] == '$') {
       offset++;

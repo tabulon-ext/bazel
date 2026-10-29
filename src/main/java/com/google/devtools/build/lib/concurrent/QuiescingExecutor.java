@@ -39,6 +39,11 @@ import java.util.concurrent.Executor;
  */
 public interface QuiescingExecutor extends Executor {
 
+  /** Executes the given {@link QuiescingTask}. */
+  default void execute(QuiescingTask task) {
+    execute((Runnable) task);
+  }
+
   /**
    * Waits for all tasks to complete. If the {@link QuiescingExecutor} owns its own {@link
    * java.util.concurrent.ExecutorService}, the service will also be shutdown.
@@ -52,6 +57,14 @@ public interface QuiescingExecutor extends Executor {
    *                         If false, just wait for them to terminate normally.
    */
   void awaitQuiescence(boolean interruptWorkers) throws InterruptedException;
+
+  /**
+   * Similar to {@link #awaitQuiescence}, but without shutting down the ExecutorService.
+   *
+   * <p>This is ideal for situations where tasks, that can spawn other tasks, are submitted in waves
+   * and we'd like to reuse the same QuiescingExecutor for them.
+   */
+  void awaitQuiescenceWithoutShutdown(boolean interruptWorkers) throws InterruptedException;
 
   /**
    * Prevent quiescence of the executor until the given future is completed. If the executor is

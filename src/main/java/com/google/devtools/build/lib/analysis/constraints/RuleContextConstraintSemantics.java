@@ -14,39 +14,25 @@
 
 package com.google.devtools.build.lib.analysis.constraints;
 
-import static com.google.common.collect.ImmutableList.toImmutableList;
+import static java.util.Objects.requireNonNull;
 
-import com.google.auto.value.AutoValue;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Verify;
 import com.google.common.collect.ImmutableCollection;
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
-import com.google.devtools.build.lib.actions.Artifact;
-import com.google.devtools.build.lib.actions.FailAction;
-import com.google.devtools.build.lib.actions.MutableActionGraph.ActionConflictException;
+import com.google.devtools.build.lib.analysis.AliasProvider;
 import com.google.devtools.build.lib.analysis.ConfiguredTarget;
-import com.google.devtools.build.lib.analysis.DependencyKind;
 import com.google.devtools.build.lib.analysis.IncompatiblePlatformProvider;
 import com.google.devtools.build.lib.analysis.LabelAndLocation;
-import com.google.devtools.build.lib.analysis.RuleConfiguredTargetBuilder;
 import com.google.devtools.build.lib.analysis.RuleContext;
-import com.google.devtools.build.lib.analysis.Runfiles;
-import com.google.devtools.build.lib.analysis.RunfilesProvider;
-import com.google.devtools.build.lib.analysis.RunfilesSupport;
 import com.google.devtools.build.lib.analysis.TransitiveInfoCollection;
 import com.google.devtools.build.lib.analysis.configuredtargets.OutputFileConfiguredTarget;
 import com.google.devtools.build.lib.analysis.constraints.EnvironmentCollection.EnvironmentWithGroup;
 import com.google.devtools.build.lib.analysis.constraints.SupportedEnvironmentsProvider.RemovedEnvironmentCulprit;
-import com.google.devtools.build.lib.analysis.platform.ConstraintValueInfo;
-import com.google.devtools.build.lib.analysis.platform.PlatformProviderUtils;
-import com.google.devtools.build.lib.analysis.test.AnalysisTestResultInfo;
 import com.google.devtools.build.lib.cmdline.Label;
-import com.google.devtools.build.lib.collect.nestedset.NestedSet;
-import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
 import com.google.devtools.build.lib.packages.Attribute;
 import com.google.devtools.build.lib.packages.AttributeMap;
 import com.google.devtools.build.lib.packages.BuildType;
@@ -58,9 +44,6 @@ import com.google.devtools.build.lib.packages.RuleClass;
 import com.google.devtools.build.lib.packages.Type;
 import com.google.devtools.build.lib.packages.Type.LabelClass;
 import com.google.devtools.build.lib.packages.Type.LabelVisitor;
-import com.google.devtools.build.lib.server.FailureDetails.FailAction.Code;
-import com.google.devtools.build.lib.skyframe.ConfiguredTargetAndData;
-import com.google.devtools.build.lib.util.OrderedSetMultimap;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -388,21 +371,25 @@ public class RuleContextConstraintSemantics implements ConstraintSemantics<RuleC
 
   /**
    * Helper container for checkConstraints: stores both a set of deps that need to be
-   * constraint-checked and the subset of those deps that only appear inside selects.
+   * constraint-checked and the subset of those deps that support static constraint checking.
    */
   private static class DepsToCheck {
     private final Set<TransitiveInfoCollection> allDeps;
-    private final Set<TransitiveInfoCollection> selectOnlyDeps;
-    DepsToCheck(Set<TransitiveInfoCollection> depsToCheck,
-        Set<TransitiveInfoCollection> selectOnlyDeps) {
+    private final Set<TransitiveInfoCollection> staticallyCheckableDeps;
+
+    DepsToCheck(
+        Set<TransitiveInfoCollection> depsToCheck,
+        Set<TransitiveInfoCollection> staticallyCheckableDeps) {
       this.allDeps = depsToCheck;
-      this.selectOnlyDeps = selectOnlyDeps;
+      this.staticallyCheckableDeps = staticallyCheckableDeps;
     }
+
     Set<TransitiveInfoCollection> allDeps() {
       return allDeps;
     }
-    boolean isSelectOnly(TransitiveInfoCollection dep) {
-      return selectOnlyDeps.contains(dep);
+
+    boolean canStaticallyCheck(TransitiveInfoCollection dep) {
+      return staticallyCheckableDeps.contains(dep);
     }
   }
 
@@ -449,7 +436,7 @@ public class RuleContextConstraintSemantics implements ConstraintSemantics<RuleC
     DepsToCheck depsToCheck = getConstraintCheckedDependencies(ruleContext);
 
     for (TransitiveInfoCollection dep : depsToCheck.allDeps()) {
-      if (!depsToCheck.isSelectOnly(dep)) {
+      if (depsToCheck.canStaticallyCheck(dep)) {
         // TODO(bazel-team): support static constraint checking for selects. A selectable constraint
         // is valid if the union of all deps in the select includes all of this rule's static
         // environments. Determining that requires following the select paths that don't get chosen,
@@ -536,7 +523,7 @@ public class RuleContextConstraintSemantics implements ConstraintSemantics<RuleC
     // words, the removed environment is no good, but some subset of it may be.
     for (EnvironmentWithGroup depEnv :
         depEnvironments.getRefinedEnvironments().getGroupedEnvironments()) {
-      for (Label fulfiller : depEnv.group().getFulfillers(depEnv.environment()).toList()) {
+      for (Label fulfiller : depEnv.group().getFulfillers(depEnv.environment())) {
         if (prunedEnvironmentsFromThisDep.contains(fulfiller)) {
           refinedEnvironmentsSoFar.add(depEnv);
         }
@@ -610,13 +597,11 @@ public class RuleContextConstraintSemantics implements ConstraintSemantics<RuleC
       Label currentTarget, Label environment, RemovedEnvironmentCulprit reason) {
     LabelAndLocation culprit = reason.culprit();
     Label targetToExplore =
-        currentTarget.equals(culprit.getLabel())
-            ? reason.selectedDepForCulprit()
-            : culprit.getLabel();
+        currentTarget.equals(culprit.label()) ? reason.selectedDepForCulprit() : culprit.label();
 
     return new StringJoiner("\n")
         .add("  environment: " + environment)
-        .add("    removed by: " + culprit.getLabel() + " (" + culprit.getLocation() + ")")
+        .add("    removed by: " + culprit.label() + " (" + culprit.location() + ")")
         .add("    because of a select() that chooses dep: " + reason.selectedDepForCulprit())
         .add("    which lacks: " + environment)
         .add("")
@@ -699,7 +684,7 @@ public class RuleContextConstraintSemantics implements ConstraintSemantics<RuleC
         // If the actual environments include members from the expected environment's group, we
         // need to either find the environment itself or another one that transitively fulfills it.
         if (actualEnvironmentLabels.contains(environment)
-            || intersect(actualEnvironmentLabels, group.getFulfillers(environment).toList())) {
+            || intersect(actualEnvironmentLabels, group.getFulfillers(environment))) {
           isSatisfied = true;
         }
       } else {
@@ -707,7 +692,7 @@ public class RuleContextConstraintSemantics implements ConstraintSemantics<RuleC
         // the group's defaults are implicitly included. So we need to check those defaults for
         // either the expected environment or another environment that transitively fulfills it.
         if (group.isDefault(environment)
-            || intersect(group.getFulfillers(environment).toList(), group.getDefaults())) {
+            || intersect(group.getFulfillers(environment), group.getDefaults())) {
           isSatisfied = true;
         }
       }
@@ -723,8 +708,7 @@ public class RuleContextConstraintSemantics implements ConstraintSemantics<RuleC
       if (!expectedEnvironments.getGroups().contains(group)) {
         for (Label expectedDefault : group.getDefaults()) {
           if (!actualEnvironmentLabels.contains(expectedDefault)
-              && !intersect(
-                  actualEnvironmentLabels, group.getFulfillers(expectedDefault).toList())) {
+              && !intersect(actualEnvironmentLabels, group.getFulfillers(expectedDefault))) {
             missingEnvironments.add(expectedDefault);
           }
         }
@@ -740,12 +724,12 @@ public class RuleContextConstraintSemantics implements ConstraintSemantics<RuleC
 
   /**
    * Returns all dependencies that should be constraint-checked against the current rule, including
-   * both "unconditional" deps (outside selects) and deps that only appear in selects.
+   * both statically checked deps and deps that only refine environments because they depend on the
+   * build configuration (in selects or late-bound aliases).
    */
   private static DepsToCheck getConstraintCheckedDependencies(RuleContext ruleContext) {
     Set<TransitiveInfoCollection> depsToCheck = new LinkedHashSet<>();
-    Set<TransitiveInfoCollection> selectOnlyDeps = new LinkedHashSet<>();
-    Set<TransitiveInfoCollection> depsOutsideSelects = new LinkedHashSet<>();
+    Set<TransitiveInfoCollection> staticallyCheckableDeps = new LinkedHashSet<>();
 
     AttributeMap attributes = ruleContext.attributes();
     for (String attr : attributes.getAttributeNames()) {
@@ -766,6 +750,14 @@ public class RuleContextConstraintSemantics implements ConstraintSemantics<RuleC
       Set<Label> selectOnlyDepsForThisAttribute =
           getDepsOnlyInSelects(ruleContext, attr, attributes.getAttributeType(attr));
       for (TransitiveInfoCollection dep : ruleContext.getPrerequisites(attr)) {
+        // For normal configured targets the target's label is the same label appearing in the
+        // select(). But for AliasConfiguredTargets the label in the select() refers to the alias,
+        // while dep.getLabel() refers to the target the alias points to. So add this quick check
+        // to make sure we're comparing the same labels.
+        Label depLabelInSelect =
+            dep instanceof ConfiguredTarget configuredTarget
+                ? configuredTarget.getOriginalLabel()
+                : dep.getLabel();
         // Output files inherit the environment spec of their generating rule.
         if (dep instanceof OutputFileConfiguredTarget) {
           // Note this reassignment means constraint violation errors reference the generating
@@ -776,28 +768,20 @@ public class RuleContextConstraintSemantics implements ConstraintSemantics<RuleC
         // checking, but for now just pass them by.
         if (dep.getProvider(SupportedEnvironmentsProvider.class) != null) {
           depsToCheck.add(dep);
-          // For normal configured targets the target's label is the same label appearing in the
-          // select(). But for AliasConfiguredTargets the label in the select() refers to the alias,
-          // while dep.getLabel() refers to the target the alias points to. So add this quick check
-          // to make sure we're comparing the same labels.
-          Label depLabelInSelect =
-              (dep instanceof ConfiguredTarget)
-                  ? ((ConfiguredTarget) dep).getOriginalLabel()
-                  : dep.getLabel();
-          if (!selectOnlyDepsForThisAttribute.contains(depLabelInSelect)) {
-            depsOutsideSelects.add(dep);
+          // Both select() entries and late-bound aliases (e.g. label_flag, label_setting) resolve
+          // based on the build configuration, so refine environments rather than checking them
+          // statically across all configurations.
+          boolean isConfigurationBased =
+              selectOnlyDepsForThisAttribute.contains(depLabelInSelect)
+                  || dep.getProvider(AliasProvider.LateBoundAliasProvider.class) != null;
+          if (!isConfigurationBased) {
+            staticallyCheckableDeps.add(dep);
           }
         }
       }
     }
 
-    for (TransitiveInfoCollection dep : depsToCheck) {
-      if (!depsOutsideSelects.contains(dep)) {
-        selectOnlyDeps.add(dep);
-      }
-    }
-
-    return new DepsToCheck(depsToCheck, selectOnlyDeps);
+    return new DepsToCheck(depsToCheck, staticallyCheckableDeps);
   }
 
   /**
@@ -839,9 +823,12 @@ public class RuleContextConstraintSemantics implements ConstraintSemantics<RuleC
   private static <T> void addSelectValuesToSet(BuildType.Selector<T> select, Set<Label> set) {
     Type<T> type = select.getOriginalType();
     LabelVisitor visitor = (label, dummy) -> set.add(label);
-    for (T value : select.getEntries().values()) {
-      type.visitLabels(visitor, value, /*context=*/ null);
-    }
+    select.forEach(
+        (label, value) -> {
+          if (value != null) {
+            type.visitLabels(visitor, value, /* context= */ null);
+          }
+        });
   }
 
   /**
@@ -854,17 +841,16 @@ public class RuleContextConstraintSemantics implements ConstraintSemantics<RuleC
    * instances like {@link OutputFileConfiguredTarget}, however, the {@code underlyingTarget} is the
    * rule that generated the file.
    */
-  @AutoValue
-  public abstract static class IncompatibleCheckResult {
-    private static IncompatibleCheckResult create(
-        boolean isIncompatible, ConfiguredTarget underlyingTarget) {
-      return new AutoValue_RuleContextConstraintSemantics_IncompatibleCheckResult(
-          isIncompatible, underlyingTarget);
+  public record IncompatibleCheckResult(boolean isIncompatible, ConfiguredTarget underlyingTarget) {
+    public IncompatibleCheckResult {
+      requireNonNull(underlyingTarget, "underlyingTarget");
     }
 
-    public abstract boolean isIncompatible();
+    private static IncompatibleCheckResult create(
+        boolean isIncompatible, ConfiguredTarget underlyingTarget) {
+      return new IncompatibleCheckResult(isIncompatible, underlyingTarget);
+    }
 
-    public abstract ConfiguredTarget underlyingTarget();
   }
 
   /**
@@ -881,160 +867,5 @@ public class RuleContextConstraintSemantics implements ConstraintSemantics<RuleC
     }
     return IncompatibleCheckResult.create(
         target.get(IncompatiblePlatformProvider.PROVIDER) != null, target);
-  }
-
-  /**
-   * Creates an incompatible {@link ConfiguredTarget} if the corresponding rule is incompatible.
-   *
-   * <p>Returns null if the target is not incompatible.
-   *
-   * <p>"Incompatible" here means either:
-   *
-   * <ol>
-   *   <li>the corresponding <code>target_compatible_with</code> list contains a constraint that the
-   *       current platform doesn't satisfy, or
-   *   <li>a transitive dependency is incompatible.
-   * </ol>
-   *
-   * @param ruleContext analysis context for the rule
-   * @param prerequisiteMap the dependencies of the rule
-   * @throws ActionConflictException if the underlying {@link RuleConfiguredTargetBuilder}
-   *     encounters a problem when assembling a dummy action for the incompatible {@link
-   *     ConfiguredTarget}.
-   */
-  @Nullable
-  public static ConfiguredTarget incompatibleConfiguredTarget(
-      RuleContext ruleContext,
-      OrderedSetMultimap<DependencyKind, ConfiguredTargetAndData> prerequisiteMap)
-      throws ActionConflictException, InterruptedException {
-    // The target (ruleContext) is incompatible if explicitly specified to be. Any rule that
-    // provides its own meaning for the "target_compatible_with" attribute has to be excluded here.
-    // For example, the "toolchain" rule uses "target_compatible_with" for bazel's toolchain
-    // resolution.
-    if (!ruleContext.getRule().getRuleClass().equals("toolchain")
-        && ruleContext.attributes().has("target_compatible_with")) {
-      ImmutableList<ConstraintValueInfo> invalidConstraintValues =
-          PlatformProviderUtils.constraintValues(
-                  ruleContext.getPrerequisites("target_compatible_with"))
-              .stream()
-              .filter(cv -> !ruleContext.targetPlatformHasConstraint(cv))
-              .collect(toImmutableList());
-
-      if (!invalidConstraintValues.isEmpty()) {
-        return createIncompatibleConfiguredTarget(ruleContext, null, invalidConstraintValues);
-      }
-    }
-
-    // This is incompatible if one of the dependencies is as well.
-    ImmutableList<ConfiguredTarget> incompatibleDependencies =
-        prerequisiteMap.values().stream()
-            .map(value -> checkForIncompatibility(value.getConfiguredTarget()))
-            .filter(IncompatibleCheckResult::isIncompatible)
-            .map(IncompatibleCheckResult::underlyingTarget)
-            .collect(toImmutableList());
-    if (!incompatibleDependencies.isEmpty()) {
-      return createIncompatibleConfiguredTarget(ruleContext, incompatibleDependencies, null);
-    }
-
-    return null;
-  }
-
-  /**
-   * A helper function for incompatibleConfiguredTarget() to actually create the incompatible {@link
-   * ConfiguredTarget}.
-   *
-   * @param ruleContext analysis context for the rule
-   * @param targetsResponsibleForIncompatibility the targets that are responsible this target's
-   *     incompatibility. If null, that means that target is responsible for its own
-   *     incompatibility. I.e. it has constraints in target_compatible_with that were not satisfied
-   *     on the target platform. This must be null if violatedConstraints is set. This must be set
-   *     if violatedConstraints is null.
-   * @param violatedConstraints the constraints that the target platform doesn't satisfy. This must
-   *     be null if targetRsesponsibleForIncompatibility is set.
-   * @throws ActionConflictException if the underlying {@link RuleConfiguredTargetBuilder}
-   *     encounters a problem when assembling a dummy action for the incompatible {@link
-   *     ConfiguredTarget}.
-   */
-  private static ConfiguredTarget createIncompatibleConfiguredTarget(
-      RuleContext ruleContext,
-      @Nullable ImmutableList<ConfiguredTarget> targetsResponsibleForIncompatibility,
-      @Nullable ImmutableList<ConstraintValueInfo> violatedConstraints)
-      throws ActionConflictException, InterruptedException {
-    // Create a dummy ConfiguredTarget that has the IncompatiblePlatformProvider set.
-    ImmutableList<Artifact> outputArtifacts = ruleContext.getOutputArtifacts();
-
-    if (ruleContext.isTestTarget() && outputArtifacts.isEmpty()) {
-      // Test targets require RunfilesSupport to be added to the RuleConfiguredTargetBuilder
-      // which needs an "executable".  Create one here if none exist already.
-      //
-      // It would be ideal if we could avoid this. Currently the problem is that some rules like
-      // sh_test only declare an output artifact in the corresponding ConfiguredTarget factory
-      // function (see ShBinary.java). Since this code path here replaces the factory function rules
-      // like sh_test never get a chance to declare an output artifact.
-      //
-      // On top of that, the rest of the code base makes the assumption that test targets provide an
-      // instance RunfilesSupport. This can be seen in the TestProvider, the TestActionBuilder, and
-      // the RuleConfiguredTargetBuilder classes. There might be a way to break this assumption, but
-      // it's currently too heavily baked in to work around it more nicely than this.
-      //
-      // Theoretically, this hack shouldn't be an issue because the corresponding actions will never
-      // get executed. They cannot be queried either.
-      outputArtifacts = ImmutableList.of(ruleContext.createOutputArtifact());
-    }
-
-    NestedSet<Artifact> filesToBuild =
-        NestedSetBuilder.<Artifact>stableOrder().addAll(outputArtifacts).build();
-
-    Runfiles.Builder runfilesBuilder =
-        new Runfiles.Builder(
-            ruleContext.getWorkspaceName(),
-            ruleContext.getConfiguration().legacyExternalRunfiles());
-    Runfiles runfiles =
-        runfilesBuilder
-            .addTransitiveArtifacts(filesToBuild)
-            .addRunfiles(ruleContext, RunfilesProvider.DEFAULT_RUNFILES)
-            .build();
-
-    RuleConfiguredTargetBuilder builder = new RuleConfiguredTargetBuilder(ruleContext);
-    builder.setFilesToBuild(filesToBuild);
-
-    if (targetsResponsibleForIncompatibility != null) {
-      builder.addNativeDeclaredProvider(
-          IncompatiblePlatformProvider.incompatibleDueToTargets(
-              ruleContext.targetPlatform(), targetsResponsibleForIncompatibility));
-    } else if (violatedConstraints != null) {
-      builder.addNativeDeclaredProvider(
-          IncompatiblePlatformProvider.incompatibleDueToConstraints(
-              ruleContext.targetPlatform(), violatedConstraints));
-    } else {
-      throw new IllegalArgumentException(
-          "Both violatedConstraints and targetsResponsibleForIncompatibility are null");
-    }
-
-    // If this is an analysis test, RuleConfiguredTargetBuilder performs some additional sanity
-    // checks. Satisfy them with an appropriate provider.
-    if (ruleContext.getRule().isAnalysisTest()) {
-      builder.addNativeDeclaredProvider(
-          new AnalysisTestResultInfo(
-              /*success=*/ false,
-              "This test is incompatible and should not have been run. Please file a bug"
-                  + " upstream."));
-    }
-
-    builder.add(RunfilesProvider.class, RunfilesProvider.simple(runfiles));
-    if (!outputArtifacts.isEmpty()) {
-      Artifact executable = outputArtifacts.get(0);
-      RunfilesSupport runfilesSupport =
-          RunfilesSupport.withExecutableButNoArgs(ruleContext, runfiles, executable);
-      builder.setRunfilesSupport(runfilesSupport, executable);
-
-      ruleContext.registerAction(
-          new FailAction(
-              ruleContext.getActionOwner(),
-              outputArtifacts,
-              "Can't build this. This target is incompatible. Please file a bug upstream.",
-              Code.CANT_BUILD_INCOMPATIBLE_TARGET));
-    }
-    return builder.build();
   }
 }

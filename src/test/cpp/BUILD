@@ -1,3 +1,6 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
 # Description:
 #   C++ utility tests for Bazel
 package(default_visibility = ["//visibility:public"])
@@ -15,13 +18,14 @@ cc_test(
             "blaze_util_windows_test.cc",
         ],
         "//conditions:default": [
-            "blaze_util_test.cc",
             "blaze_util_posix_test.cc",
+            "blaze_util_test.cc",
         ],
     }),
     deps = [
         "//src/main/cpp:blaze_util",
-        "//src/main/cpp/util",
+        "//src/main/cpp/util:filesystem",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -36,7 +40,9 @@ cc_test(
         "//src/main/cpp:blaze_util",
         "//src/main/cpp:option_processor",
         "//src/main/cpp:workspace_layout",
-        "//src/main/cpp/util",
+        "//src/main/cpp/util:blaze_exit_code",
+        "//src/main/cpp/util:filesystem",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -52,7 +58,9 @@ cc_test(
         "//src/main/cpp:option_processor",
         "//src/main/cpp:rc_file",
         "//src/main/cpp:workspace_layout",
-        "//src/main/cpp/util",
+        "//src/main/cpp/util:blaze_exit_code",
+        "//src/main/cpp/util:filesystem",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -64,8 +72,22 @@ cc_test(
     deps = [
         "//src/main/cpp:blaze_util",
         "//src/main/cpp:option_processor",
+        "//src/main/cpp:sem_ver",
         "//src/main/cpp:workspace_layout",
-        "//src/main/cpp/util",
+        "//src/main/cpp/util:filesystem",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "sem_ver_test",
+    size = "small",
+    srcs = ["sem_ver_test.cc"],
+    deps = [
+        "//src/main/cpp:sem_ver",
+        "@abseil-cpp//absl/strings:str_format",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -77,6 +99,8 @@ cc_library(
     hdrs = ["test_util.h"],
     deps = [
         "//src/main/cpp:startup_options",
+        "//src/main/cpp/util:blaze_exit_code",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -90,6 +114,9 @@ cc_test(
         "//src/main/cpp:blaze_util",
         "//src/main/cpp:startup_options",
         "//src/main/cpp:workspace_layout",
+        "//src/main/cpp/util:blaze_exit_code",
+        "//src/main/cpp/util:filesystem",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -103,6 +130,10 @@ cc_test(
         "//src/main/cpp:bazel_startup_options",
         "//src/main/cpp:blaze_util",
         "//src/main/cpp:workspace_layout",
+        "//src/main/cpp/util:blaze_exit_code",
+        "//src/main/cpp/util:filesystem",
+        "@abseil-cpp//absl/time",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -114,7 +145,8 @@ cc_test(
     deps = [
         "//src/main/cpp:blaze_util",
         "//src/main/cpp:workspace_layout",
-        "//src/main/cpp/util",
+        "//src/main/cpp/util:filesystem",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],
 )

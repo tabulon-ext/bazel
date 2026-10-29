@@ -14,43 +14,104 @@
 package com.google.devtools.build.skyframe;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.google.devtools.build.lib.concurrent.AbstractQueueVisitor;
 import com.google.devtools.build.lib.concurrent.MultiThreadPoolsQuiescingExecutor;
 import com.google.devtools.build.lib.concurrent.MultiThreadPoolsQuiescingExecutor.ThreadPoolType;
+import com.google.devtools.build.lib.concurrent.QuiescingExecutor;
+import com.google.devtools.build.lib.concurrent.QuiescingTask;
 import com.google.devtools.build.skyframe.ParallelEvaluatorContext.RunnableMaker;
+import com.google.devtools.build.skyframe.SkyFunction.Environment.SkyKeyComputeState;
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
+import org.mockito.Mock;
+import org.mockito.junit.MockitoJUnit;
+import org.mockito.junit.MockitoRule;
 
 /** Tests for {@link NodeEntryVisitor}. */
 @RunWith(JUnit4.class)
 public class NodeEntryVisitorTest {
+  @Rule public final MockitoRule mockito = MockitoJUnit.rule();
+
+  @Mock private MultiThreadPoolsQuiescingExecutor executor;
+  @Mock private InflightTrackingProgressReceiver receiver;
+  @Mock private RunnableMaker runnableMaker;
+  @Mock private Cache<SkyKey, SkyKeyComputeState> stateCache;
+
+  private static QuiescingTask createTestTask() {
+    return new QuiescingTask(mock(AbstractQueueVisitor.class)) {
+      @Override
+      public void runCore() {}
+    };
+  }
+
   @Test
   public void enqueueEvaluation_multiThreadPoolsQuiescingExecutor_nonCPUHeavyKey() {
-    MultiThreadPoolsQuiescingExecutor executor = mock(MultiThreadPoolsQuiescingExecutor.class);
     NodeEntryVisitor nodeEntryVisitor =
-        new NodeEntryVisitor(
-            executor, mock(DirtyTrackingProgressReceiver.class), mock(RunnableMaker.class));
-    SkyKey nonCPUHeavyKey = mock(SkyKey.class);
+        new NodeEntryVisitor(executor, receiver, runnableMaker, stateCache);
+    SkyKey nonCpuHeavyKey = mock(SkyKey.class);
 
-    nodeEntryVisitor.enqueueEvaluation(nonCPUHeavyKey, Integer.MAX_VALUE);
+    nodeEntryVisitor.enqueueEvaluation(nonCpuHeavyKey, null);
 
-    verify(executor).execute(any(), eq(ThreadPoolType.REGULAR));
+    verify(executor).execute((Runnable) any(), eq(ThreadPoolType.REGULAR), anyBoolean());
   }
 
   @Test
   public void enqueueEvaluation_multiThreadPoolsQuiescingExecutor_cpuHeavyKey() {
-    MultiThreadPoolsQuiescingExecutor executor = mock(MultiThreadPoolsQuiescingExecutor.class);
     NodeEntryVisitor nodeEntryVisitor =
-        new NodeEntryVisitor(
-            executor, mock(DirtyTrackingProgressReceiver.class), mock(RunnableMaker.class));
+        new NodeEntryVisitor(executor, receiver, runnableMaker, stateCache);
     CPUHeavySkyKey cpuHeavyKey = mock(CPUHeavySkyKey.class);
 
-    nodeEntryVisitor.enqueueEvaluation(cpuHeavyKey, Integer.MAX_VALUE);
+    nodeEntryVisitor.enqueueEvaluation(cpuHeavyKey, null);
 
-    verify(executor).execute(any(), eq(ThreadPoolType.CPU_HEAVY));
+    verify(executor).execute((Runnable) any(), eq(ThreadPoolType.CPU_HEAVY), anyBoolean());
+  }
+
+  @Test
+  public void enqueueEvaluation_multiThreadPoolsQuiescingExecutor_quiescingTask_nonCpuHeavyKey() {
+    QuiescingTask task = createTestTask();
+    when(runnableMaker.make(any())).thenReturn(task);
+    NodeEntryVisitor nodeEntryVisitor =
+        new NodeEntryVisitor(executor, receiver, runnableMaker, stateCache);
+    SkyKey nonCpuHeavyKey = mock(SkyKey.class);
+
+    nodeEntryVisitor.enqueueEvaluation(nonCpuHeavyKey, null);
+
+    verify(executor).execute(eq(task), eq(ThreadPoolType.REGULAR), anyBoolean());
+  }
+
+  @Test
+  public void enqueueEvaluation_multiThreadPoolsQuiescingExecutor_quiescingTask_cpuHeavyKey() {
+    QuiescingTask task = createTestTask();
+    when(runnableMaker.make(any())).thenReturn(task);
+    NodeEntryVisitor nodeEntryVisitor =
+        new NodeEntryVisitor(executor, receiver, runnableMaker, stateCache);
+    CPUHeavySkyKey cpuHeavyKey = mock(CPUHeavySkyKey.class);
+
+    nodeEntryVisitor.enqueueEvaluation(cpuHeavyKey, null);
+
+    verify(executor).execute(eq(task), eq(ThreadPoolType.CPU_HEAVY), anyBoolean());
+  }
+
+  @Test
+  public void enqueueEvaluation_regularQuiescingExecutor_quiescingTask() {
+    QuiescingExecutor regularExecutor = mock(QuiescingExecutor.class);
+    QuiescingTask task = createTestTask();
+    when(runnableMaker.make(any())).thenReturn(task);
+    NodeEntryVisitor nodeEntryVisitor =
+        new NodeEntryVisitor(regularExecutor, receiver, runnableMaker, stateCache);
+    SkyKey key = mock(SkyKey.class);
+
+    nodeEntryVisitor.enqueueEvaluation(key, null);
+
+    verify(regularExecutor).execute(task);
   }
 }

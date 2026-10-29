@@ -1,22 +1,24 @@
 load("@rules_java//java:defs.bzl", "java_library")
 
 package(
-    default_visibility = ["//src:__subpackages__"],
+    default_applicable_licenses = ["//:license"],
+    default_visibility = ["//src/main/java/com/google/devtools/build/lib:build_lib"],
 )
 
 filegroup(
     name = "srcs",
     srcs = glob(["**"]),
-    visibility = ["//src:__subpackages__"],
+    visibility = ["//src/main/java/com/google/devtools/build/lib:__pkg__"],
 )
 
 java_library(
     name = "sleep_prevention_module",
     srcs = ["SleepPreventionModule.java"],
     deps = [
-        "//src/main/java/com/google/devtools/build/lib:runtime",
-        "//src/main/java/com/google/devtools/build/lib/jni",
-        "//third_party:guava",
+        ":platform_native_deps_service",
+        "//src/main/java/com/google/devtools/build/lib/analysis:blaze_directories",
+        "//src/main/java/com/google/devtools/build/lib/runtime:blaze_command_cluster",
+        "//third_party/java/guava:base",
     ],
 )
 
@@ -27,11 +29,13 @@ java_library(
         "SystemSuspensionModule.java",
     ],
     deps = [
-        "//src/main/java/com/google/devtools/build/lib:runtime",
+        ":platform_native_deps_service",
+        "//src/main/java/com/google/devtools/build/lib/analysis:blaze_directories",
         "//src/main/java/com/google/devtools/build/lib/events",
-        "//src/main/java/com/google/devtools/build/lib/jni",
-        "//third_party:flogger",
-        "//third_party:jsr305",
+        "//src/main/java/com/google/devtools/build/lib/runtime:blaze_command_cluster",
+        "//third_party/java/flogger",
+        "//third_party/java/guava:base",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
@@ -42,12 +46,14 @@ java_library(
         "SystemThermalModule.java",
     ],
     deps = [
-        "//src/main/java/com/google/devtools/build/lib:runtime",
+        ":platform_native_deps_service",
+        "//src/main/java/com/google/devtools/build/lib/analysis:blaze_directories",
         "//src/main/java/com/google/devtools/build/lib/events",
-        "//src/main/java/com/google/devtools/build/lib/jni",
+        "//src/main/java/com/google/devtools/build/lib/runtime:blaze_command_cluster",
         "//src/main/java/com/google/devtools/build/lib/util:os",
-        "//third_party:flogger",
-        "//third_party:jsr305",
+        "//third_party/java/flogger",
+        "//third_party/java/guava:base",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
@@ -58,11 +64,13 @@ java_library(
         "SystemDiskSpaceModule.java",
     ],
     deps = [
-        "//src/main/java/com/google/devtools/build/lib:runtime",
+        ":platform_native_deps_service",
+        "//src/main/java/com/google/devtools/build/lib/analysis:blaze_directories",
         "//src/main/java/com/google/devtools/build/lib/events",
-        "//src/main/java/com/google/devtools/build/lib/jni",
-        "//third_party:flogger",
-        "//third_party:jsr305",
+        "//src/main/java/com/google/devtools/build/lib/runtime:blaze_command_cluster",
+        "//third_party/java/flogger",
+        "//third_party/java/guava:base",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
@@ -73,12 +81,14 @@ java_library(
         "SystemLoadAdvisoryModule.java",
     ],
     deps = [
-        "//src/main/java/com/google/devtools/build/lib:runtime",
+        ":platform_native_deps_service",
+        "//src/main/java/com/google/devtools/build/lib/analysis:blaze_directories",
         "//src/main/java/com/google/devtools/build/lib/events",
-        "//src/main/java/com/google/devtools/build/lib/jni",
+        "//src/main/java/com/google/devtools/build/lib/runtime:blaze_command_cluster",
         "//src/main/java/com/google/devtools/build/lib/util:os",
-        "//third_party:flogger",
-        "//third_party:jsr305",
+        "//third_party/java/flogger",
+        "//third_party/java/guava:base",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
@@ -88,8 +98,11 @@ java_library(
         "SystemMemoryPressureModule.java",
     ],
     deps = [
+        ":platform_native_deps_service",
         ":system_memory_pressure_monitor",
-        "//src/main/java/com/google/devtools/build/lib:runtime",
+        "//src/main/java/com/google/devtools/build/lib/analysis:blaze_directories",
+        "//src/main/java/com/google/devtools/build/lib/runtime:blaze_command_cluster",
+        "//third_party/java/guava:base",
     ],
 )
 
@@ -100,10 +113,10 @@ java_library(
         "SystemMemoryPressureMonitor.java",
     ],
     deps = [
+        ":platform_native_deps_service",
         "//src/main/java/com/google/devtools/build/lib/events",
-        "//src/main/java/com/google/devtools/build/lib/jni",
-        "//third_party:flogger",
-        "//third_party:jsr305",
+        "//third_party/java/flogger",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 
@@ -114,11 +127,38 @@ java_library(
         "SystemCPUSpeedModule.java",
     ],
     deps = [
-        "//src/main/java/com/google/devtools/build/lib:runtime",
+        ":platform_native_deps_service",
+        "//src/main/java/com/google/devtools/build/lib/analysis:blaze_directories",
         "//src/main/java/com/google/devtools/build/lib/events",
+        "//src/main/java/com/google/devtools/build/lib/runtime:blaze_command_cluster",
+        "//third_party/java/flogger",
+        "//third_party/java/guava:base",
+        "//third_party/java/jsr305_annotations",
+    ],
+)
+
+# IJ
+java_library(
+    name = "platform_native_deps_service",
+    srcs = [
+        "PlatformNativeDepsService.java",
+    ],
+    deps = [
+        "//src/main/java/com/google/devtools/build/lib/runtime:blaze_service",
+        "//src/main/java/com/google/devtools/build/lib/skybridge:skybridge_interface",
+        "//third_party/java/error_prone:annotations",
+    ],
+)
+
+# SC-only
+java_library(
+    name = "platform_native_deps_service_impl",
+    srcs = [
+        "PlatformNativeDepsServiceImpl.java",
+    ],
+    deps = [
+        ":platform_native_deps_service",
         "//src/main/java/com/google/devtools/build/lib/jni",
-        "//third_party:flogger",
-        "//third_party:guava",
-        "//third_party:jsr305",
+        "//src/main/java/com/google/devtools/build/lib/skybridge:sc_only",
     ],
 )

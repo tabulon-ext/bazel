@@ -14,23 +14,30 @@
 
 package com.google.devtools.build.lib.starlarkdebug.server;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Ordering;
 import com.google.devtools.build.lib.starlarkdebugging.StarlarkDebuggingProtos;
 import com.google.devtools.build.lib.starlarkdebugging.StarlarkDebuggingProtos.Value;
 import java.lang.reflect.Array;
 import java.util.Map;
-import java.util.Set;
 import net.starlark.java.eval.Debug;
 import net.starlark.java.eval.EvalException;
+import net.starlark.java.eval.Mutability;
+import net.starlark.java.eval.Printer;
 import net.starlark.java.eval.Starlark;
 import net.starlark.java.eval.StarlarkInt;
+import net.starlark.java.eval.StarlarkList;
 import net.starlark.java.eval.StarlarkSemantics;
 import net.starlark.java.eval.StarlarkValue;
 import net.starlark.java.eval.Structure;
 
 /** Helper class for creating {@link StarlarkDebuggingProtos.Value} from Starlark objects. */
 final class DebuggerSerialization {
+
+  @VisibleForTesting static final int MAX_DESCRIPTION_CHARS = 10_000;
+  @VisibleForTesting static final int MAX_DESCRIPTION_DEPTH = 10;
+  @VisibleForTesting static final int MAX_DESCRIPTION_ELEMENTS = 1_000;
 
   static Value getValueProto(ThreadObjectMap objectMap, String label, Object value) {
     // TODO(bazel-team): prune cycles, and provide a way to limit breadth/depth of children reported
@@ -46,21 +53,30 @@ final class DebuggerSerialization {
   }
 
   private static String getDescription(Object value) {
-    if (value instanceof String) {
-      return (String) value;
+    if (value instanceof String string) {
+      if (string.length() > MAX_DESCRIPTION_CHARS) {
+        return string.substring(0, MAX_DESCRIPTION_CHARS) + "...";
+      }
+      return string;
     }
-    return Starlark.repr(value);
+    return new Printer(
+            new StringBuilder(),
+            MAX_DESCRIPTION_CHARS,
+            MAX_DESCRIPTION_DEPTH,
+            MAX_DESCRIPTION_ELEMENTS)
+        .repr(value, StarlarkSemantics.DEFAULT)
+        .toString();
   }
 
   private static boolean hasChildren(Object value) {
-    if (value instanceof Map) {
-      return !((Map) value).isEmpty();
+    if (value instanceof Map<?, ?> map) {
+      return !map.isEmpty();
     }
     if (value instanceof Map.Entry) {
       return true;
     }
-    if (value instanceof Iterable) {
-      return ((Iterable) value).iterator().hasNext();
+    if (value instanceof Iterable<?> iterable) {
+      return iterable.iterator().hasNext();
     }
     if (value.getClass().isArray()) {
       return Array.getLength(value) > 0;
@@ -81,14 +97,14 @@ final class DebuggerSerialization {
   }
 
   static ImmutableList<Value> getChildren(ThreadObjectMap objectMap, Object value) {
-    if (value instanceof Map) {
-      return getChildren(objectMap, ((Map) value).entrySet());
+    if (value instanceof Map<?, ?> map) {
+      return getChildren(objectMap, map.entrySet());
     }
-    if (value instanceof Map.Entry) {
-      return getChildren(objectMap, (Map.Entry) value);
+    if (value instanceof Map.Entry<?, ?> mapEntry) {
+      return getChildren(objectMap, mapEntry);
     }
-    if (value instanceof Iterable) {
-      return getChildren(objectMap, (Iterable) value);
+    if (value instanceof Iterable<?> iterable) {
+      return getChildren(objectMap, iterable);
     }
     if (value.getClass().isArray()) {
       return getArrayChildren(objectMap, value);
@@ -97,11 +113,11 @@ final class DebuggerSerialization {
       return getDebugAttributes(objectMap, (Debug.ValueWithDebugAttributes) value);
     }
     // TODO(bazel-team): move child-listing logic to StarlarkValue where practical
-    if (value instanceof Structure) {
-      return getChildren(objectMap, (Structure) value);
+    if (value instanceof Structure structure) {
+      return getChildren(objectMap, structure);
     }
-    if (value instanceof StarlarkValue) {
-      return getChildren(objectMap, (StarlarkValue) value);
+    if (value instanceof StarlarkValue starlarkValue) {
+      return getChildren(objectMap, starlarkValue);
     }
     // fallback to assuming there are no children
     return ImmutableList.of();
@@ -126,11 +142,9 @@ final class DebuggerSerialization {
   private static ImmutableList<Value> getChildren(
       ThreadObjectMap objectMap, StarlarkValue starlarkValue) {
     StarlarkSemantics semantics = StarlarkSemantics.DEFAULT; // TODO(adonovan): obtain from thread.
-    // TODO(adonovan): would the debugger be content with Starlark.{dir,getattr}
-    // instead of getAnnotatedField{,Names}, if we filtered out BuiltinCallables?
-    Set<String> fieldNames;
+    StarlarkList<String> fieldNames;
     try {
-      fieldNames = Starlark.getAnnotatedFieldNames(semantics, starlarkValue);
+      fieldNames = Starlark.dir(Mutability.IMMUTABLE, semantics, starlarkValue);
     } catch (IllegalArgumentException e) {
       // silently return no children
       return ImmutableList.of();
@@ -142,21 +156,12 @@ final class DebuggerSerialization {
             getValueProto(
                 objectMap,
                 fieldName,
-                Starlark.getAnnotatedField(semantics, starlarkValue, fieldName)));
+                Starlark.getattr(Mutability.IMMUTABLE, semantics, starlarkValue, fieldName, null)));
       } catch (EvalException | InterruptedException | IllegalArgumentException e) {
         // silently ignore errors
       }
     }
     return children.build();
-  }
-
-  private static ImmutableList<Value> getDebugAttributes(
-      ThreadObjectMap objectMap, Debug.ValueWithDebugAttributes value) {
-    ImmutableList.Builder<Value> attributes = ImmutableList.builder();
-    for (Debug.DebugAttribute attr : value.getDebugAttributes()) {
-      attributes.add(getValueProto(objectMap, attr.name, attr.value));
-    }
-    return attributes.build();
   }
 
   private static ImmutableList<Value> getChildren(
@@ -173,6 +178,15 @@ final class DebuggerSerialization {
       builder.add(getValueProto(objectMap, String.format("[%d]", index++), value));
     }
     return builder.build();
+  }
+
+  private static ImmutableList<Value> getDebugAttributes(
+      ThreadObjectMap objectMap, Debug.ValueWithDebugAttributes value) {
+    ImmutableList.Builder<Value> attributes = ImmutableList.builder();
+    for (Debug.DebugAttribute attr : value.getDebugAttributes()) {
+      attributes.add(getValueProto(objectMap, attr.name, attr.value));
+    }
+    return attributes.build();
   }
 
   private static ImmutableList<Value> getArrayChildren(ThreadObjectMap objectMap, Object array) {

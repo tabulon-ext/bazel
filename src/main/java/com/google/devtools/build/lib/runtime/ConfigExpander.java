@@ -13,22 +13,29 @@
 // limitations under the License.
 package com.google.devtools.build.lib.runtime;
 
+import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.ListMultimap;
 import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.events.EventHandler;
 import com.google.devtools.build.lib.util.OS;
+import com.google.devtools.common.options.OpaqueOptionsData;
+import com.google.devtools.common.options.OptionDefinition;
 import com.google.devtools.common.options.OptionValueDescription;
 import com.google.devtools.common.options.OptionsParser;
+import com.google.devtools.common.options.OptionsParser.ArgAndFallbackData;
 import com.google.devtools.common.options.OptionsParsingException;
 import com.google.devtools.common.options.ParsedOptionDescription;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
+import javax.annotation.Nullable;
 
 /** Encapsulates logic for performing --config option expansion. */
 final class ConfigExpander {
@@ -86,10 +93,14 @@ final class ConfigExpander {
   static void expandConfigOptions(
       EventHandler eventHandler,
       ListMultimap<String, RcChunkOfArgs> commandToRcArgs,
+      String currentCommand,
       List<String> commandsToParse,
       Consumer<String> rcFileNotesConsumer,
-      OptionsParser optionsParser)
+      OptionsParser optionsParser,
+      @Nullable OpaqueOptionsData fallbackData)
       throws OptionsParsingException {
+    // Tracks whether the expansion of an option added to the values accumulated by the parser.
+    Map<ParsedOptionDescription, Boolean> expansionAccumulatedValues = new HashMap<>();
 
     OptionValueDescription configValueDescription =
         optionsParser.getOptionValueDescription("config");
@@ -103,15 +114,28 @@ final class ConfigExpander {
       // them, to preserve order.
       for (ParsedOptionDescription configInstance : configInstances) {
         String configValueToExpand = (String) configInstance.getConvertedValue();
-        List<String> expansion =
+        var expansion =
             getExpansion(
                 eventHandler,
                 commandToRcArgs,
                 commandsToParse,
                 configValueToExpand,
-                rcFileNotesConsumer);
-        optionsParser.parseArgsAsExpansionOfOption(
-            configInstance, String.format("expanded from --%s", configValueToExpand), expansion);
+                rcFileNotesConsumer,
+                fallbackData);
+        int unparsedArgs = countUnparsedArgs(optionsParser);
+        var ignoredArgs =
+            optionsParser.parseArgsAsExpansionOfOption(
+                configInstance,
+                String.format("expanded from --config=%s", configValueToExpand),
+                expansion);
+        expansionAccumulatedValues.put(
+            configInstance, countUnparsedArgs(optionsParser) > unparsedArgs);
+        if (!ignoredArgs.isEmpty()) {
+          rcFileNotesConsumer.accept(
+              String.format(
+                  "Ignored as unsupported by '%s': %s",
+                  currentCommand, Joiner.on(' ').join(ignoredArgs)));
+        }
       }
     }
 
@@ -119,22 +143,33 @@ final class ConfigExpander {
         optionsParser.getOptionValueDescription("enable_platform_specific_config");
     if (shouldEnablePlatformSpecificConfig(
         enablePlatformSpecificConfigDescription, commandToRcArgs, commandsToParse)) {
-      List<String> expansion =
+      var expansion =
           getExpansion(
               eventHandler,
               commandToRcArgs,
               commandsToParse,
               getPlatformName(),
-              rcFileNotesConsumer);
-      optionsParser.parseArgsAsExpansionOfOption(
-          Iterables.getOnlyElement(enablePlatformSpecificConfigDescription.getCanonicalInstances()),
-          String.format("enabled by --enable_platform_specific_config"),
-          expansion);
+              rcFileNotesConsumer,
+              fallbackData);
+      ParsedOptionDescription optionToExpand =
+          Iterables.getOnlyElement(enablePlatformSpecificConfigDescription.getCanonicalInstances());
+      int unparsedArgs = countUnparsedArgs(optionsParser);
+      var ignoredArgs =
+          optionsParser.parseArgsAsExpansionOfOption(
+              optionToExpand, "enabled by --enable_platform_specific_config", expansion);
+      expansionAccumulatedValues.put(
+          optionToExpand, countUnparsedArgs(optionsParser) > unparsedArgs);
+      if (!ignoredArgs.isEmpty()) {
+        rcFileNotesConsumer.accept(
+            String.format(
+                "Ignored as unsupported by '%s': %s",
+                currentCommand, Joiner.on(' ').join(ignoredArgs)));
+      }
     }
 
     // At this point, we've expanded everything, identify duplicates, if any, to warn about
     // re-application.
-    List<String> configs = optionsParser.getOptions(CommonCommandOptions.class).configs;
+    List<String> configs = optionsParser.getOptions(CommonCommandOptions.class).getConfigs();
     Set<String> configSet = new HashSet<>();
     LinkedHashSet<String> duplicateConfigs = new LinkedHashSet<>();
     for (String configValue : configs) {
@@ -142,6 +177,32 @@ final class ConfigExpander {
         duplicateConfigs.add(configValue);
       }
     }
+    if (duplicateConfigs.isEmpty()) {
+      return;
+    }
+
+    // Expanding a config again only makes a difference if it adds to the values accumulated by the
+    // parser since everything else it sets is overridden by its last expansion. In addition to
+    // residue and Starlark flags, these are the values of repeatable flags, which may also be set
+    // by the untracked implicit requirements of an option.
+    for (ParsedOptionDescription option : optionsParser.asCompleteListOfParsedOptions()) {
+      OptionDefinition definition = option.getOptionDefinition();
+      if (definition.hasImplicitRequirements()
+          || (definition.allowsMultiple() && !definition.getOptionName().equals("config"))) {
+        expansionAccumulatedValues.replace(
+            getExpandedOption(option, expansionAccumulatedValues.keySet()), true);
+      }
+    }
+    // As a config adds the same values every time it is expanded, it can only have added any if
+    // every expansion it has been part of did.
+    for (ParsedOptionDescription configInstance :
+        optionsParser.getOptionValueDescription("config").getCanonicalInstances()) {
+      if (!expansionAccumulatedValues.getOrDefault(
+          getExpandedOption(configInstance, expansionAccumulatedValues.keySet()), true)) {
+        duplicateConfigs.remove((String) configInstance.getConvertedValue());
+      }
+    }
+
     if (!duplicateConfigs.isEmpty()) {
       eventHandler.handle(
           Event.warn(
@@ -152,24 +213,48 @@ final class ConfigExpander {
     }
   }
 
-  private static List<String> getExpansion(
+  /**
+   * Returns the number of args that the parser didn't parse as options and thus accumulated instead
+   * of overriding earlier ones: residue and Starlark flags, as it isn't known at this point whether
+   * they are repeatable.
+   */
+  private static int countUnparsedArgs(OptionsParser optionsParser) {
+    return optionsParser.getResidue().size() + optionsParser.getSkippedArgs().size();
+  }
+
+  /**
+   * Returns the given option if it is one of the expanded options or else the one among them that
+   * it has been expanded from, if any.
+   */
+  @Nullable
+  private static ParsedOptionDescription getExpandedOption(
+      ParsedOptionDescription option, Set<ParsedOptionDescription> expandedOptions) {
+    while (option != null && !expandedOptions.contains(option)) {
+      option = option.getOrigin().getExpandedFrom();
+    }
+    return option;
+  }
+
+  private static List<ArgAndFallbackData> getExpansion(
       EventHandler eventHandler,
       ListMultimap<String, RcChunkOfArgs> commandToRcArgs,
       List<String> commandsToParse,
       String configToExpand,
-      Consumer<String> rcFileNotesConsumer)
+      Consumer<String> rcFileNotesConsumer,
+      @Nullable OpaqueOptionsData fallbackData)
       throws OptionsParsingException {
     LinkedHashSet<String> configAncestorSet = new LinkedHashSet<>();
     configAncestorSet.add(configToExpand);
     List<String> longestChain = new ArrayList<>();
-    List<String> finalExpansion =
+    List<ArgAndFallbackData> finalExpansion =
         getExpansion(
             commandToRcArgs,
             commandsToParse,
             configAncestorSet,
             configToExpand,
             longestChain,
-            rcFileNotesConsumer);
+            rcFileNotesConsumer,
+            fallbackData);
 
     // In order to prevent warning about a long chain of 13 configs at the 10, 11, 12, and 13
     // point, we identify the longest chain for this 'high-level' --config found and only warn
@@ -196,15 +281,16 @@ final class ConfigExpander {
    *     should not be in the parents list of the second bar.
    * @param longestChain will be populated with the longest inheritance chain of configs.
    */
-  private static List<String> getExpansion(
+  private static List<ArgAndFallbackData> getExpansion(
       ListMultimap<String, RcChunkOfArgs> commandToRcArgs,
       List<String> commandsToParse,
       LinkedHashSet<String> configAncestorSet,
       String configToExpand,
       List<String> longestChain,
-      Consumer<String> rcFileNotesConsumer)
+      Consumer<String> rcFileNotesConsumer,
+      @Nullable OpaqueOptionsData fallbackData)
       throws OptionsParsingException {
-    List<String> expansion = new ArrayList<>();
+    List<ArgAndFallbackData> expansion = new ArrayList<>();
     boolean foundDefinition = false;
     // The expansion order of rc files is first by command priority, and then in the order the
     // rc files were read, respecting import statement placement.
@@ -220,7 +306,12 @@ final class ConfigExpander {
         // For each arg in the rcARgs chunk, we first check if it is a config, and if so, expand
         // it in place. We avoid cycles by tracking the parents of this config.
         for (String arg : rcArgs.getArgs()) {
-          expansion.add(arg);
+          expansion.add(
+              new ArgAndFallbackData(
+                  arg,
+                  commandToParse.equals(BlazeOptionHandler.COMMON_PSEUDO_COMMAND)
+                      ? fallbackData
+                      : null));
           if (arg.length() >= 8 && arg.substring(0, 8).equals("--config")) {
             // We have a config. Because we don't want to worry about formatting,
             // we will only accept --config=value, and will not accept value on a following line.
@@ -256,7 +347,8 @@ final class ConfigExpander {
                     extendedConfigAncestorSet,
                     newConfigValue,
                     longestChain,
-                    rcFileNotesConsumer));
+                    rcFileNotesConsumer,
+                    fallbackData));
           }
         }
       }

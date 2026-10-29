@@ -16,7 +16,7 @@ package com.google.testing.junit.runner.util;
 
 import java.util.HashMap;
 import java.util.Map;
-import javax.annotation.Nullable;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Utility class for dealing with escaping XML content and attributes.
@@ -78,11 +78,12 @@ public class XmlEscapers {
 
     /**
      * Sets the safe range of characters for the escaper. Characters in this range that have no
-     * explicit replacement are considered 'safe' and remain unescaped in the output. If
-     * {@code safeMax < safeMin} then the safe range is empty.
+     * explicit replacement are considered 'safe' and remain unescaped in the output. If {@code
+     * safeMax < safeMin} then the safe range is empty.
      *
      * @return the builder instance
      */
+    @CanIgnoreReturnValue
     Builder setSafeRange(char safeMin, char safeMax) {
       this.safeMin = safeMin;
       this.safeMax = safeMax;
@@ -96,6 +97,7 @@ public class XmlEscapers {
      *
      * @return the builder instance
      */
+    @CanIgnoreReturnValue
     Builder setUnsafeReplacement(@Nullable String unsafeReplacement) {
       this.unsafeReplacement = unsafeReplacement;
       return this;
@@ -109,6 +111,7 @@ public class XmlEscapers {
      * @return the builder instance
      * @throws NullPointerException if {@code replacement} is null
      */
+    @CanIgnoreReturnValue
     Builder addEscape(char c, String replacement) {
       if (replacement == null) {
         throw new NullPointerException();

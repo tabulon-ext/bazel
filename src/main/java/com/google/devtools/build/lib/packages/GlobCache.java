@@ -13,22 +13,28 @@
 // limitations under the License.
 package com.google.devtools.build.lib.packages;
 
+import static com.google.common.base.Throwables.throwIfInstanceOf;
+import static com.google.common.base.Throwables.throwIfUnchecked;
+
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Throwables;
-import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.SettableFuture;
 import com.google.devtools.build.lib.actions.ThreadStateReceiver;
+import com.google.devtools.build.lib.cmdline.IgnoredSubdirectories;
 import com.google.devtools.build.lib.cmdline.PackageIdentifier;
 import com.google.devtools.build.lib.concurrent.ThreadSafety;
 import com.google.devtools.build.lib.packages.Globber.BadGlobException;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
 import com.google.devtools.build.lib.util.Pair;
+import com.google.devtools.build.lib.vfs.Dirent;
+import com.google.devtools.build.lib.vfs.FileStatus;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.SyscallCache;
 import com.google.devtools.build.lib.vfs.UnixGlob;
+import com.google.devtools.build.lib.vfs.UnixGlob.FilesystemOps;
 import com.google.devtools.build.lib.vfs.UnixGlobPathDiscriminator;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -43,8 +49,13 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import javax.annotation.Nullable;
 
-/** Caches the results of glob expansion for a package. Has lifetime of a single build. */
+/**
+ * Caches the results of glob evaluations for a single package. Has lifetime of evaluation of that
+ * package.
+ */
 @ThreadSafety.ThreadCompatible
 public class GlobCache {
   /**
@@ -64,8 +75,7 @@ public class GlobCache {
   /** The name of the package we belong to. */
   private final PackageIdentifier packageId;
 
-  /** System call caching layer. */
-  private final SyscallCache syscallCache;
+  private final CountingFilesystemOps filesystemOps;
 
   private final int maxDirectoriesToEagerlyVisit;
 
@@ -76,7 +86,7 @@ public class GlobCache {
 
   private final CachingPackageLocator packageLocator;
 
-  private final ImmutableSet<PathFragment> ignoredGlobPrefixes;
+  private final IgnoredSubdirectories ignoredSubdirectories;
 
   /**
    * Create a glob expansion cache.
@@ -93,7 +103,7 @@ public class GlobCache {
   public GlobCache(
       final Path packageDirectory,
       final PackageIdentifier packageId,
-      final ImmutableSet<PathFragment> ignoredGlobPrefixes,
+      final IgnoredSubdirectories ignoredSubdirectories,
       final CachingPackageLocator locator,
       SyscallCache syscallCache,
       Executor globExecutor,
@@ -110,12 +120,12 @@ public class GlobCache {
                     command.run();
                   }
                 });
-    this.syscallCache = syscallCache;
+    this.filesystemOps = new CountingFilesystemOps(syscallCache);
     this.maxDirectoriesToEagerlyVisit = maxDirectoriesToEagerlyVisit;
 
     Preconditions.checkNotNull(locator);
     this.packageLocator = locator;
-    this.ignoredGlobPrefixes = ignoredGlobPrefixes;
+    this.ignoredSubdirectories = ignoredSubdirectories;
   }
 
   private boolean globCacheShouldTraverseDirectory(Path directory) {
@@ -126,10 +136,8 @@ public class GlobCache {
     PathFragment subPackagePath =
         packageId.getPackageFragment().getRelative(directory.relativeTo(packageDirectory));
 
-    for (PathFragment ignoredPrefix : ignoredGlobPrefixes) {
-      if (subPackagePath.startsWith(ignoredPrefix)) {
-        return false;
-      }
+    if (ignoredSubdirectories.matchingEntry(subPackagePath) != null) {
+      return false;
     }
 
     return !isSubPackage(PackageIdentifier.create(packageId.getRepository(), subPackagePath));
@@ -219,11 +227,10 @@ public class GlobCache {
       throw new BadGlobException(error + " (in glob pattern '" + pattern + "')");
     }
     try {
-      return UnixGlob.forPath(packageDirectory)
+      return new UnixGlob.Builder(packageDirectory, filesystemOps)
           .addPattern(pattern)
           .setPathDiscriminator(new GlobUnixPathDiscriminator(globberOperation))
           .setExecutor(globExecutor)
-          .setFilesystemCalls(syscallCache)
           .globAsync();
     } catch (UnixGlob.BadPattern ex) {
       throw new BadGlobException(ex.getMessage());
@@ -237,7 +244,9 @@ public class GlobCache {
       return future.get();
     } catch (ExecutionException e) {
       Throwable cause = e.getCause();
-      Throwables.propagateIfPossible(cause, IOException.class, InterruptedException.class);
+      throwIfInstanceOf(cause, IOException.class);
+      throwIfInstanceOf(cause, InterruptedException.class);
+      throwIfUnchecked(cause);
       throw new RuntimeException(e);
     }
   }
@@ -281,6 +290,10 @@ public class GlobCache {
     return new ArrayList<>(results);
   }
 
+  public long getGlobFilesystemOperationCost() {
+    return filesystemOps.filesystemOpCost.get();
+  }
+
   public Set<Pair<String, Globber.Operation>> getKeySet() {
     return globCache.keySet();
   }
@@ -288,10 +301,6 @@ public class GlobCache {
   /** Block on the completion of all potentially-abandoned background tasks. */
   public void finishBackgroundTasks() {
     finishBackgroundTasks(globCache.values());
-  }
-
-  public void cancelBackgroundTasks() {
-    cancelBackgroundTasks(globCache.values());
   }
 
   private static void finishBackgroundTasks(Collection<Future<List<Path>>> tasks) {
@@ -303,6 +312,10 @@ public class GlobCache {
         // failure already occurred.
       }
     }
+  }
+
+  public void cancelBackgroundTasks() {
+    cancelBackgroundTasks(globCache.values());
   }
 
   private static void cancelBackgroundTasks(Collection<Future<List<Path>>> tasks) {
@@ -347,21 +360,59 @@ public class GlobCache {
 
     @Override
     public boolean shouldIncludePathInResult(Path path, boolean isDirectory) {
-      switch (globberOperation) {
-        case FILES_AND_DIRS:
-          return !isDirectory || !isSubPackage(path);
-        case SUBPACKAGES:
+      return switch (globberOperation) {
+        case FILES_AND_DIRS -> !isDirectory || !isSubPackage(path);
+        case SUBPACKAGES -> {
           // no files, or root pkg
           if (!isDirectory || path.equals(packageDirectory)) {
-            return false;
+            yield false;
           }
-          return isSubPackage(path);
+          yield isSubPackage(path);
+        }
+        case FILES -> !isDirectory;
+      };
+    }
+  }
 
-        case FILES:
-          return !isDirectory;
+  /**
+   * A {@link FilesystemOps} implementation that delegates to a {@link SyscallCache} but also
+   * computes a total cost of the unique filesystem operations (regardless or not if there were
+   * actually performed or cached; this way the cost is deterministic for a set of glob operations).
+   *
+   * <p>{@link #statIfFound} costs <code>1</code> and {@link #readdir} costs <code>1 + D</code>,
+   * where <code>D</code> is the number of dirents.
+   */
+  private static class CountingFilesystemOps implements FilesystemOps {
+    private final SyscallCache syscallCache;
+    private final AtomicLong filesystemOpCost = new AtomicLong(0L);
+
+    private final Set<Path> pathsForStatIfFound = Sets.newConcurrentHashSet();
+    private final Set<Path> pathsForReaddir = Sets.newConcurrentHashSet();
+
+    private CountingFilesystemOps(SyscallCache syscallCache) {
+      this.syscallCache = syscallCache;
+    }
+
+    @Nullable
+    @Override
+    public FileStatus statIfFound(Path path) throws IOException {
+      if (pathsForStatIfFound.add(path)) {
+        filesystemOpCost.incrementAndGet();
       }
-      throw new IllegalStateException(
-          "Unexpected unhandled Globber.Operation enum value: " + globberOperation);
+      return syscallCache.statIfFound(path);
+    }
+
+    @Override
+    public Collection<Dirent> readdir(Path path) throws IOException {
+      boolean uniqueOp = pathsForReaddir.add(path);
+      if (uniqueOp) {
+        filesystemOpCost.incrementAndGet();
+      }
+      Collection<Dirent> result = syscallCache.readdir(path);
+      if (uniqueOp) {
+        filesystemOpCost.addAndGet(result.size());
+      }
+      return result;
     }
   }
 }

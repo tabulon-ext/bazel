@@ -14,14 +14,26 @@
 
 package com.google.devtools.build.lib.shell;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Throwables;
+import com.google.common.collect.Lists;
+import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.devtools.build.lib.shell.SubprocessBuilder.StreamAction;
+import com.google.devtools.build.lib.util.OS;
+import com.google.devtools.build.lib.util.StringEncoding;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.ProcessBuilder.Redirect;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 
 /** A subprocess factory that uses {@link java.lang.ProcessBuilder}. */
 public class JavaSubprocessFactory implements SubprocessFactory {
@@ -73,21 +85,13 @@ public class JavaSubprocessFactory implements SubprocessFactory {
 
     @Override
     public void waitFor() throws InterruptedException {
-      if (deadlineMillis > 0) {
-        // Careful: I originally used Long.MAX_VALUE if there's no timeout. This is safe with
-        // Process, but not for the UNIXProcess subclass, which has an integer overflow for very
-        // large timeouts. As of this writing, it converts the passed in value to nanos (which
-        // saturates at Long.MAX_VALUE), then adds 999999 to round up (which overflows), converts
-        // back to millis, and then calls Object.wait with a negative timeout, which throws.
-        long waitTimeMillis = deadlineMillis - System.currentTimeMillis();
-        boolean exitedInTime = process.waitFor(waitTimeMillis, TimeUnit.MILLISECONDS);
-        if (!exitedInTime && deadlineExceeded.compareAndSet(false, true)) {
-          process.destroy();
-          // The destroy call returns immediately, so we still need to wait for the actual exit. The
-          // sole caller assumes that waitFor only exits when the process is gone (or throws).
-          process.waitFor();
-        }
-      } else {
+      var waitTimeMillis =
+          (deadlineMillis > 0) ? deadlineMillis - System.currentTimeMillis() : Long.MAX_VALUE;
+      var exitedInTime = process.waitFor(waitTimeMillis, TimeUnit.MILLISECONDS);
+      if (!exitedInTime && deadlineExceeded.compareAndSet(false, true)) {
+        process.destroy();
+        // The destroy call returns immediately, so we still need to wait for the actual exit. The
+        // sole caller assumes that waitFor only exits when the process is gone (or throws).
         process.waitFor();
       }
     }
@@ -109,8 +113,7 @@ public class JavaSubprocessFactory implements SubprocessFactory {
 
     @Override
     public void close() {
-      // java.lang.Process doesn't give us a way to clean things up other than #destroy(), which was
-      // already called by this point.
+      process.destroyForcibly();
     }
 
     @Override
@@ -119,10 +122,31 @@ public class JavaSubprocessFactory implements SubprocessFactory {
     }
   }
 
-  public static final JavaSubprocessFactory INSTANCE = new JavaSubprocessFactory();
+  // Subprocesses fork from this platform thread to ensure the subprocess's parent is long lived,
+  // which prevents actions from being killed erroneously. See the doc comment on
+  // startOnPlatformThread for more details.
+  @VisibleForTesting
+  static final ExecutorService DEFAULT_FORK_EXECUTOR =
+      Executors.newSingleThreadExecutor(
+          runnable -> {
+            Thread thread = new Thread(runnable, "subprocess-fork");
+            thread.setDaemon(true);
+            return thread;
+          });
 
-  private JavaSubprocessFactory() {
-    // We are a singleton
+  private final ReentrantLock lock = new ReentrantLock();
+  private final ExecutorService forkExecutor;
+
+  public static final JavaSubprocessFactory INSTANCE =
+      new JavaSubprocessFactory(DEFAULT_FORK_EXECUTOR);
+
+  private JavaSubprocessFactory(ExecutorService forkExecutor) {
+    this.forkExecutor = forkExecutor;
+  }
+
+  @VisibleForTesting
+  static JavaSubprocessFactory createForTesting(ExecutorService forkExecutor) {
+    return new JavaSubprocessFactory(forkExecutor);
   }
 
   // since we are a singleton, we represent an ideal global lock for
@@ -142,19 +166,68 @@ public class JavaSubprocessFactory implements SubprocessFactory {
   // I was able to reproduce this problem reliably by running significantly more threads than
   // there are CPU cores on my workstation - the more threads the more likely it happens.
   //
-  // As a workaround, we put a synchronized block around the fork.
-  private synchronized Process start(ProcessBuilder builder) throws IOException {
-    return builder.start();
+  // As a workaround, we use a lock around the fork.
+  private Process start(ProcessBuilder builder) throws IOException {
+    lock.lock();
+    try {
+      return startOnPlatformThread(builder);
+    } catch (IOException e) {
+      if (e.getMessage().contains("Failed to exec spawn helper")) {
+        // Detect permanent failures due to an upgrade of the underlying JDK version,
+        // see https://bugs.openjdk.org/browse/JDK-8325621.
+        throw new IllegalStateException(
+            "Subprocess creation has failed, the current JDK version is newer than the version"
+                + " used at startup. Re-rerunning the blaze invocation should succeed.",
+            e);
+      }
+      throw e;
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * Starts a subprocess by forking from a long-lived platform thread, which prevents the parent
+   * thread from being killed when using virtual threads.
+   *
+   * <p>A virtual thread forks from its carrier thread. The carrier thread is detached while the
+   * virtual thread waits for the forked process to complete. If there isn't other work for the
+   * carrier thread to do, then it is idle and can be killed due to inactivity. The parent carrier
+   * thread being killed causes the linux-sandbox to die because it self destructs when its parent
+   * dies.
+   *
+   * <p>The default virtual thread scheduler uses a {@link java.util.concurrent.ForkJoinPool} for
+   * its carrier threads with an idle TTL of 30 seconds. Without a long-lived platform thread as the
+   * parent, builds can fail unexpectedly when actions take longer than 30 seconds.
+   */
+  private Process startOnPlatformThread(ProcessBuilder builder) throws IOException {
+    Future<Process> future = forkExecutor.submit(builder::start);
+    try {
+      return Uninterruptibles.getUninterruptibly(future);
+    } catch (ExecutionException e) {
+      Throwables.throwIfInstanceOf(e.getCause(), IOException.class);
+      Throwables.throwIfUnchecked(e.getCause());
+      throw new IllegalStateException("Unexpected error starting subprocess", e.getCause());
+    }
   }
 
   @Override
   public Subprocess create(SubprocessBuilder params) throws IOException {
+    Preconditions.checkState(
+        OS.getCurrent() != OS.WINDOWS,
+        "attempting to use non-Windows subprocess factory on Windows - did you forget to call"
+            + " WindowsSubprocessFactory.maybeInstallWindowsSubprocessFactory?");
     ProcessBuilder builder = new ProcessBuilder();
-    builder.command(params.getArgv());
-    if (params.getEnv() != null) {
-      builder.environment().clear();
-      builder.environment().putAll(params.getEnv());
-    }
+    builder.command(Lists.transform(params.getArgv(), StringEncoding::internalToPlatform));
+    builder.environment().clear();
+    (params.getEnv() != null ? params.getEnv() : params.getClientEnv())
+        .forEach(
+            (key, value) ->
+                builder
+                    .environment()
+                    .put(
+                        StringEncoding.internalToPlatform(key),
+                        StringEncoding.internalToPlatform(value)));
 
     builder.redirectOutput(getRedirect(params.getStdout(), params.getStdoutFile()));
     builder.redirectError(getRedirect(params.getStderr(), params.getStderrFile()));
@@ -174,24 +247,18 @@ public class JavaSubprocessFactory implements SubprocessFactory {
    * redirected to exists, deletes the file before redirecting to it.
    */
   private Redirect getRedirect(StreamAction action, File file) {
-    switch (action) {
-      case DISCARD:
-        return Redirect.to(new File("/dev/null"));
-
-      case REDIRECT:
+    return switch (action) {
+      case DISCARD -> Redirect.to(new File("/dev/null"));
+      case REDIRECT -> {
         // We need to use Redirect.appendTo() here, because on older Linux kernels writes are
         // otherwise not atomic and might result in lost log messages:
         // https://lkml.org/lkml/2014/3/3/308
         if (file.exists()) {
           file.delete();
         }
-        return Redirect.appendTo(file);
-
-      case STREAM:
-        return Redirect.PIPE;
-
-      default:
-        throw new IllegalStateException();
-    }
+        yield Redirect.appendTo(file);
+      }
+      case STREAM -> Redirect.PIPE;
+    };
   }
 }

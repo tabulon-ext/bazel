@@ -14,12 +14,49 @@
 
 """Exported builtins symbols that are specific to OSS Bazel."""
 
-load("@_builtins//:common/java/java_library.bzl", "java_library")
-load("@_builtins//:common/java/java_plugin.bzl", "java_plugin")
+load(":common/cc/cc_common_bazel.bzl", "cc_common")
+load(":common/java/java_common.bzl", "java_common_export_for_bazel")
+load(":common/objc/apple_common.bzl", "apple_common_bazel")
+load(":common/python/py_internal.bzl", "py_internal")
 
-exported_toplevels = {}
-exported_rules = {
-    "+java_library": java_library,
-    "+java_plugin": java_plugin,
+_: Any  # Enable type checking.
+
+_REMOVED_RULES = [
+    "cc_binary",
+    "cc_import",
+    "cc_library",
+    "cc_shared_library",
+    "cc_static_library",
+    "cc_test",
+    "cc_toolchain",
+    "cc_toolchain_alias",
+    "fdo_prefetch_hints",
+    "fdo_profile",
+    "memprof_profile",
+    "propeller_optimize",
+    "objc_import",
+    "objc_library",
+]
+
+def _removed_rule_failure(**_kwargs) -> Never:
+    fail("""
+         This rule has been removed from Bazel. Please add a `load()` statement for it.
+         This can also be done automatically by running:
+         buildifier --lint=fix <path-to-BUILD-or-bzl-file>
+         """)
+
+exported_toplevels = {
+    "py_internal": py_internal,
+    "java_common": java_common_export_for_bazel,
+    "cc_common": cc_common,
+    "apple_common": apple_common_bazel,
 }
-exported_to_java = {}
+
+exported_rules = {
+    "cc_toolchain_suite": lambda name, **kwargs: _builtins.toplevel.native.filegroup(name = name),
+} | {
+    rule_name: _removed_rule_failure
+    for rule_name in _REMOVED_RULES
+}
+
+exported_to_java: dict[str, Any] = {}

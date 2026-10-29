@@ -14,11 +14,15 @@
 package com.google.devtools.build.lib.packages;
 
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.devtools.build.lib.packages.util.TargetDataSubject.assertThat;
 
-import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.packages.util.PackageLoadingTestCase;
+import com.google.devtools.build.lib.skyframe.serialization.AutoRegistry;
+import com.google.devtools.build.lib.skyframe.serialization.ObjectCodecRegistry;
+import com.google.devtools.build.lib.skyframe.serialization.testutils.RoundTripping;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -37,15 +41,34 @@ public class EnvironmentGroupTest extends PackageLoadingTestCase {
   public final void createPackage() throws Exception {
     scratch.file(
         "pkg/BUILD",
-        "environment(name='foo', fulfills = [':bar', ':baz'])",
-        "environment(name='bar', fulfills = [':baz'])",
-        "environment(name='baz')",
-        "environment(name='not_in_group')",
-        "environment_group(",
-        "    name = 'group',",
-        "    environments = [':foo', ':bar', ':baz'],",
-        "    defaults = [':foo'],",
-        ")");
+        """
+        environment(
+            name = "foo",
+            fulfills = [
+                ":bar",
+                ":baz",
+            ],
+        )
+
+        environment(
+            name = "bar",
+            fulfills = [":baz"],
+        )
+
+        environment(name = "baz")
+
+        environment(name = "not_in_group")
+
+        environment_group(
+            name = "group",
+            defaults = [":foo"],
+            environments = [
+                ":foo",
+                ":bar",
+                ":baz",
+            ],
+        )
+        """);
     group = (EnvironmentGroup) getTarget("//pkg:group");
   }
 
@@ -54,51 +77,33 @@ public class EnvironmentGroupTest extends PackageLoadingTestCase {
     assertThat(group.getEnvironments())
         .isEqualTo(
             ImmutableSet.of(
-                Label.parseAbsolute("//pkg:foo", ImmutableMap.of()),
-                Label.parseAbsolute("//pkg:bar", ImmutableMap.of()),
-                Label.parseAbsolute("//pkg:baz", ImmutableMap.of())));
+                Label.parseCanonical("//pkg:foo"),
+                Label.parseCanonical("//pkg:bar"),
+                Label.parseCanonical("//pkg:baz")));
   }
 
   @Test
   public void defaultsMembership() throws Exception {
-    assertThat(group.getDefaults())
-        .isEqualTo(ImmutableSet.of(Label.parseAbsolute("//pkg:foo", ImmutableMap.of())));
+    assertThat(group.getDefaults()).isEqualTo(ImmutableSet.of(Label.parseCanonical("//pkg:foo")));
   }
 
   @Test
   public void isDefault() throws Exception {
     EnvironmentLabels unpackedGroup = group.getEnvironmentLabels();
-    assertThat(unpackedGroup.isDefault(Label.parseAbsolute("//pkg:foo", ImmutableMap.of())))
-        .isTrue();
-    assertThat(unpackedGroup.isDefault(Label.parseAbsolute("//pkg:bar", ImmutableMap.of())))
-        .isFalse();
-    assertThat(unpackedGroup.isDefault(Label.parseAbsolute("//pkg:baz", ImmutableMap.of())))
-        .isFalse();
-    assertThat(
-            unpackedGroup.isDefault(Label.parseAbsolute("//pkg:not_in_group", ImmutableMap.of())))
-        .isFalse();
+    assertThat(unpackedGroup.isDefault(Label.parseCanonical("//pkg:foo"))).isTrue();
+    assertThat(unpackedGroup.isDefault(Label.parseCanonical("//pkg:bar"))).isFalse();
+    assertThat(unpackedGroup.isDefault(Label.parseCanonical("//pkg:baz"))).isFalse();
+    assertThat(unpackedGroup.isDefault(Label.parseCanonical("//pkg:not_in_group"))).isFalse();
   }
 
   @Test
   public void fulfillers() throws Exception {
     EnvironmentLabels unpackedGroup = group.getEnvironmentLabels();
-    assertThat(
-            unpackedGroup
-                .getFulfillers(Label.parseAbsolute("//pkg:baz", ImmutableMap.of()))
-                .toList())
-        .containsExactly(
-            Label.parseAbsolute("//pkg:foo", ImmutableMap.of()),
-            Label.parseAbsolute("//pkg:bar", ImmutableMap.of()));
-    assertThat(
-            unpackedGroup
-                .getFulfillers(Label.parseAbsolute("//pkg:bar", ImmutableMap.of()))
-                .toList())
-        .containsExactly(Label.parseAbsolute("//pkg:foo", ImmutableMap.of()));
-    assertThat(
-            unpackedGroup
-                .getFulfillers(Label.parseAbsolute("//pkg:foo", ImmutableMap.of()))
-                .toList())
-        .isEmpty();
+    assertThat(unpackedGroup.getFulfillers(Label.parseCanonical("//pkg:baz")))
+        .containsExactly(Label.parseCanonical("//pkg:foo"), Label.parseCanonical("//pkg:bar"));
+    assertThat(unpackedGroup.getFulfillers(Label.parseCanonical("//pkg:bar")))
+        .containsExactly(Label.parseCanonical("//pkg:foo"));
+    assertThat(unpackedGroup.getFulfillers(Label.parseCanonical("//pkg:foo"))).isEmpty();
   }
 
   @Test
@@ -106,9 +111,43 @@ public class EnvironmentGroupTest extends PackageLoadingTestCase {
     scratch.file(
         "a/BUILD", "environment_group(name = 'empty_group', environments = [], defaults = [])");
     reporter.removeHandler(failFastHandler);
-    Package pkg = getTarget("//a:BUILD").getPackage();
+    Packageoid pkg = getTarget("//a:BUILD").getPackageoid();
     assertThat(pkg.containsErrors()).isTrue();
     assertContainsEvent(
         "environment group empty_group must contain at least one environment");
+  }
+
+  @Test
+  public void reduceForSerialization_hasConsistentValues() {
+    assertThat(group).hasSamePropertiesAs(group.reduceForSerialization());
+  }
+
+  @Test
+  public void environmentLabels_roundTrips() throws Exception {
+    EnvironmentLabels labels = group.getEnvironmentLabels();
+    EnvironmentLabels copy = roundTrip(labels);
+
+    assertThat(copy).isNotSameInstanceAs(labels);
+    assertThat(copy).isEqualTo(labels);
+    assertThat(copy.getFulfillers(Label.parseCanonical("//pkg:baz")))
+        .containsExactly(Label.parseCanonical("//pkg:foo"), Label.parseCanonical("//pkg:bar"));
+  }
+
+  @Test
+  public void environmentLabels_serializationIndependentOfInstanceIdentity() throws Exception {
+    EnvironmentLabels labels = group.getEnvironmentLabels();
+    EnvironmentLabels copy = roundTrip(labels);
+    ObjectCodecRegistry registry = AutoRegistry.get();
+
+    // Equal but distinct instances, e.g. one kept alive across commands by an interner, must
+    // serialize the same as a single instance.
+    assertThat(RoundTripping.toBytesMemoized(ImmutableList.of(labels, copy), registry))
+        .isEqualTo(RoundTripping.toBytesMemoized(ImmutableList.of(labels, labels), registry));
+  }
+
+  private static EnvironmentLabels roundTrip(EnvironmentLabels labels) throws Exception {
+    ObjectCodecRegistry registry = AutoRegistry.get();
+    return (EnvironmentLabels)
+        RoundTripping.fromBytesMemoized(RoundTripping.toBytesMemoized(labels, registry), registry);
   }
 }

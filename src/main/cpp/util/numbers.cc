@@ -13,12 +13,14 @@
 // limitations under the License.
 #include "src/main/cpp/util/numbers.h"
 
-#include <errno.h>  // errno, ERANGE
+#include <errno.h>
 #include <limits.h>
+#include <stdint.h>
+
 #include <cassert>
-#include <cinttypes>
 #include <cstdlib>
 #include <limits>
+#include <string>
 
 #include "src/main/cpp/util/strings.h"
 

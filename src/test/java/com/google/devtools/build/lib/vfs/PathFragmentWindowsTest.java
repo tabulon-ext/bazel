@@ -146,6 +146,8 @@ public class PathFragmentWindowsTest {
   @Test
   public void testWindowsVolumeUppercase() {
     assertThat(create("C:/")).isEqualTo(create("c:/"));
+    assertThat(create("C:/foo/bar")).isEqualTo(create("c:/foo/bar"));
+    assertThat(create("c:/foo/bar").getPathString()).isEqualTo("C:/foo/bar");
   }
 
   @Test
@@ -177,6 +179,9 @@ public class PathFragmentWindowsTest {
   public void testSegmentsCountWindows() {
     assertThat(create("C:/foo").segmentCount()).isEqualTo(1);
     assertThat(create("C:/").segmentCount()).isEqualTo(0);
+    // Mix usage of Windows and Unix separator is valid
+    assertThat(create("C:/foo\\bar").segmentCount()).isEqualTo(2);
+    assertThat(create("C:\\foo\\bar/baz").segmentCount()).isEqualTo(3);
   }
 
   @Test
@@ -185,6 +190,12 @@ public class PathFragmentWindowsTest {
     assertThat(create("C:/foo/bar").getSegment(1)).isEqualTo("bar");
     assertThat(create("C:/foo/").getSegment(0)).isEqualTo("foo");
     assertThat(create("C:/foo").getSegment(0)).isEqualTo("foo");
+    // Mix usage of Windows and Unix separator is valid
+    assertThat(create("C:/foo\\bar").getSegment(0)).isEqualTo("foo");
+    assertThat(create("C:/foo\\bar").getSegment(1)).isEqualTo("bar");
+    assertThat(create("C:\\foo\\bar/baz").getSegment(0)).isEqualTo("foo");
+    assertThat(create("C:\\foo\\bar/baz").getSegment(1)).isEqualTo("bar");
+    assertThat(create("C:\\foo\\bar/baz").getSegment(2)).isEqualTo("baz");
   }
 
   @Test
@@ -193,6 +204,9 @@ public class PathFragmentWindowsTest {
     assertThat(create("C:/foo").getBaseName()).isEqualTo("foo");
     // Never return the drive name as a basename.
     assertThat(create("C:/").getBaseName()).isEmpty();
+    // Mix usage of Windows and Unix separator is valid
+    assertThat(create("C:/foo\\bar").getBaseName()).isEqualTo("bar");
+    assertThat(create("C:\\foo\\bar/baz").getBaseName()).isEqualTo("baz");
   }
 
   @Test
@@ -232,7 +246,7 @@ public class PathFragmentWindowsTest {
     assertThat(create("C:/a/b")).isEqualTo(create("C:/a/b"));
     assertThat(create("C:/a/./b")).isEqualTo(create("C:/a/b"));
     assertThat(create("C:/a/../b")).isEqualTo(create("C:/b"));
-    assertThat(create("C:/../b")).isEqualTo(create("C:/../b"));
+    assertThat(create("C:/../b")).isEqualTo(create("C:/b"));
   }
 
   @Test

@@ -13,70 +13,135 @@
 // limitations under the License.
 package com.google.devtools.build.lib.buildtool;
 
+import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.base.Preconditions.checkState;
+import static com.google.common.collect.ImmutableList.toImmutableList;
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
+import static com.google.devtools.build.lib.buildtool.AnalysisPhaseRunner.evaluateProjectFile;
+import static com.google.devtools.common.options.OptionsParser.STARLARK_SKIPPED_PREFIXES;
+import static java.util.Comparator.comparing;
+import static java.util.stream.Collectors.joining;
+
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Splitter;
+import com.google.common.base.Stopwatch;
+import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
 import com.google.common.flogger.GoogleLogger;
 import com.google.devtools.build.lib.actions.BuildFailedException;
 import com.google.devtools.build.lib.actions.CommandLineExpansionException;
 import com.google.devtools.build.lib.actions.TestExecException;
 import com.google.devtools.build.lib.analysis.AnalysisAndExecutionResult;
 import com.google.devtools.build.lib.analysis.AnalysisResult;
-import com.google.devtools.build.lib.analysis.BuildInfoEvent;
+import com.google.devtools.build.lib.analysis.BuildView;
 import com.google.devtools.build.lib.analysis.ConfiguredTarget;
+import com.google.devtools.build.lib.analysis.PlatformOptions;
 import com.google.devtools.build.lib.analysis.ViewCreationFailedException;
-import com.google.devtools.build.lib.analysis.WorkspaceStatusAction.DummyEnvironment;
+import com.google.devtools.build.lib.analysis.actions.TemplateExpansionException;
 import com.google.devtools.build.lib.analysis.config.BuildOptions;
+import com.google.devtools.build.lib.analysis.config.CoreOptions;
 import com.google.devtools.build.lib.analysis.config.InvalidConfigurationException;
+import com.google.devtools.build.lib.analysis.platform.PlatformValue;
 import com.google.devtools.build.lib.buildeventstream.BuildEvent.LocalFile.LocalFileType;
 import com.google.devtools.build.lib.buildeventstream.BuildEventArtifactUploader.UploadContext;
 import com.google.devtools.build.lib.buildeventstream.BuildEventIdUtil;
 import com.google.devtools.build.lib.buildeventstream.BuildEventProtocolOptions;
+import com.google.devtools.build.lib.buildtool.AnalysisPhaseRunner.ProjectEvaluationResult;
+import com.google.devtools.build.lib.buildtool.SkyframeMemoryDumper.DisplayMode;
 import com.google.devtools.build.lib.buildtool.buildevent.BuildCompleteEvent;
 import com.google.devtools.build.lib.buildtool.buildevent.BuildInterruptedEvent;
 import com.google.devtools.build.lib.buildtool.buildevent.BuildStartingEvent;
 import com.google.devtools.build.lib.buildtool.buildevent.NoExecutionEvent;
+import com.google.devtools.build.lib.buildtool.buildevent.ReleaseReplaceableBuildEvent;
 import com.google.devtools.build.lib.buildtool.buildevent.StartingAqueryDumpAfterBuildEvent;
+import com.google.devtools.build.lib.buildtool.buildevent.UpdateOptionsEvent;
+import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.cmdline.TargetParsingException;
 import com.google.devtools.build.lib.events.Event;
+import com.google.devtools.build.lib.events.ExtendedEventHandler;
 import com.google.devtools.build.lib.events.OutputFilter;
 import com.google.devtools.build.lib.events.Reporter;
 import com.google.devtools.build.lib.exec.ExecutionOptions;
+import com.google.devtools.build.lib.packages.NoSuchTargetException;
+import com.google.devtools.build.lib.packages.Target;
 import com.google.devtools.build.lib.pkgcache.LoadingFailedException;
+import com.google.devtools.build.lib.pkgcache.LoadingOptions;
+import com.google.devtools.build.lib.profiler.MemoryProfiler;
 import com.google.devtools.build.lib.profiler.ProfilePhase;
 import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
 import com.google.devtools.build.lib.query2.aquery.ActionGraphProtoOutputFormatterCallback;
+import com.google.devtools.build.lib.runtime.BlazeOptionHandler.SkyframeExecutorTargetLoader;
 import com.google.devtools.build.lib.runtime.BlazeRuntime;
 import com.google.devtools.build.lib.runtime.CommandEnvironment;
+import com.google.devtools.build.lib.runtime.CommandLineEvent;
+import com.google.devtools.build.lib.runtime.CommandLineEvent.CanonicalCommandLineEvent;
+import com.google.devtools.build.lib.runtime.ExecRootEvent;
+import com.google.devtools.build.lib.runtime.KeepGoingOption;
+import com.google.devtools.build.lib.runtime.KeepStateAfterBuildOption;
+import com.google.devtools.build.lib.runtime.StarlarkOptionsParser;
+import com.google.devtools.build.lib.runtime.StarlarkOptionsParser.BuildSettingLoader;
+import com.google.devtools.build.lib.server.FailureDetails;
 import com.google.devtools.build.lib.server.FailureDetails.ActionQuery;
 import com.google.devtools.build.lib.server.FailureDetails.BuildConfiguration.Code;
 import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
-import com.google.devtools.build.lib.skyframe.AspectKeyCreator.AspectKey;
-import com.google.devtools.build.lib.skyframe.ConfiguredTargetKey;
+import com.google.devtools.build.lib.server.FailureDetails.RemoteAnalysisCaching;
+import com.google.devtools.build.lib.skyframe.BuildResultListener;
+import com.google.devtools.build.lib.skyframe.RepositoryMappingValue.RepositoryMappingResolutionException;
 import com.google.devtools.build.lib.skyframe.SequencedSkyframeExecutor;
+import com.google.devtools.build.lib.skyframe.SkyframeBuildView.BuildDriverKeyTestContext;
+import com.google.devtools.build.lib.skyframe.SkyframeExecutor;
 import com.google.devtools.build.lib.skyframe.TargetPatternPhaseValue;
-import com.google.devtools.build.lib.skyframe.WorkspaceInfoFromDiff;
 import com.google.devtools.build.lib.skyframe.actiongraph.v2.ActionGraphDump;
 import com.google.devtools.build.lib.skyframe.actiongraph.v2.AqueryOutputHandler;
 import com.google.devtools.build.lib.skyframe.actiongraph.v2.AqueryOutputHandler.OutputType;
 import com.google.devtools.build.lib.skyframe.actiongraph.v2.InvalidAqueryOutputFormatException;
+import com.google.devtools.build.lib.skyframe.config.ParsedFlagsValue;
+import com.google.devtools.build.lib.skyframe.serialization.FingerprintValueService;
+import com.google.devtools.build.lib.skyframe.serialization.FingerprintValueStore;
+import com.google.devtools.build.lib.skyframe.serialization.SkycacheMetadataParams;
+import com.google.devtools.build.lib.skyframe.serialization.analysis.FrontierSerializer;
+import com.google.devtools.build.lib.skyframe.serialization.analysis.RemoteAnalysisCacheClient;
+import com.google.devtools.build.lib.skyframe.serialization.analysis.RemoteAnalysisCacheFactory;
+import com.google.devtools.build.lib.skyframe.serialization.analysis.RemoteAnalysisCacheReaderDepsProvider;
+import com.google.devtools.build.lib.skyframe.serialization.analysis.RemoteAnalysisCachingDependenciesProvider;
+import com.google.devtools.build.lib.skyframe.serialization.analysis.RemoteAnalysisCachingServicesSupplier;
+import com.google.devtools.build.lib.skyframe.serialization.analysis.RemoteAnalysisMetadataWriter;
+import com.google.devtools.build.lib.skyframe.serialization.analysis.SerializationDependenciesProvider;
 import com.google.devtools.build.lib.util.AbruptExitException;
 import com.google.devtools.build.lib.util.CrashFailureDetails;
 import com.google.devtools.build.lib.util.DetailedExitCode;
 import com.google.devtools.build.lib.util.ExitCode;
 import com.google.devtools.build.lib.util.InterruptedFailureDetails;
+import com.google.devtools.build.lib.util.RegexFilter;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
+import com.google.devtools.build.skyframe.SkyFunctionName;
+import com.google.devtools.build.skyframe.SkyKey;
+import com.google.devtools.build.skyframe.SkyValue;
+import com.google.devtools.common.options.OptionDefinition;
+import com.google.devtools.common.options.OptionPriority.PriorityCategory;
+import com.google.devtools.common.options.OptionsParser;
+import com.google.devtools.common.options.OptionsParsingException;
+import com.google.devtools.common.options.OptionsParsingResult;
 import com.google.devtools.common.options.OptionsProvider;
 import com.google.devtools.common.options.RegexPatternOption;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintStream;
-import java.util.HashSet;
+import java.util.Collection;
+import java.util.List;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Stream;
 import javax.annotation.Nullable;
 
 /**
@@ -94,8 +159,10 @@ public class BuildTool {
 
   private static final GoogleLogger logger = GoogleLogger.forEnclosingClass();
 
+  private static final String SKYFRAME_MEMORY_DUMP_FILE = "skyframe_memory.json";
+
   private static final AnalysisPostProcessor NOOP_POST_PROCESSOR =
-      (req, env, runtime, analysisResult) -> {};
+      (unusedRequest, unusedEnv, unusedRuntime, unusedAnalysisResult) -> {};
 
   /** Hook for inserting extra post-analysis-phase processing. Used for implementing {a,c}query. */
   public interface AnalysisPostProcessor {
@@ -146,12 +213,31 @@ public class BuildTool {
    *     the request object are populated
    * @param result the build result that is the mutable result of this build
    * @param validator target validator
+   * @param optionsParser the {@link OptionsParser} that was used to parse the command line options.
+   *     Also used to parse the options applied by the project file.
+   * @param targetsForProjectResolution if not null, the targets for which to perform project file
+   *     resolution. If null (the common behavior), derive the targets from the {@code request}
+   *     instead.
    */
-  public void buildTargets(BuildRequest request, BuildResult result, TargetValidator validator)
-      throws BuildFailedException, InterruptedException, ViewCreationFailedException,
-          TargetParsingException, LoadingFailedException, AbruptExitException,
-          InvalidConfigurationException, TestExecException, ExitException,
-          PostExecutionActionGraphDumpException {
+  public void buildTargets(
+      BuildRequest request,
+      BuildResult result,
+      TargetValidator validator,
+      OptionsParser optionsParser,
+      @Nullable List<String> targetsForProjectResolution)
+      throws BuildFailedException,
+          InterruptedException,
+          ViewCreationFailedException,
+          TargetParsingException,
+          LoadingFailedException,
+          AbruptExitException,
+          InvalidConfigurationException,
+          TestExecException,
+          ExitException,
+          PostExecutionDumpException,
+          RepositoryMappingResolutionException,
+          OptionsParsingException {
+    maybeSetStopOnFirstFailure(request, result);
     try (SilentCloseable c = Profiler.instance().profile("validateOptions")) {
       validateOptions(request);
     }
@@ -160,99 +246,349 @@ public class BuildTool {
       buildOptions = runtime.createBuildOptions(request);
     }
 
-    ExecutionTool executionTool = null;
+    RemoteAnalysisCachingDependenciesProvider analysisCachingDeps = null;
+    RemoteAnalysisCacheReaderDepsProvider analysisCacheReaderDeps = null;
+    SerializationDependenciesProvider serializationDependenciesProvider = null;
     boolean catastrophe = false;
     try {
       try (SilentCloseable c = Profiler.instance().profile("BuildStartingEvent")) {
-        env.getEventBus().post(new BuildStartingEvent(env, request));
+        env.getEventBus()
+            .post(BuildStartingEvent.create(env.getDirectories(), env.getOutputService(), request));
       }
       logger.atInfo().log("Build identifier: %s", request.getId());
-
-      // Error out early if multi_cpus is set, but we're not in build or test command.
-      if (!request.getMultiCpus().isEmpty()) {
-        getReporter()
-            .handle(
-                Event.warn(
-                    "The --experimental_multi_cpu option is _very_ experimental and only intended"
-                        + " for internal testing at this time. If you do not work on the build"
-                        + " tool, then you should stop now!"));
-        if (!"build".equals(request.getCommandName()) && !"test".equals(request.getCommandName())) {
-          throw new InvalidConfigurationException(
-              "The experimental setting to select multiple CPUs is only supported for 'build' and "
-                  + "'test' right now!",
-              Code.MULTI_CPU_PREREQ_UNMET);
-        }
-      }
 
       // Exit if there are any pending exceptions from modules.
       env.throwPendingException();
 
       initializeOutputFilter(request);
 
-      if (request.getBuildOptions().mergedSkyframeAnalysisExecution) {
-        // Target pattern evaluation.
-        TargetPatternPhaseValue loadingResult;
-        Profiler.instance().markPhase(ProfilePhase.TARGET_PATTERN_EVAL);
-        try (SilentCloseable c = Profiler.instance().profile("evaluateTargetPatterns")) {
-          loadingResult =
-              AnalysisAndExecutionPhaseRunner.evaluateTargetPatterns(env, request, validator);
-        }
-        env.setWorkspaceName(loadingResult.getWorkspaceName());
-
-        if (request.getBuildOptions().performAnalysisPhase) {
-          executionTool = new ExecutionTool(env, request);
-          Set<ConfiguredTargetKey> builtTargets = new HashSet<>();
-          Set<AspectKey> builtAspects = new HashSet<>();
-
-          try (SilentCloseable c = Profiler.instance().profile("ExecutionTool.init")) {
-            executionTool.prepareForExecution(request.getId(), builtTargets, builtAspects);
-          }
-
-          // TODO(b/199053098): implement support for --nobuild.
-          AnalysisAndExecutionResult analysisAndExecutionResult =
-              AnalysisAndExecutionPhaseRunner.execute(env, request, buildOptions, loadingResult);
-
-          result.setBuildConfigurationCollection(
-              analysisAndExecutionResult.getConfigurationCollection());
-          result.setActualTargets(analysisAndExecutionResult.getTargetsToBuild());
-          result.setTestTargets(analysisAndExecutionResult.getTargetsToTest());
-          try (SilentCloseable c = Profiler.instance().profile("Show results")) {
-            result.setSuccessfulTargets(
-                ExecutionTool.determineSuccessfulTargets(
-                    analysisAndExecutionResult.getTargetsToBuild(), builtTargets));
-            result.setSuccessfulAspects(
-                ExecutionTool.determineSuccessfulAspects(
-                    analysisAndExecutionResult.getAspectsMap().keySet(), builtAspects));
-            result.setSkippedTargets(analysisAndExecutionResult.getTargetsToSkip());
-            BuildResultPrinter buildResultPrinter = new BuildResultPrinter(env);
-            buildResultPrinter.showBuildResult(
-                request,
-                result,
-                analysisAndExecutionResult.getTargetsToBuild(),
-                analysisAndExecutionResult.getTargetsToSkip(),
-                analysisAndExecutionResult.getAspectsMap());
-          }
-          FailureDetail delayedFailureDetail = analysisAndExecutionResult.getFailureDetail();
-          if (delayedFailureDetail != null) {
-            throw new BuildFailedException(
-                delayedFailureDetail.getMessage(), DetailedExitCode.of(delayedFailureDetail));
-          }
-        }
-        return;
+      TargetPatternPhaseValue targetPatternPhaseValue;
+      MemoryProfiler.instance().markPhase(ProfilePhase.TARGET_PATTERN_EVAL);
+      Profiler.instance().markPhase(ProfilePhase.TARGET_PATTERN_EVAL);
+      try (SilentCloseable c = Profiler.instance().profile("evaluateTargetPatterns")) {
+        targetPatternPhaseValue =
+            evaluateTargetPatterns(
+                env.getReporter(),
+                env.getSkyframeExecutor(),
+                env.getRelativeWorkingDirectory(),
+                request.getKeepGoing(),
+                request.getTargets(),
+                request.getLoadingOptions(),
+                request.getLoadingPhaseThreadCount(),
+                request.shouldRunTests(),
+                validator);
       }
-      AnalysisResult analysisResult =
-          AnalysisPhaseRunner.execute(env, request, buildOptions, validator);
 
+      env.getEventBus().post(new ExecRootEvent(env.getExecRoot()));
+
+      TargetPatternPhaseValue targetPatternsForProjectResolution =
+          targetsForProjectResolution == null
+              ? targetPatternPhaseValue
+              : evaluateTargetPatterns(
+                  ExtendedEventHandler
+                      .NOOP, // Don't report this because it'll throw off our tracking of the
+                  // complete target set.
+                  env.getSkyframeExecutor(),
+                  env.getRelativeWorkingDirectory(),
+                  request.getKeepGoing(),
+                  targetsForProjectResolution,
+                  request.getLoadingOptions(),
+                  request.getLoadingPhaseThreadCount(),
+                  request.shouldRunTests(),
+                  validator);
+
+      ImmutableSet<OptionDefinition> optionDefinitions =
+          optionsParser.getOptionsSortedByCategory().values().stream()
+              .flatMap(Collection::stream)
+              .collect(toImmutableSet());
+      ImmutableSet.Builder<String> allOptionNames = ImmutableSet.builder();
+      for (OptionDefinition optionDefinition : optionDefinitions) {
+        allOptionNames.add(optionDefinition.getOptionName());
+        // --no[flag_name] is a valid flag only if [flag_name] is a boolean flag.
+        if (optionDefinition.usesBooleanValueSyntax()) {
+          allOptionNames.add("no" + optionDefinition.getOptionName());
+        }
+      }
+      ProjectEvaluationResult projectEvaluationResult =
+          evaluateProjectFile(
+              request,
+              buildOptions,
+              allOptionNames.build(),
+              request.getUserOptions(),
+              targetPatternsForProjectResolution,
+              env);
+
+      if (!projectEvaluationResult.buildOptions().isEmpty()) {
+        // First parse the native options from the project file.
+        optionsParser.parse(
+            PriorityCategory.COMMAND_LINE,
+            projectEvaluationResult.projectFile().get().toString(),
+            projectEvaluationResult.buildOptions().stream()
+                .filter(o -> STARLARK_SKIPPED_PREFIXES.stream().noneMatch(o::startsWith))
+                .collect(toImmutableList()));
+        // Then parse the starlark options from the project file.
+        BuildSettingLoader buildSettingLoader = new SkyframeExecutorTargetLoader(env);
+        StarlarkOptionsParser starlarkOptionsParser =
+            StarlarkOptionsParser.builder()
+                .buildSettingLoader(buildSettingLoader)
+                .nativeOptionsParser(optionsParser)
+                .build();
+        Preconditions.checkState(
+            starlarkOptionsParser.parseGivenArgs(
+                Stream.concat(
+                        projectEvaluationResult.buildOptions().stream()
+                            .filter(
+                                o -> STARLARK_SKIPPED_PREFIXES.stream().anyMatch(o::startsWith)),
+                        optionsParser.getSkippedArgs().stream())
+                    .collect(toImmutableList())));
+
+        env.getEventBus()
+            .post(
+                new CanonicalCommandLineEvent(
+                    runtime.getProductName(),
+                    runtime.getStartupOptionsProvider(),
+                    request.getCommandName(),
+                    optionsParser.getResidue(),
+                    optionsParser
+                        .getOptions(BuildEventProtocolOptions.class)
+                        .getIncludeResidueInRunBepEvent(),
+                    optionsParser.getExplicitCommandLineStarlarkOptions(),
+                    optionsParser.getStarlarkOptions(),
+                    optionsParser.getStarlarkOptionsAllowingMultiple(),
+                    optionsParser.asListOfCanonicalOptions(),
+                    // This replaces the tentative CanonicalCommandLineEvent posted earlier in the
+                    // build in BlazeCommandDispatcher.
+                    /* replaceable= */ false));
+        env.getEventBus().post(new UpdateOptionsEvent(optionsParser));
+        maybeSetStopOnFirstFailure(optionsParser, result);
+      } else {
+        // No PROJECT.scl flag updates. Release the original CanonicalCommandLineEvent for posting.
+        env.getEventBus()
+            .post(
+                new ReleaseReplaceableBuildEvent(
+                    BuildEventIdUtil.structuredCommandlineId(
+                        CommandLineEvent.CanonicalCommandLineEvent.LABEL)));
+      }
+      buildOptions = runtime.createBuildOptions(optionsParser);
+      buildOptions = addPlatformFlags(request, buildOptions);
+
+      if (request.needsInstrumentationFilter()) {
+        applyHeuristicInstrumentationFilter(buildOptions, targetPatternPhaseValue);
+      }
+      var analysisDeps =
+          RemoteAnalysisCacheFactory.create(
+              env,
+              targetPatternPhaseValue.getTargetLabels(),
+              BuildView.getTopLevelConfigurationTrimmedOfTestOptions(
+                  buildOptions, env.getReporter()),
+              request.getUserOptions(),
+              projectEvaluationResult.buildOptions());
+      analysisCachingDeps = analysisDeps.deps();
+      analysisCacheReaderDeps = analysisDeps.readerDeps();
+      serializationDependenciesProvider = analysisDeps.serializationDeps();
+
+      if (env.withMergedAnalysisAndExecutionSourceOfTruth()) {
+        // a.k.a. Skymeld.
+        buildTargetsWithMergedAnalysisExecution(
+            request,
+            result,
+            targetPatternPhaseValue,
+            buildOptions,
+            analysisCachingDeps,
+            analysisCacheReaderDeps);
+      } else {
+        buildTargetsWithoutMergedAnalysisExecution(
+            request,
+            result,
+            targetPatternPhaseValue,
+            buildOptions,
+            analysisCachingDeps,
+            analysisCacheReaderDeps);
+      }
+
+      if (analysisCacheReaderDeps.mode().serializesValues()) {
+        Preconditions.checkState(!analysisCachingDeps.bailedOut());
+        serializeValues(serializationDependenciesProvider);
+      }
+    } catch (Error | RuntimeException e) {
+      // Don't handle the error here. We will do so in stopRequest.
+      catastrophe = true;
+      throw e;
+    } finally {
+      if (!catastrophe) {
+        // Delete dirty nodes to ensure that they do not accumulate indefinitely.
+        long versionWindow = request.getViewOptions().getVersionWindowForDirtyNodeGc();
+        if (versionWindow != -1) {
+          env.getSkyframeExecutor()
+              .deleteOldNodes(
+                  versionWindow, request.getViewOptions().getKeepChangePrunableNodesDuringGc());
+        }
+        // The workspace status actions will not run with certain flags, or if an error occurs early
+        // in the build. Ensure that build info is posted on every build.
+        env.ensureBuildInfoPosted();
+
+        // Log stats and sync state even on failure.
+        if (analysisCachingDeps != null) {
+          if (analysisCacheReaderDeps.mode().isRetrievalEnabled()
+              && (analysisCacheReaderDeps.shouldBailOutOnMissingFingerprint()
+                  || analysisCachingDeps.bailedOut())) {
+            reportOnlyBailOutReason(analysisCacheReaderDeps);
+          } else {
+            logAnalysisCachingStats(analysisCacheReaderDeps);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Applies an input {@link BuildOptions}'s platform flags (i.e. the {@code platform} rule's {@code
+   * flags} attribute)
+   *
+   * <p>This is important to support {@code BaselineOptionsFunction}'s {@code
+   * BASELINE_CONFIGURATION} and {@code BASELINE_EXEC_CONFIGURATION}.
+   *
+   * <p>{@code BASELINE_EXEC_CONFIGURATION} is set by applying the exec transition to the top-level
+   * {@link BuildOptions}. If the top-level {@code --platforms} sets a flag that propagates to the
+   * exec configuration, we need to ensure that flag is in {@code BASELINE_EXEC_CONFIGURATION}
+   *
+   * <p>While it'd be nice to handle this in {@code BaselineOptionsFunction}, exec-configured calls
+   * to that function cannot depend on {@code BASELINE_CONFIGURATION} to support the Bazel feature
+   * that changing target-only flags doesn't invalidate exec-configured graph nodes. If we applied
+   * this logic there we'd have to do a {@code TopLevelOptions -> platformMapping -> execTransition}
+   * sequence that breaks that requirement.
+   *
+   * <p>See {@link ParsedFlagsValue#mergeWith} for mapping logic. See {@link
+   * BaselineOptionsFunction} for more details on how this mapping is consumed and further adjusted.
+   */
+  private BuildOptions addPlatformFlags(BuildRequest request, BuildOptions originalOptions)
+      throws InterruptedException, RepositoryMappingResolutionException {
+    if (originalOptions.get(PlatformOptions.class).getPlatforms().isEmpty()) {
+      return originalOptions;
+    }
+    Label targetPlatform =
+        Iterables.getOnlyElement(originalOptions.get(PlatformOptions.class).getPlatforms());
+    try {
+      Optional<ParsedFlagsValue> targetPlatformFlags =
+          PlatformValue.getFlags(
+              targetPlatform,
+              new PlatformValue.SkyframeEvaluator() {
+                @Nullable
+                @Override
+                public SkyValue evaluate(SkyKey key) throws InterruptedException {
+                  var evalResult =
+                      env.getSkyframeExecutor()
+                          .evaluate(
+                              ImmutableList.of(key),
+                              /* keepGoing= */ false,
+                              request.getLoadingPhaseThreadCount(),
+                              env.getReporter());
+                  if (evalResult.hasError()) {
+                    // Already handled by env.getReporter().
+                    return null;
+                  }
+                  return evalResult.get(key);
+                }
+              },
+              env.getSkyframeExecutor().getMainRepoMapping(env.getReporter()));
+      if (targetPlatformFlags.isPresent()) {
+        return targetPlatformFlags.get().mergeWith(originalOptions).getOptions();
+      }
+    } catch (NoSuchTargetException e) {
+      // Already handled by env.getReporter()).
+    }
+    return originalOptions;
+  }
+
+  private static TargetPatternPhaseValue evaluateTargetPatterns(
+      ExtendedEventHandler reporter,
+      SkyframeExecutor skyframeExecutor,
+      PathFragment relativeWorkingDirectory,
+      boolean keepGoing,
+      List<String> targets,
+      LoadingOptions loadingOptions,
+      int loadingPhaseThreadCount,
+      boolean shouldRunTests,
+      final TargetValidator validator)
+      throws LoadingFailedException, TargetParsingException, InterruptedException {
+    TargetPatternPhaseValue result =
+        skyframeExecutor.loadTargetPatternsWithFilters(
+            reporter,
+            targets,
+            relativeWorkingDirectory,
+            loadingOptions,
+            loadingPhaseThreadCount,
+            keepGoing,
+            shouldRunTests);
+    if (validator != null) {
+      ImmutableSet<Target> targetLabels =
+          result.getTargets(reporter, skyframeExecutor.getPackageManager());
+      validator.validateTargets(targetLabels, keepGoing);
+    }
+    return result;
+  }
+
+  private void applyHeuristicInstrumentationFilter(
+      BuildOptions buildOptions, TargetPatternPhaseValue targetPatternPhaseValue)
+      throws InterruptedException, InvalidConfigurationException {
+    try (SilentCloseable c = Profiler.instance().profile("Compute instrumentation filter")) {
+      String instrumentationFilter =
+          InstrumentationFilterSupport.computeInstrumentationFilter(
+              env.getReporter(),
+              // TODO(ulfjack): Expensive. Make this part of the TargetPatternPhaseValue or write
+              // a new SkyFunction to compute it?
+              targetPatternPhaseValue.getTestsToRun(env.getReporter(), env.getPackageManager()));
+      try {
+        // We're modifying the buildOptions in place, which is not ideal, but we also don't want
+        // to pay the price for making a copy. Maybe reconsider later if this turns out to be a
+        // problem (and the performance loss may not be a big deal). Notably, one must not call
+        // .checksum() before mutating the BuildOptions instance, lest the checksum and the option
+        // values get out of sync.
+        buildOptions
+            .get(CoreOptions.class)
+            .setInstrumentationFilter(
+                new RegexFilter.RegexFilterConverter().convert(instrumentationFilter));
+      } catch (OptionsParsingException e) {
+        throw new InvalidConfigurationException(Code.HEURISTIC_INSTRUMENTATION_FILTER_INVALID, e);
+      }
+    }
+  }
+
+  private void buildTargetsWithoutMergedAnalysisExecution(
+      BuildRequest request,
+      BuildResult result,
+      TargetPatternPhaseValue targetPatternPhaseValue,
+      BuildOptions buildOptions,
+      RemoteAnalysisCachingDependenciesProvider remoteAnalysisCachingDeps,
+      RemoteAnalysisCacheReaderDepsProvider remoteAnalysisCacheReaderDeps)
+      throws BuildFailedException,
+          ViewCreationFailedException,
+          AbruptExitException,
+          RepositoryMappingResolutionException,
+          InterruptedException,
+          InvalidConfigurationException,
+          TestExecException,
+          ExitException,
+          PostExecutionDumpException {
+    AnalysisResult analysisResult =
+        AnalysisPhaseRunner.execute(
+            env,
+            request,
+            targetPatternPhaseValue,
+            buildOptions,
+            remoteAnalysisCachingDeps,
+            remoteAnalysisCacheReaderDeps);
+    ExecutionTool executionTool = null;
+    try {
       // We cannot move the executionTool down to the execution phase part since it does set up the
       // symlinks for tools.
       // TODO(twerth): Extract embedded tool setup from execution tool and move object creation to
       // execution phase.
       executionTool = new ExecutionTool(env, request);
-      if (request.getBuildOptions().performAnalysisPhase) {
-
+      if (request.getBuildOptions().getPerformAnalysisPhase()) {
         if (!analysisResult.getExclusiveTests().isEmpty()
-            && executionTool.getTestActionContext().forceParallelTestExecution()) {
-          String testStrategy = request.getOptions(ExecutionOptions.class).testStrategy;
+            && executionTool.getTestActionContext().forceExclusiveTestsInParallel()) {
+          String testStrategy = request.getOptions(ExecutionOptions.class).getTestStrategy();
           for (ConfiguredTarget test : analysisResult.getExclusiveTests()) {
             getReporter()
                 .handle(
@@ -264,8 +600,12 @@ public class BuildTool {
           }
           analysisResult = analysisResult.withExclusiveTestsAsParallelTests();
         }
+        if (!analysisResult.getExclusiveIfLocalTests().isEmpty()
+            && executionTool.getTestActionContext().forceExclusiveIfLocalTestsInParallel()) {
+          analysisResult = analysisResult.withExclusiveIfLocalTestsAsParallelTests();
+        }
 
-        result.setBuildConfigurationCollection(analysisResult.getConfigurationCollection());
+        result.setBuildConfiguration(analysisResult.getConfiguration());
         result.setActualTargets(analysisResult.getTargetsToBuild());
         result.setTestTargets(analysisResult.getTargetsToTest());
 
@@ -273,7 +613,6 @@ public class BuildTool {
           analysisPostProcessor.process(request, env, runtime, analysisResult);
         }
 
-        // Execution phase.
         if (needsExecutionPhase(request.getBuildOptions())) {
           try (SilentCloseable closeable = Profiler.instance().profile("ExecutionTool.init")) {
             executionTool.init();
@@ -293,69 +632,206 @@ public class BuildTool {
               delayedFailureDetail.getMessage(), DetailedExitCode.of(delayedFailureDetail));
         }
 
-        // Only consider builds with SequencedSkyframeExecutor.
-        if (env.getSkyframeExecutor() instanceof SequencedSkyframeExecutor
-            && request.getBuildOptions().aqueryDumpAfterBuildFormat != null) {
+        // Only run this post-build step for builds with SequencedSkyframeExecutor. Enabling the
+        // aquery dump format feature will disable Skymeld, so it only runs in the non-Skymeld path.
+        if ((env.getSkyframeExecutor() instanceof SequencedSkyframeExecutor)
+            && request.getBuildOptions().getAqueryDumpAfterBuildFormat() != null) {
           try (SilentCloseable c = Profiler.instance().profile("postExecutionDumpSkyframe")) {
             dumpSkyframeStateAfterBuild(
                 request.getOptions(BuildEventProtocolOptions.class),
-                request.getBuildOptions().aqueryDumpAfterBuildFormat,
-                request.getBuildOptions().aqueryDumpAfterBuildOutputFile);
-          } catch (CommandLineExpansionException | IOException e) {
-            throw new PostExecutionActionGraphDumpException(e);
+                request.getBuildOptions().getAqueryDumpAfterBuildFormat(),
+                request.getBuildOptions().getAqueryDumpAfterBuildOutputFile());
+          } catch (CommandLineExpansionException | IOException | TemplateExpansionException e) {
+            throw new PostExecutionDumpException(e);
           } catch (InvalidAqueryOutputFormatException e) {
-            throw new PostExecutionActionGraphDumpException(
-                "--skyframe_state must be used with --output=proto|textproto|jsonproto.", e);
+            throw new PostExecutionDumpException(
+                "--skyframe_state must be used with "
+                    + "--output=proto|streamed_proto|textproto|jsonproto.",
+                e);
           }
         }
       }
-    } catch (Error | RuntimeException e) {
-      // Don't handle the error here. We will do so in stopRequest.
-      catastrophe = true;
-      throw e;
     } finally {
       if (executionTool != null) {
         executionTool.shutdown();
       }
-      if (!catastrophe) {
-        // Delete dirty nodes to ensure that they do not accumulate indefinitely.
-        long versionWindow = request.getViewOptions().versionWindowForDirtyNodeGc;
-        if (versionWindow != -1) {
-          env.getSkyframeExecutor().deleteOldNodes(versionWindow);
-        }
-        // The workspace status actions will not run with certain flags, or if an error
-        // occurs early in the build. Tell a lie so that the event is not missing.
-        // If multiple build_info events are sent, only the first is kept, so this does not harm
-        // successful runs (which use the workspace status action).
-        env.getEventBus()
-            .post(
-                new BuildInfoEvent(
-                    env.getBlazeWorkspace()
-                        .getWorkspaceStatusActionFactory()
-                        .createDummyWorkspaceStatus(
-                            new DummyEnvironment() {
-                              @Override
-                              public Path getWorkspace() {
-                                return env.getWorkspace();
-                              }
+    }
+  }
 
-                              @Override
-                              public String getBuildRequestId() {
-                                return env.getBuildRequestId();
-                              }
+  /** Performs the merged analysis and execution phase. */
+  private void buildTargetsWithMergedAnalysisExecution(
+      BuildRequest request,
+      BuildResult result,
+      TargetPatternPhaseValue targetPatternPhaseValue,
+      BuildOptions buildOptions,
+      RemoteAnalysisCachingDependenciesProvider remoteAnalysisCachingDependenciesProvider,
+      RemoteAnalysisCacheReaderDepsProvider remoteAnalysisCacheReaderDeps)
+      throws InterruptedException,
+          AbruptExitException,
+          ViewCreationFailedException,
+          BuildFailedException,
+          TestExecException,
+          InvalidConfigurationException,
+          RepositoryMappingResolutionException {
+    // See https://github.com/bazelbuild/rules_nodejs/issues/3693.
+    env.getSkyframeExecutor().clearSyscallCache();
 
-                              @Override
-                              public OptionsProvider getOptions() {
-                                return env.getOptions();
-                              }
+    boolean hasCatastrophe = false;
 
-                              @Nullable
-                              @Override
-                              public WorkspaceInfoFromDiff getWorkspaceInfoFromDiff() {
-                                return env.getWorkspaceInfoFromDiff();
-                              }
-                            })));
+    ExecutionTool executionTool = new ExecutionTool(env, request);
+    // This timer measures time from the first execution activity to the last.
+    Stopwatch executionTimer = Stopwatch.createUnstarted();
+
+    // TODO(b/199053098): implement support for --nobuild.
+    AnalysisAndExecutionResult analysisAndExecutionResult = null;
+    boolean buildCompleted = false;
+    try {
+      analysisAndExecutionResult =
+          AnalysisAndExecutionPhaseRunner.execute(
+              env,
+              request,
+              buildOptions,
+              targetPatternPhaseValue,
+              () -> executionTool.prepareForExecution(executionTimer),
+              result::setBuildConfiguration,
+              new BuildDriverKeyTestContext() {
+                @Override
+                public String getTestStrategy() {
+                  return request.getOptions(ExecutionOptions.class).getTestStrategy();
+                }
+
+                @Override
+                public boolean forceExclusiveTestsInParallel() {
+                  return executionTool.getTestActionContext().forceExclusiveTestsInParallel();
+                }
+
+                @Override
+                public boolean forceExclusiveIfLocalTestsInParallel() {
+                  return executionTool
+                      .getTestActionContext()
+                      .forceExclusiveIfLocalTestsInParallel();
+                }
+              },
+              remoteAnalysisCachingDependenciesProvider,
+              remoteAnalysisCacheReaderDeps);
+      buildCompleted = true;
+
+      // This value is null when there's no analysis.
+      if (analysisAndExecutionResult == null) {
+        return;
       }
+    } catch (InvalidConfigurationException
+        | RepositoryMappingResolutionException
+        | ViewCreationFailedException
+        | BuildFailedException
+        | TestExecException e) {
+      // These are non-catastrophic.
+      buildCompleted = true;
+      throw e;
+    } catch (Error | RuntimeException e) {
+      // These are catastrophic.
+      hasCatastrophe = true;
+      throw e;
+    } finally {
+      if (result.getBuildConfiguration() != null) {
+        // We still need to do this even in case of an exception.
+        result.setConvenienceSymlinks(
+            executionTool.handleConvenienceSymlinks(
+                env.getBuildResultListener().getAnalyzedTargets(), result.getBuildConfiguration()));
+      }
+      executionTool.unconditionalExecutionPhaseFinalizations(
+          executionTimer, env.getSkyframeExecutor());
+
+      // For the --noskymeld code path, this is done after the analysis phase.
+      BuildResultListener buildResultListener = env.getBuildResultListener();
+      result.setActualTargets(buildResultListener.getAnalyzedTargets());
+      result.setTestTargets(buildResultListener.getAnalyzedTests());
+
+      if (!hasCatastrophe) {
+        executionTool.nonCatastrophicFinalizations(
+            result,
+            env.getBlazeWorkspace().getPersistentActionCache(),
+            /* explanationHandler= */ null,
+            buildCompleted);
+      }
+    }
+
+    // This is the --keep_going code path: Time to throw the delayed exceptions.
+    // Keeping legacy behavior: for execution errors, keep the message of the BuildFailedException
+    // empty.
+    if (analysisAndExecutionResult.getExecutionDetailedExitCode() != null) {
+      throw new BuildFailedException(
+          null, analysisAndExecutionResult.getExecutionDetailedExitCode());
+    }
+
+    FailureDetail delayedFailureDetail = analysisAndExecutionResult.getFailureDetail();
+    if (delayedFailureDetail != null) {
+      throw new BuildFailedException(
+          delayedFailureDetail.getMessage(), DetailedExitCode.of(delayedFailureDetail));
+    }
+  }
+
+  private void dumpSkyframeMemory(
+      BuildResult buildResult, BuildEventProtocolOptions bepOptions, String format)
+      throws PostExecutionDumpException, InterruptedException {
+    if (!env.getSkyframeExecutor().tracksStateForIncrementality()) {
+      throw new PostExecutionDumpException(
+          "Skyframe memory dump requested, but incremental state is not tracked", null);
+    }
+
+    boolean reportTransient = true;
+    boolean reportConfiguration = true;
+    boolean reportPrecomputed = true;
+    boolean reportWorkspaceStatus = true;
+
+    for (String flag : Splitter.on(",").split(format)) {
+      switch (flag) {
+        case "json" -> {} // JSON is the only format we support, no need to note it explicitly
+        case "notransient" -> reportTransient = false;
+        case "noconfig" -> reportConfiguration = false;
+        case "noprecomputed" -> reportPrecomputed = false;
+        case "noworkspacestatus" -> reportWorkspaceStatus = false;
+        default -> throw new PostExecutionDumpException("Unknown flag: '" + flag + "'", null);
+      }
+    }
+
+    try {
+      OutputStream outputStream;
+      UploadContext streamingContext = null;
+
+      if (bepOptions.getStreamingLogFileUploads()) {
+        streamingContext =
+            runtime
+                .getBuildEventArtifactUploaderFactoryMap()
+                .select(bepOptions.getBuildEventUploadStrategy())
+                .create(env)
+                .startUpload(LocalFileType.PERFORMANCE_LOG, null);
+        outputStream = streamingContext.getOutputStream();
+        buildResult
+            .getBuildToolLogCollection()
+            .addUriFuture(SKYFRAME_MEMORY_DUMP_FILE, streamingContext.uriFuture());
+      } else {
+        Path localPath = env.getOutputBase().getRelative(SKYFRAME_MEMORY_DUMP_FILE);
+        outputStream = localPath.getOutputStream();
+        buildResult.getBuildToolLogCollection().addLocalFile(SKYFRAME_MEMORY_DUMP_FILE, localPath);
+      }
+
+      try (PrintStream printStream = new PrintStream(outputStream)) {
+
+        SkyframeMemoryDumper dumper =
+            new SkyframeMemoryDumper(
+                DisplayMode.SUMMARY,
+                null,
+                runtime.getRuleClassProvider(),
+                env.getSkyframeExecutor().getEvaluator().getInMemoryGraph(),
+                reportTransient,
+                reportConfiguration,
+                reportPrecomputed,
+                reportWorkspaceStatus);
+        dumper.dumpFull(printStream);
+      }
+    } catch (IOException | SkyframeMemoryDumper.DumpFailedException e) {
+      throw new PostExecutionDumpException("cannot write Skyframe dump: " + e.getMessage(), e);
     }
   }
 
@@ -368,7 +844,10 @@ public class BuildTool {
       @Nullable BuildEventProtocolOptions besOptions,
       String format,
       @Nullable PathFragment outputFilePathFragment)
-      throws CommandLineExpansionException, IOException, InvalidAqueryOutputFormatException {
+      throws CommandLineExpansionException,
+          IOException,
+          InvalidAqueryOutputFormatException,
+          TemplateExpansionException {
     Preconditions.checkState(env.getSkyframeExecutor() instanceof SequencedSkyframeExecutor);
 
     UploadContext streamingContext = null;
@@ -377,11 +856,11 @@ public class BuildTool {
 
     if (outputFilePathFragment == null) {
       outputFileName = getDefaultOutputFileName(format);
-      if (besOptions != null && besOptions.streamingLogFileUploads) {
+      if (besOptions != null && besOptions.getStreamingLogFileUploads()) {
         streamingContext =
             runtime
                 .getBuildEventArtifactUploaderFactoryMap()
-                .select(besOptions.buildEventUploadStrategy)
+                .select(besOptions.getBuildEventUploadStrategy())
                 .create(env)
                 .startUpload(LocalFileType.PERFORMANCE_LOG, /* inputSupplier= */ null);
       } else {
@@ -411,25 +890,24 @@ public class BuildTool {
           new ActionGraphDump(
               /* includeActionCmdLine= */ false,
               /* includeArtifacts= */ true,
+              /* includePrunedInputs= */ true,
               /* actionFilters= */ null,
               /* includeParamFiles= */ false,
-              /* deduplicateDepsets= */ true,
-              aqueryOutputHandler);
-      ((SequencedSkyframeExecutor) env.getSkyframeExecutor()).dumpSkyframeState(actionGraphDump);
+              /* includeFileWriteContents= */ false,
+              aqueryOutputHandler,
+              getReporter());
+      AqueryProcessor.dumpActionGraph(env, aqueryOutputHandler, actionGraphDump);
     }
   }
 
   private static String getDefaultOutputFileName(String format) {
-    switch (format) {
-      case "proto":
-        return "aquery_dump.proto";
-      case "textproto":
-        return "aquery_dump.textproto";
-      case "jsonproto":
-        return "aquery_dump.json";
-      default:
-        throw new IllegalArgumentException("Unsupported format type: " + format);
-    }
+    return switch (format) {
+      case "proto" -> "aquery_dump.proto";
+      case "streamed_proto" -> "aquery_dump.pb";
+      case "textproto" -> "aquery_dump.textproto";
+      case "jsonproto" -> "aquery_dump.json";
+      default -> throw new IllegalArgumentException("Unsupported format type: " + format);
+    };
   }
 
   private static OutputStream initOutputStream(
@@ -446,8 +924,14 @@ public class BuildTool {
     }
   }
 
-  public BuildResult processRequest(BuildRequest request, TargetValidator validator) {
-    return processRequest(request, validator, /* postBuildCallback= */ null);
+  public BuildResult processRequest(
+      BuildRequest request, TargetValidator validator, OptionsParsingResult options) {
+    return processRequest(
+        request,
+        validator,
+        /* postBuildCallback= */ null,
+        options,
+        /* targetsForProjectResolution= */ null);
   }
 
   /**
@@ -468,18 +952,74 @@ public class BuildTool {
    *     the request object are populated
    * @param validator an optional target validator
    * @param postBuildCallback an optional callback called after the build has been completed
-   *     successfully
+   *     successfully.
+   * @param options the options parsing result containing the options parsed so far, excluding those
+   *     from flagsets. This will be cast to an {@link OptionsParser} in order to add any options
+   *     from flagsets.
    * @return the result as a {@link BuildResult} object
    */
   public BuildResult processRequest(
-      BuildRequest request, TargetValidator validator, PostBuildCallback postBuildCallback) {
+      BuildRequest request,
+      TargetValidator validator,
+      PostBuildCallback postBuildCallback,
+      OptionsParsingResult options,
+      @Nullable List<String> targetsForProjectResolution) {
     BuildResult result = new BuildResult(request.getStartTime());
     maybeSetStopOnFirstFailure(request, result);
     Throwable crash = null;
     DetailedExitCode detailedExitCode = null;
     try {
+      detailedExitCode =
+          processRequestHandleCheckedExceptions(
+              request, result, validator, options, targetsForProjectResolution, postBuildCallback);
+    } catch (Throwable throwable) {
+      crash = throwable;
+      detailedExitCode = CrashFailureDetails.detailedExitCodeForThrowable(crash);
+      Throwables.throwIfUnchecked(throwable);
+      // This point should not be reached. Unchecked exceptions have just been thrown by
+      // Throwables.throwIfUnchecked(), and all checked exceptions should be caught in
+      // processRequestHandleCheckedExceptions.
+      IllegalStateException illegalStateException =
+          new IllegalStateException(
+              "This checked exception should have been handled by"
+                  + " processRequestHandleCheckedExceptions()",
+              throwable);
+      // crash must be an unchecked exception because in the finally block it is passed to
+      // stopRequest() which accepts only Error or RuntimeException.
+      crash = illegalStateException;
+      throw illegalStateException;
+    } finally {
+      if (detailedExitCode == null) {
+        detailedExitCode =
+            CrashFailureDetails.detailedExitCodeForThrowable(
+                new IllegalStateException("Unspecified DetailedExitCode"));
+      }
+      try (SilentCloseable c = Profiler.instance().profile("stopRequest")) {
+        stopRequest(result, crash, detailedExitCode);
+      }
+    }
+
+    return result;
+  }
+
+  private DetailedExitCode processRequestHandleCheckedExceptions(
+      BuildRequest request,
+      BuildResult result,
+      TargetValidator validator,
+      OptionsParsingResult options,
+      List<String> targetsForProjectResolution,
+      PostBuildCallback postBuildCallback) {
+    // Don't add any throws here. The purpose of this method is to catch all checked exceptions
+    // so that the catch-all `catch (Throwable throwable)` in `processRequest` only gets to handle
+    // unchecked exceptions.
+    DetailedExitCode detailedExitCode;
+    try {
       try (SilentCloseable c = Profiler.instance().profile("buildTargets")) {
-        buildTargets(request, result, validator);
+        // This OptionsParsingResult is essentially a wrapper around the OptionsParser in
+        // https://github.com/bazelbuild/bazel/blob/master/src/main/java/com/google/devtools/build/lib/runtime/BlazeCommandDispatcher.java#L341. Casting it back to
+        // an OptionsParser is safe, and necessary in order to add any options from flagsets.
+        buildTargets(
+            request, result, validator, (OptionsParser) options, targetsForProjectResolution);
       }
       detailedExitCode = DetailedExitCode.success();
       if (postBuildCallback != null) {
@@ -489,6 +1029,16 @@ public class BuildTool {
         } catch (InterruptedException e) {
           detailedExitCode =
               InterruptedFailureDetails.detailedExitCode("post build callback interrupted");
+        }
+      }
+
+      if (env.getSkyframeExecutor() instanceof SequencedSkyframeExecutor
+          && request.getBuildOptions().getSkyframeMemoryDump() != null) {
+        try (SilentCloseable c = Profiler.instance().profile("BuildTool.dumpSkyframeMemory")) {
+          dumpSkyframeMemory(
+              result,
+              request.getOptions(BuildEventProtocolOptions.class),
+              request.getBuildOptions().getSkyframeMemoryDump());
         }
       }
     } catch (BuildFailedException e) {
@@ -511,8 +1061,8 @@ public class BuildTool {
       AbruptExitException environmentPendingAbruptExitException = env.getPendingException();
       if (detailedExitCode == null && environmentPendingAbruptExitException != null) {
         detailedExitCode = environmentPendingAbruptExitException.getDetailedExitCode();
-        // Report the exception from the environment - the exception we're handling here is just an
-        // interruption.
+        // Report the exception from the environment - the exception we're handling here is just
+        // an interruption.
         reportExceptionError(environmentPendingAbruptExitException);
       }
       if (detailedExitCode == null) {
@@ -524,6 +1074,9 @@ public class BuildTool {
         result.setCatastrophe();
       }
     } catch (TargetParsingException | LoadingFailedException e) {
+      detailedExitCode = e.getDetailedExitCode();
+      reportExceptionError(e);
+    } catch (RepositoryMappingResolutionException e) {
       detailedExitCode = e.getDetailedExitCode();
       reportExceptionError(e);
     } catch (ViewCreationFailedException e) {
@@ -549,7 +1102,7 @@ public class BuildTool {
       detailedExitCode = e.getDetailedExitCode();
       reportExceptionError(e);
       result.setCatastrophe();
-    } catch (PostExecutionActionGraphDumpException e) {
+    } catch (PostExecutionDumpException e) {
       detailedExitCode =
           DetailedExitCode.of(
               FailureDetail.newBuilder()
@@ -560,38 +1113,148 @@ public class BuildTool {
                           .build())
                   .build());
       reportExceptionError(e);
-    } catch (Throwable throwable) {
-      crash = throwable;
-      detailedExitCode = CrashFailureDetails.detailedExitCodeForThrowable(crash);
-      Throwables.throwIfUnchecked(throwable);
-      throw new IllegalStateException(throwable);
-    } finally {
-      if (detailedExitCode == null) {
-        detailedExitCode =
-            CrashFailureDetails.detailedExitCodeForThrowable(
-                new IllegalStateException("Unspecified DetailedExitCode"));
-      }
-      try (SilentCloseable c = Profiler.instance().profile("stopRequest")) {
-        stopRequest(result, crash, detailedExitCode);
-      }
+    } catch (OptionsParsingException e) {
+      detailedExitCode =
+          DetailedExitCode.of(
+              FailureDetail.newBuilder()
+                  .setMessage(Strings.nullToEmpty(e.getMessage()))
+                  .setCommand(
+                      FailureDetails.Command.newBuilder()
+                          .setCode(FailureDetails.Command.Code.OPTIONS_PARSE_FAILURE))
+                  .build());
+      reportExceptionError(e);
     }
-
-    return result;
+    // Don't add a `catch (Throwable throwable)` or similar here. The purpose of this method is to
+    // check at compile time that all checked exceptions are handled here so that the catch-all
+    // `catch (Throwable throwable)` in `processRequest` only gets to handle unchecked exceptions.
+    return detailedExitCode;
   }
 
-  private static void maybeSetStopOnFirstFailure(BuildRequest request, BuildResult result) {
-    if (shouldStopOnFailure(request)) {
-      result.setStopOnFirstFailure(true);
+  private void reportRemoteAnalysisServiceStats(
+      @Nullable FingerprintValueService fingerprintValueService,
+      @Nullable RemoteAnalysisCacheClient analysisCacheClient) {
+    if (fingerprintValueService != null) {
+      fingerprintValueService.shutdown();
+    }
+    FingerprintValueStore.Stats fingerprintValueServiceStats =
+        fingerprintValueService == null
+            ? FingerprintValueStore.EMPTY_STATS
+            : fingerprintValueService.getStats();
+    RemoteAnalysisCacheClient.Stats remoteAnalysisCacheClientStats =
+        analysisCacheClient == null
+            ? RemoteAnalysisCacheClient.EMPTY_STATS
+            : analysisCacheClient.getStats();
+    env.getRemoteAnalysisCachingEventListener()
+        .recordServiceStats(fingerprintValueServiceStats, remoteAnalysisCacheClientStats);
+    RemoteAnalysisCachingServicesSupplier servicesSupplier =
+        env.getBlazeWorkspace().remoteAnalysisCachingServicesSupplier();
+    env.getRemoteAnalysisCachingEventListener().recordPeers(servicesSupplier.getPeers());
+  }
+
+  private void reportOnlyBailOutReason(RemoteAnalysisCacheReaderDepsProvider readerDeps)
+      throws InterruptedException {
+    RemoteAnalysisCacheClient remoteAnalysisCacheClient = readerDeps.getAnalysisCacheClient();
+    if (remoteAnalysisCacheClient == null) {
+      return;
+    }
+    env.getRemoteAnalysisCachingEventListener()
+        .recordServiceStats(
+            /* fvsStats= */ FingerprintValueStore.EMPTY_STATS,
+            remoteAnalysisCacheClient.getStats());
+  }
+
+  /**
+   * Handles post-build analysis caching operations.
+   *
+   * <ol>
+   *   <li>If this is a cache-writing build, then this will serialize and upload the frontier
+   *       Skyframe values.
+   *   <li>If this is a cache-reading build, then this will report the cache hit stats while
+   *       downloading the frontier Skyframe values during analysis.
+   * </ol>
+   */
+  private void logAnalysisCachingStats(RemoteAnalysisCacheReaderDepsProvider dependenciesProvider)
+      throws InterruptedException {
+    if (!(env.getSkyframeExecutor() instanceof SequencedSkyframeExecutor)) {
+      return;
+    }
+
+    if (dependenciesProvider.mode().requiresBackendConnectivity()) {
+      reportRemoteAnalysisServiceStats(
+          dependenciesProvider.getFingerprintValueService(),
+          dependenciesProvider.getAnalysisCacheClient());
+    }
+    if (dependenciesProvider.mode().isUploadEnabled()) {
+      reportRemoteAnalysisUploadStats();
+    }
+    if (dependenciesProvider.mode().isRetrievalEnabled()) {
+      reportRemoteAnalysisRetrievalStats();
+      env.getSkyframeExecutor()
+          .syncRemoteAnalysisCachingState(
+              env.getRemoteAnalysisCachingEventListener().getSkyValueVersion(),
+              env.getRemoteAnalysisCachingEventListener().getClientId());
     }
   }
 
-  private static boolean shouldStopOnFailure(BuildRequest request) {
-    return !(request.getKeepGoing() && request.getExecutionOptions().testKeepGoing);
+  private void tryWriteSkycacheMetadata(
+      SerializationDependenciesProvider serializationDependenciesProvider)
+      throws InterruptedException {
+    String message = "No local crash but the RPC failed in the backend";
+    boolean success = false;
+    SkycacheMetadataParams skycacheMetadataParams =
+        env.getBlazeWorkspace().remoteAnalysisCachingServicesSupplier().getSkycacheMetadataParams();
+    if (skycacheMetadataParams == null) {
+      return;
+    }
+    try (SilentCloseable c = Profiler.instance().profile("skycache.metadata.upload")) {
+      // This is a blocking call. We cannot finish the build until the metadata has been written
+      // and at this point there is nothing else to do in the build that could be done in
+      // parallel.
+      RemoteAnalysisMetadataWriter metadataWriter =
+          serializationDependenciesProvider.getMetadataWriter();
+      if (metadataWriter == null) {
+        message = "MetadataAnalysisCacheWriterService is unavailable";
+      } else {
+        success =
+            metadataWriter.addTopLevelTargets(
+                env.getCommandId().toString(),
+                skycacheMetadataParams.getEvaluatingVersion(),
+                skycacheMetadataParams.getConfigurationHash(),
+                skycacheMetadataParams.getUseFakeStampData(),
+                skycacheMetadataParams.getBazelVersion(),
+                skycacheMetadataParams.getTargets(),
+                skycacheMetadataParams.getConfigFlags());
+      }
+    } catch (IOException e) {
+      // To avoid build failures for a UX-enhancing feature, errors writing build metadata do not
+      // cause the build to fail. Instead, we log the error and rely on external monitoring to
+      // detect issues with metadata writes.
+      message = e.getMessage();
+    }
+    if (success) {
+      env.getReporter().handle(Event.info("Skycache: Successfully wrote metadata to backend"));
+    } else {
+      env.getReporter()
+          .handle(
+              Event.warn(
+                  "Skycache: Failed to write metadata to backend"
+                      + (message != null ? ": " + message : "")));
+    }
+  }
+
+  private static void maybeSetStopOnFirstFailure(
+      OptionsProvider optionsProvider, BuildResult result) {
+    result.setStopOnFirstFailure(shouldStopOnFailure(optionsProvider));
+  }
+
+  private static boolean shouldStopOnFailure(OptionsProvider optionsProvider) {
+    return !(optionsProvider.getOptions(KeepGoingOption.class).getKeepGoing()
+        && optionsProvider.getOptions(ExecutionOptions.class).getTestKeepGoing());
   }
 
   /** Initializes the output filter to the value given with {@code --output_filter}. */
   private void initializeOutputFilter(BuildRequest request) {
-    RegexPatternOption outputFilterOption = request.getBuildOptions().outputFilter;
+    RegexPatternOption outputFilterOption = request.getBuildOptions().getOutputFilter();
     if (outputFilterOption != null) {
       getReporter()
           .setOutputFilter(
@@ -600,7 +1263,7 @@ public class BuildTool {
   }
 
   private static boolean needsExecutionPhase(BuildRequestOptions options) {
-    return options.performAnalysisPhase && options.performExecutionPhase;
+    return options.getPerformAnalysisPhase() && options.getPerformExecutionPhase();
   }
 
   /**
@@ -618,14 +1281,13 @@ public class BuildTool {
     Preconditions.checkState((crash == null) || !detailedExitCode.isSuccess());
     result.setUnhandledThrowable(crash);
     result.setDetailedExitCode(detailedExitCode);
+    if (!detailedExitCode.isSuccess()) {
+      logger.atInfo().log(
+          "Unsuccessful command ended with FailureDetail: %s", detailedExitCode.getFailureDetail());
+    }
 
     InterruptedException ie = null;
-    try {
-      env.getSkyframeExecutor().notifyCommandComplete(env.getReporter());
-    } catch (InterruptedException e) {
-      env.getReporter().handle(Event.error("Build interrupted during command completion"));
-      ie = e;
-    }
+
     // The stop time has to be captured before we send the BuildCompleteEvent.
     result.setStopTime(runtime.getClock().currentTimeMillis());
 
@@ -633,13 +1295,13 @@ public class BuildTool {
     // that the build completed normally. BlazeCommandDispatcher will call handleCrash.
     if (crash == null) {
       try {
+        MemoryProfiler.instance().markPhase(ProfilePhase.FINISH);
         Profiler.instance().markPhase(ProfilePhase.FINISH);
       } catch (InterruptedException e) {
         env.getReporter().handle(Event.error("Build interrupted during command completion"));
         ie = e;
       }
-      env.getEventBus().post(new CollectMetricsEvent());
-      env.getEventBus().post(new BuildPrecompleteEvent());
+
       env.getEventBus()
           .post(
               new BuildCompleteEvent(
@@ -688,14 +1350,144 @@ public class BuildTool {
     private final DetailedExitCode detailedExitCode;
 
     ExitException(DetailedExitCode detailedExitCode) {
-      super(
-          Preconditions.checkNotNull(detailedExitCode.getFailureDetail(), "failure detail")
-              .getMessage());
+      super(checkNotNull(detailedExitCode.getFailureDetail(), "failure detail").getMessage());
       this.detailedExitCode = detailedExitCode;
     }
 
     DetailedExitCode getDetailedExitCode() {
       return detailedExitCode;
     }
+  }
+
+  private void serializeValues(SerializationDependenciesProvider serializationDependenciesProvider)
+      throws InterruptedException, AbruptExitException {
+    if (!(env.getSkyframeExecutor() instanceof SequencedSkyframeExecutor)) {
+      return;
+    }
+
+    checkState(serializationDependenciesProvider.mode().serializesValues());
+
+    if (serializationDependenciesProvider.mode().isAsyncUpload()) {
+      try {
+        serializationDependenciesProvider.waitForUploadCompletion();
+      } catch (ExecutionException e) {
+        Throwables.throwIfInstanceOf(e.getCause(), AbruptExitException.class);
+        throw new AbruptExitException(
+            DetailedExitCode.of(
+                FailureDetail.newBuilder()
+                    .setMessage("Skycache upload failed: " + e.getCause().getMessage())
+                    .setRemoteAnalysisCaching(
+                        RemoteAnalysisCaching.newBuilder()
+                            .setCode(RemoteAnalysisCaching.Code.UPLOAD_FAILED))
+                    .build()));
+      }
+      tryWriteSkycacheMetadata(serializationDependenciesProvider);
+      return;
+    }
+
+    try (SilentCloseable closeable = Profiler.instance().profile("serializeAndUploadFrontier")) {
+      Optional<FailureDetail> maybeFailureDetail =
+          FrontierSerializer.serializeAndUploadFrontier(
+              serializationDependenciesProvider,
+              env.getSkyframeExecutor().getEvaluator(),
+              env.getVersionGetter(),
+              env.getReporter(),
+              env.getEventBus(),
+              env.getOptions()
+                  .getOptions(KeepStateAfterBuildOption.class)
+                  .getKeepStateAfterBuild());
+      if (maybeFailureDetail.isPresent()) {
+        throw new AbruptExitException(DetailedExitCode.of(maybeFailureDetail.get()));
+      }
+    }
+
+    if (serializationDependenciesProvider.mode().isSyncUpload()) {
+      tryWriteSkycacheMetadata(serializationDependenciesProvider);
+    }
+  }
+
+  private void reportRemoteAnalysisUploadStats() {
+    FingerprintValueStore.Stats stats =
+        env.getRemoteAnalysisCachingEventListener().getFingerprintValueStoreStats();
+
+    env.getReporter()
+        .handle(
+            Event.info(
+                String.format(
+                    "Skycache write: uploaded %s/%s key/value bytes and %s entries (%s batches)",
+                    stats.keyBytesSent(),
+                    stats.valueBytesSent(),
+                    stats.entriesWritten(),
+                    stats.setBatches())));
+  }
+
+  private void reportRemoteAnalysisRetrievalStats() {
+    var listener = env.getRemoteAnalysisCachingEventListener();
+    var hitsByFunction = listener.getHitsBySkyFunctionName();
+    var missesByFunction = listener.getMissesBySkyFunctionName();
+    long totalHits = hitsByFunction.values().stream().mapToLong(AtomicLong::get).sum();
+    long totalMisses = missesByFunction.values().stream().mapToLong(AtomicLong::get).sum();
+    long totalRequests = totalHits + totalMisses;
+
+    checkState(totalRequests >= 0, "totalRequests should be non-negative");
+    if (totalRequests == 0) {
+      // Don't report stats if there were no requests.
+      return;
+    }
+
+    // Combine keys from both maps
+    Set<SkyFunctionName> allFunctionNames =
+        Sets.union(hitsByFunction.keySet(), missesByFunction.keySet());
+    // Format the stats per function, sorted alphabetically by function name
+    String statsByFunction =
+        allFunctionNames.stream()
+            .sorted(comparing(SkyFunctionName::getName))
+            .map(
+                functionName -> {
+                  long hits = hitsByFunction.getOrDefault(functionName, new AtomicLong(0)).get();
+                  long misses =
+                      missesByFunction.getOrDefault(functionName, new AtomicLong(0)).get();
+                  long functionTotal = hits + misses;
+                  double functionHitRate =
+                      functionTotal == 0 ? 0.0 : (double) hits / functionTotal * 100;
+                  return String.format(
+                      "%s: %d/%d (%.2f%%)",
+                      functionName.getName(), hits, functionTotal, functionHitRate);
+                })
+            .collect(joining(", "));
+
+    FingerprintValueStore.Stats fvsStats = listener.getFingerprintValueStoreStats();
+    long bytesReceived = fvsStats.valueBytesReceived();
+    long requests = fvsStats.entriesFound() + fvsStats.entriesNotFound();
+
+    RemoteAnalysisCacheClient.Stats raccStats = listener.getRemoteAnalysisCacheStats();
+    bytesReceived += raccStats.bytesReceived();
+    requests += raccStats.requestsSent();
+
+    // totalRequests is already checked to be non-zero above.
+    double overallHitRate = (double) totalHits / totalRequests * 100;
+    env.getReporter()
+        .handle(
+            Event.info(
+                String.format(
+                    "Skycache read: %s received in %s requests, %s/%s cache"
+                        + " hits (%.2f%%) [Breakdown: %s]",
+                    formatBytes(bytesReceived),
+                    requests,
+                    totalHits,
+                    totalRequests,
+                    overallHitRate,
+                    statsByFunction)));
+  }
+
+  /** Formats a number of bytes in a human-readable prefixed format. */
+  private static String formatBytes(long bytes) {
+    var k = 1024;
+    if (bytes < k) {
+      return bytes + " B";
+    }
+    int exponent = (int) (Math.log((double) bytes) / Math.log(k));
+    String prefixedUnit = "KMGTPE".charAt(exponent - 1) + "B";
+    return String.format("%.2f %s", bytes / Math.pow(k, exponent), prefixedUnit);
   }
 }

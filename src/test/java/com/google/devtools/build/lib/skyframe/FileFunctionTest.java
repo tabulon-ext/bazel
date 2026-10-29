@@ -27,9 +27,6 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 import com.google.common.testing.EqualsTester;
 import com.google.devtools.build.lib.actions.FileStateValue;
 import com.google.devtools.build.lib.actions.FileValue;
@@ -37,10 +34,14 @@ import com.google.devtools.build.lib.actions.FileValue.DifferentRealPathFileValu
 import com.google.devtools.build.lib.actions.FileValue.DifferentRealPathFileValueWithoutStoredChain;
 import com.google.devtools.build.lib.actions.FileValue.SymlinkFileValueWithStoredChain;
 import com.google.devtools.build.lib.actions.FileValue.SymlinkFileValueWithoutStoredChain;
-import com.google.devtools.build.lib.actions.ThreadStateReceiver;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
-import com.google.devtools.build.lib.analysis.ConfiguredRuleClassProvider;
 import com.google.devtools.build.lib.analysis.ServerDirectories;
+import com.google.devtools.build.lib.bazel.repository.RepoDefinitionFunction;
+import com.google.devtools.build.lib.bazel.repository.RepoDefinitionValue;
+import com.google.devtools.build.lib.bazel.repository.RepoMetadataRequirements;
+import com.google.devtools.build.lib.bazel.repository.RepositoryFetchFunction;
+import com.google.devtools.build.lib.bazel.repository.RepositoryOptions;
+import com.google.devtools.build.lib.bazel.repository.cache.LocalRepoContentsCache;
 import com.google.devtools.build.lib.clock.BlazeClock;
 import com.google.devtools.build.lib.cmdline.LabelConstants;
 import com.google.devtools.build.lib.events.NullEventHandler;
@@ -50,24 +51,18 @@ import com.google.devtools.build.lib.io.FileSymlinkCycleUniquenessFunction;
 import com.google.devtools.build.lib.io.FileSymlinkInfiniteExpansionException;
 import com.google.devtools.build.lib.io.FileSymlinkInfiniteExpansionUniquenessFunction;
 import com.google.devtools.build.lib.io.InconsistentFilesystemException;
-import com.google.devtools.build.lib.packages.WorkspaceFileValue;
 import com.google.devtools.build.lib.pkgcache.PathPackageLocator;
-import com.google.devtools.build.lib.rules.repository.LocalRepositoryFunction;
-import com.google.devtools.build.lib.rules.repository.LocalRepositoryRule;
-import com.google.devtools.build.lib.rules.repository.RepositoryDelegatorFunction;
-import com.google.devtools.build.lib.rules.repository.RepositoryFunction;
+import com.google.devtools.build.lib.rules.repository.RepositoryDirectoryValue;
 import com.google.devtools.build.lib.skyframe.ExternalFilesHelper.ExternalFileAction;
-import com.google.devtools.build.lib.skyframe.PackageLookupFunction.CrossRepositoryLabelViolationStrategy;
 import com.google.devtools.build.lib.skyframe.serialization.testutils.FsUtils;
 import com.google.devtools.build.lib.skyframe.serialization.testutils.SerializationTester;
 import com.google.devtools.build.lib.testutil.ManualClock;
 import com.google.devtools.build.lib.testutil.TestConstants;
-import com.google.devtools.build.lib.testutil.TestPackageFactoryBuilderFactory;
-import com.google.devtools.build.lib.testutil.TestRuleClassProvider;
 import com.google.devtools.build.lib.util.Pair;
 import com.google.devtools.build.lib.util.io.TimestampGranularityMonitor;
 import com.google.devtools.build.lib.vfs.DigestHashFunction;
 import com.google.devtools.build.lib.vfs.FileAccessException;
+import com.google.devtools.build.lib.vfs.FileStateKey;
 import com.google.devtools.build.lib.vfs.FileStatus;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.Path;
@@ -76,6 +71,7 @@ import com.google.devtools.build.lib.vfs.Root;
 import com.google.devtools.build.lib.vfs.RootedPath;
 import com.google.devtools.build.lib.vfs.SyscallCache;
 import com.google.devtools.build.lib.vfs.inmemoryfs.InMemoryFileSystem;
+import com.google.devtools.build.skyframe.Differencer.DiffWithDelta.Delta;
 import com.google.devtools.build.skyframe.ErrorInfo;
 import com.google.devtools.build.skyframe.ErrorInfoSubject;
 import com.google.devtools.build.skyframe.EvaluationContext;
@@ -90,12 +86,14 @@ import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.SkyValue;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
@@ -112,13 +110,14 @@ public class FileFunctionTest {
   private static final EvaluationContext EVALUATION_OPTIONS =
       EvaluationContext.newBuilder()
           .setKeepGoing(false)
-          .setNumThreads(DEFAULT_THREAD_COUNT)
+          .setParallelism(DEFAULT_THREAD_COUNT)
           .setEventHandler(NullEventHandler.INSTANCE)
           .build();
 
   private InMemoryFileSystem fs;
   private Root pkgRoot;
   private Path outputBase;
+  private Root outputBaseRoot;
   private PathPackageLocator pkgLocator;
   private boolean fastDigest;
   private ManualClock manualClock;
@@ -135,6 +134,7 @@ public class FileFunctionTest {
     this.fs = fs;
     pkgRoot = Root.fromPath(fs.getPath("/root"));
     outputBase = fs.getPath("/output_base");
+    outputBaseRoot = Root.fromPath(outputBase);
     pkgLocator =
         new PathPackageLocator(
             outputBase,
@@ -153,24 +153,19 @@ public class FileFunctionTest {
         new BlazeDirectories(
             new ServerDirectories(pkgRoot.asPath(), outputBase, outputBase),
             pkgRoot.asPath(),
-            /* defaultSystemJavabase= */ null,
             TestConstants.PRODUCT_NAME);
     ExternalFilesHelper externalFilesHelper =
         ExternalFilesHelper.createForTesting(pkgLocatorRef, externalFileAction, directories);
     differencer = new SequencedRecordingDifferencer();
-    ConfiguredRuleClassProvider ruleClassProvider =
-        TestRuleClassProvider.getRuleClassProviderWithClearedSuffix();
-    ImmutableMap<String, RepositoryFunction> repositoryHandlers =
-        ImmutableMap.of(LocalRepositoryRule.NAME, new LocalRepositoryFunction());
     MemoizingEvaluator evaluator =
         new InMemoryMemoizingEvaluator(
             ImmutableMap.<SkyFunctionName, SkyFunction>builder()
                 .put(
-                    FileStateValue.FILE_STATE,
+                    FileStateKey.FILE_STATE,
                     new FileStateFunction(
                         Suppliers.ofInstance(
                             new TimestampGranularityMonitor(BlazeClock.instance())),
-                        () -> SyscallCache.NO_CACHE,
+                        SyscallCache.NO_CACHE,
                         externalFilesHelper))
                 .put(
                     FileSymlinkCycleUniquenessFunction.NAME,
@@ -178,65 +173,48 @@ public class FileFunctionTest {
                 .put(
                     FileSymlinkInfiniteExpansionUniquenessFunction.NAME,
                     new FileSymlinkInfiniteExpansionUniquenessFunction())
-                .put(FileValue.FILE, new FileFunction(pkgLocatorRef))
-                .put(
-                    SkyFunctions.PACKAGE,
-                    new PackageFunction(
-                        null,
-                        null,
-                        null,
-                        null,
-                        null,
-                        /*packageProgress=*/ null,
-                        PackageFunction.ActionOnIOExceptionReadingBuildFile.UseOriginalIOException
-                            .INSTANCE,
-                        PackageFunction.IncrementalityIntent.INCREMENTAL,
-                        k -> ThreadStateReceiver.NULL_INSTANCE))
+                .put(SkyFunctions.FILE, new FileFunction(pkgLocatorRef, directories))
+                .put(SkyFunctions.PACKAGE, PackageFunction.newBuilder().build())
                 .put(
                     SkyFunctions.PACKAGE_LOOKUP,
                     new PackageLookupFunction(
                         new AtomicReference<>(ImmutableSet.of()),
-                        CrossRepositoryLabelViolationStrategy.ERROR,
-                        BazelSkyframeExecutorConstants.BUILD_FILES_BY_PRIORITY,
-                        BazelSkyframeExecutorConstants.EXTERNAL_PACKAGE_HELPER))
-                .put(
-                    WorkspaceFileValue.WORKSPACE_FILE,
-                    new WorkspaceFileFunction(
-                        ruleClassProvider,
-                        TestPackageFactoryBuilderFactory.getInstance()
-                            .builder(directories)
-                            .build(ruleClassProvider, fs),
-                        directories,
-                        /*bzlLoadFunctionForInlining=*/ null))
-                .put(
-                    SkyFunctions.EXTERNAL_PACKAGE,
-                    new ExternalPackageFunction(
-                        BazelSkyframeExecutorConstants.EXTERNAL_PACKAGE_HELPER))
-                .put(
-                    SkyFunctions.LOCAL_REPOSITORY_LOOKUP,
-                    new LocalRepositoryLookupFunction(
-                        BazelSkyframeExecutorConstants.EXTERNAL_PACKAGE_HELPER))
+                        BazelSkyframeExecutorConstants.BUILD_FILES_BY_PRIORITY))
                 .put(
                     SkyFunctions.REPOSITORY_DIRECTORY,
-                    new RepositoryDelegatorFunction(
-                        repositoryHandlers,
-                        null,
-                        new AtomicBoolean(true),
+                    new RepositoryFetchFunction(
+                        ImmutableMap::of,
                         ImmutableMap::of,
                         directories,
-                        ManagedDirectoriesKnowledge.NO_MANAGED_DIRECTORIES,
-                        BazelSkyframeExecutorConstants.EXTERNAL_PACKAGE_HELPER))
+                        new LocalRepoContentsCache()))
+                .put(
+                    SkyFunctions.REPOSITORY_MAPPING,
+                    new SkyFunction() {
+                      @Override
+                      public SkyValue compute(SkyKey skyKey, Environment env) {
+                        return RepositoryMappingValue.VALUE_FOR_EMPTY_ROOT_MODULE;
+                      }
+                    })
+                .put(
+                    RepoDefinitionValue.REPO_DEFINITION,
+                    new SkyFunction() {
+                      @Override
+                      public SkyValue compute(SkyKey skyKey, Environment env) {
+                        return RepoDefinitionValue.NOT_FOUND;
+                      }
+                    })
                 .build(),
             differencer);
     PrecomputedValue.BUILD_ID.set(differencer, UUID.randomUUID());
     PrecomputedValue.PATH_PACKAGE_LOCATOR.set(differencer, pkgLocator);
-    RepositoryDelegatorFunction.REPOSITORY_OVERRIDES.set(differencer, ImmutableMap.of());
-    RepositoryDelegatorFunction.DEPENDENCY_FOR_UNCONDITIONAL_FETCHING.set(
-        differencer, RepositoryDelegatorFunction.DONT_FETCH_UNCONDITIONALLY);
+    RepoDefinitionFunction.REPOSITORY_OVERRIDES.set(differencer, ImmutableMap.of());
+    RepositoryDirectoryValue.FETCH_DISABLED.set(differencer, false);
+    RepositoryDirectoryValue.FORCE_FETCH.set(
+        differencer, RepositoryDirectoryValue.FORCE_FETCH_DISABLED);
+    RepositoryDirectoryValue.VENDOR_DIRECTORY.set(differencer, Optional.empty());
+    RepoMetadataRequirements.REQUIRE_REPO_EXTENSION_METADATA.set(
+        differencer, RepositoryOptions.RequireRepoExtensionMetadataMode.FALSE);
     PrecomputedValue.STARLARK_SEMANTICS.set(differencer, StarlarkSemantics.DEFAULT);
-    RepositoryDelegatorFunction.RESOLVED_FILE_INSTEAD_OF_WORKSPACE.set(
-        differencer, Optional.empty());
-    RepositoryDelegatorFunction.ENABLE_BZLMOD.set(differencer, false);
     return evaluator;
   }
 
@@ -250,8 +228,16 @@ public class FileFunctionTest {
 
   private static FileValue valueForPathHelper(Root root, Path path, MemoizingEvaluator evaluator)
       throws InterruptedException {
-    PathFragment pathFragment = root.relativize(path);
-    RootedPath rootedPath = RootedPath.toRootedPath(root, pathFragment);
+    return valueForRootedPathHelper(
+        RootedPath.toRootedPath(root, root.relativize(path)), evaluator);
+  }
+
+  private FileValue valueForRootedPath(RootedPath rootedPath) throws InterruptedException {
+    return valueForRootedPathHelper(rootedPath, makeEvaluator());
+  }
+
+  private static FileValue valueForRootedPathHelper(
+      RootedPath rootedPath, MemoizingEvaluator evaluator) throws InterruptedException {
     SkyKey key = FileValue.key(rootedPath);
     EvaluationResult<FileValue> result =
         evaluator.evaluate(ImmutableList.of(key), EVALUATION_OPTIONS);
@@ -325,7 +311,7 @@ public class FileFunctionTest {
     file("a");
     file("b");
 
-    Set<RootedPath> seenFiles = Sets.newHashSet();
+    Set<RootedPath> seenFiles = new HashSet<>();
     seenFiles.addAll(getFilesSeenAndAssertValueChangesIfContentsOfFileChanges("a", false, "b"));
     seenFiles.addAll(getFilesSeenAndAssertValueChangesIfContentsOfFileChanges("b", false, "a"));
     assertThat(seenFiles).containsExactly(rootedPath("a"), rootedPath("b"), rootedPath(""));
@@ -396,7 +382,7 @@ public class FileFunctionTest {
     symlink("a", "../outside");
     file("b");
     file("../outside");
-    Set<RootedPath> seenFiles = Sets.newHashSet();
+    Set<RootedPath> seenFiles = new HashSet<>();
     seenFiles.addAll(getFilesSeenAndAssertValueChangesIfContentsOfFileChanges("b", false, "a"));
     seenFiles.addAll(
         getFilesSeenAndAssertValueChangesIfContentsOfFileChanges("../outside", true, "a"));
@@ -413,7 +399,7 @@ public class FileFunctionTest {
     symlink("a", "/absolute");
     file("b");
     file("/absolute");
-    Set<RootedPath> seenFiles = Sets.newHashSet();
+    Set<RootedPath> seenFiles = new HashSet<>();
     seenFiles.addAll(getFilesSeenAndAssertValueChangesIfContentsOfFileChanges("b", false, "a"));
     seenFiles.addAll(
         getFilesSeenAndAssertValueChangesIfContentsOfFileChanges("/absolute", true, "a"));
@@ -435,22 +421,18 @@ public class FileFunctionTest {
     symlink("a", externalPath);
     file("b");
     file(externalPath);
-    Set<RootedPath> seenFiles = Sets.newHashSet();
+    Set<RootedPath> seenFiles = new HashSet<>();
     seenFiles.addAll(getFilesSeenAndAssertValueChangesIfContentsOfFileChanges("b", false, "a"));
     seenFiles.addAll(
         getFilesSeenAndAssertValueChangesIfContentsOfFileChanges(externalPath, true, "a"));
-    Root root = Root.absoluteRoot(fs);
     assertThat(seenFiles)
         .containsExactly(
-            rootedPath("WORKSPACE"),
-            rootedPath("WORKSPACE.bazel"),
             rootedPath("a"),
             rootedPath(""),
-            RootedPath.toRootedPath(root, PathFragment.create("/")),
-            RootedPath.toRootedPath(root, PathFragment.create("/output_base")),
-            RootedPath.toRootedPath(root, PathFragment.create("/output_base/external")),
-            RootedPath.toRootedPath(root, PathFragment.create("/output_base/external/a")),
-            RootedPath.toRootedPath(root, PathFragment.create("/output_base/external/a/b")));
+            rootedPath("/output_base"),
+            rootedPath("/output_base/external"),
+            rootedPath("/output_base/external/a"),
+            rootedPath("/output_base/external/a/b"));
   }
 
   @Test
@@ -509,7 +491,7 @@ public class FileFunctionTest {
   @Test
   public void testBrokenSymlink() throws Exception {
     symlink("a", "b");
-    Set<RootedPath> seenFiles = Sets.newHashSet();
+    Set<RootedPath> seenFiles = new HashSet<>();
     seenFiles.addAll(getFilesSeenAndAssertValueChangesIfContentsOfFileChanges("b", true, "a"));
     seenFiles.addAll(getFilesSeenAndAssertValueChangesIfContentsOfFileChanges("a", false, "b"));
     assertThat(seenFiles).containsExactly(rootedPath("a"), rootedPath("b"), rootedPath(""));
@@ -550,7 +532,7 @@ public class FileFunctionTest {
         new CustomInMemoryFs(manualClock) {
           @Override
           @SuppressWarnings("UnsynchronizedOverridesSynchronized")
-          protected byte[] getFastDigest(PathFragment path) {
+          public byte[] getFastDigest(PathFragment path) {
             return digest;
           }
         });
@@ -589,7 +571,7 @@ public class FileFunctionTest {
         new CustomInMemoryFs(manualClock) {
           @Override
           @SuppressWarnings("UnsynchronizedOverridesSynchronized")
-          protected byte[] getFastDigest(PathFragment path) {
+          public byte[] getFastDigest(PathFragment path) {
             return path.getBaseName().equals("unreadable") ? expectedDigest : null;
           }
         });
@@ -797,8 +779,9 @@ public class FileFunctionTest {
   }
 
   @Test
-  public void testAbsoluteSymlinksReferredByInternalFilesToFilesOutsideRootWhenExternalAssumedNonExistentAndImmutable()
-      throws Exception {
+  public void
+      testAbsoluteSymlinksReferredByInternalFilesToFilesOutsideRootWhenExternalAssumedNonExistentAndImmutable()
+          throws Exception {
     file("/outsideroot/src/foo/bar");
     symlink("/root/src", "/outsideroot/src");
 
@@ -846,13 +829,14 @@ public class FileFunctionTest {
     FileValue value = (FileValue) result.get(key);
     assertThat(value).isNotNull();
     assertThat(value.exists()).isTrue();
-    assertThat(value.realRootedPath().getRootRelativePath().getPathString())
+    assertThat(
+            value.realRootedPath((RootedPath) key.argument()).getRootRelativePath().getPathString())
         .isEqualTo("insideroot");
   }
 
   private static Set<RootedPath> filesSeen(MemoizingEvaluator graph) {
     return graph.getValues().keySet().stream()
-        .filter(SkyFunctionName.functionIs(FileStateValue.FILE_STATE))
+        .filter(SkyFunctionName.functionIs(FileStateKey.FILE_STATE))
         .map(SkyKey::argument)
         .map(RootedPath.class::cast)
         .collect(toImmutableSet());
@@ -889,7 +873,7 @@ public class FileFunctionTest {
     fs =
         new CustomInMemoryFs(manualClock) {
           @Override
-          protected byte[] getDigest(PathFragment path) throws IOException {
+          public byte[] getDigest(PathFragment path) throws IOException {
             digestCalls.incrementAndGet();
             return super.getDigest(path);
           }
@@ -971,7 +955,7 @@ public class FileFunctionTest {
     createFsAndRoot(
         new CustomInMemoryFs(manualClock) {
           @Override
-          protected boolean isReadable(PathFragment path) throws IOException {
+          public boolean isReadable(PathFragment path) throws IOException {
             if (path.getBaseName().equals("unreadable")) {
               throw new IOException("isReadable failed");
             }
@@ -1058,7 +1042,7 @@ public class FileFunctionTest {
     EvaluationContext evaluationContext =
         EvaluationContext.newBuilder()
             .setKeepGoing(true)
-            .setNumThreads(DEFAULT_THREAD_COUNT)
+            .setParallelism(DEFAULT_THREAD_COUNT)
             .setEventHandler(eventHandler)
             .build();
     EvaluationResult<FileValue> result = evaluator.evaluate(keys, evaluationContext);
@@ -1082,22 +1066,22 @@ public class FileFunctionTest {
 
   @Test
   public void testSymlinkCycle_ancestorCycle_startInCycle() throws Exception {
-    runTestSymlinkCycle(/*ancestorCycle=*/ true, /*startInCycle=*/ true);
+    runTestSymlinkCycle(/* ancestorCycle= */ true, /* startInCycle= */ true);
   }
 
   @Test
   public void testSymlinkCycle_ancestorCycle_startOutOfCycle() throws Exception {
-    runTestSymlinkCycle(/*ancestorCycle=*/ true, /*startInCycle=*/ false);
+    runTestSymlinkCycle(/* ancestorCycle= */ true, /* startInCycle= */ false);
   }
 
   @Test
   public void testSymlinkCycle_regularCycle_startInCycle() throws Exception {
-    runTestSymlinkCycle(/*ancestorCycle=*/ false, /*startInCycle=*/ true);
+    runTestSymlinkCycle(/* ancestorCycle= */ false, /* startInCycle= */ true);
   }
 
   @Test
   public void testSymlinkCycle_regularCycle_startOutOfCycle() throws Exception {
-    runTestSymlinkCycle(/*ancestorCycle=*/ false, /*startInCycle=*/ false);
+    runTestSymlinkCycle(/* ancestorCycle= */ false, /* startInCycle= */ false);
   }
 
   @Test
@@ -1208,7 +1192,7 @@ public class FileFunctionTest {
     EvaluationContext evaluationContext =
         EvaluationContext.newBuilder()
             .setKeepGoing(true)
-            .setNumThreads(DEFAULT_THREAD_COUNT)
+            .setParallelism(DEFAULT_THREAD_COUNT)
             .setEventHandler(eventHandler)
             .build();
     EvaluationResult<FileValue> result = evaluator.evaluate(keys, evaluationContext);
@@ -1235,24 +1219,25 @@ public class FileFunctionTest {
   @Test
   public void testInfiniteSymlinkExpansion_absoluteSymlinkToDescendant() throws Exception {
     runTestSimpleInfiniteSymlinkExpansion(
-        /* symlinkToAncestor= */ false, /*absoluteSymlink=*/ true);
+        /* symlinkToAncestor= */ false, /* absoluteSymlink= */ true);
   }
 
   @Test
   public void testInfiniteSymlinkExpansion_relativeSymlinkToDescendant() throws Exception {
     runTestSimpleInfiniteSymlinkExpansion(
-        /* symlinkToAncestor= */ false, /*absoluteSymlink=*/ false);
+        /* symlinkToAncestor= */ false, /* absoluteSymlink= */ false);
   }
 
   @Test
   public void testInfiniteSymlinkExpansion_absoluteSymlinkToAncestor() throws Exception {
-    runTestSimpleInfiniteSymlinkExpansion(/* symlinkToAncestor= */ true, /*absoluteSymlink=*/ true);
+    runTestSimpleInfiniteSymlinkExpansion(
+        /* symlinkToAncestor= */ true, /* absoluteSymlink= */ true);
   }
 
   @Test
   public void testInfiniteSymlinkExpansion_relativeSymlinkToAncestor() throws Exception {
     runTestSimpleInfiniteSymlinkExpansion(
-        /* symlinkToAncestor= */ true, /*absoluteSymlink=*/ false);
+        /* symlinkToAncestor= */ true, /* absoluteSymlink= */ false);
   }
 
   @Test
@@ -1271,7 +1256,7 @@ public class FileFunctionTest {
     EvaluationContext evaluationContext =
         EvaluationContext.newBuilder()
             .setKeepGoing(true)
-            .setNumThreads(DEFAULT_THREAD_COUNT)
+            .setParallelism(DEFAULT_THREAD_COUNT)
             .setEventHandler(eventHandler)
             .build();
     EvaluationResult<FileValue> result =
@@ -1302,7 +1287,7 @@ public class FileFunctionTest {
     EvaluationContext evaluationContext =
         EvaluationContext.newBuilder()
             .setKeepGoing(true)
-            .setNumThreads(DEFAULT_THREAD_COUNT)
+            .setParallelism(DEFAULT_THREAD_COUNT)
             .setEventHandler(eventHandler)
             .build();
     EvaluationResult<FileValue> result =
@@ -1330,24 +1315,23 @@ public class FileFunctionTest {
     EvaluationContext evaluationContext =
         EvaluationContext.newBuilder()
             .setKeepGoing(true)
-            .setNumThreads(1)
+            .setParallelism(1)
             .setEventHandler(NullEventHandler.INSTANCE)
             .build();
     EvaluationResult<FileValue> result =
         evaluator.evaluate(ImmutableList.of(fooKey), evaluationContext);
-    ErrorInfoSubject errorInfoSubject = assertThatEvaluationResult(result)
-        .hasErrorEntryForKeyThat(fooKey);
+    ErrorInfoSubject errorInfoSubject =
+        assertThatEvaluationResult(result).hasErrorEntryForKeyThat(fooKey);
     errorInfoSubject.isTransient();
-    errorInfoSubject
-        .hasExceptionThat()
-        .hasMessageThat()
-        .isEqualTo("bork");
+    errorInfoSubject.hasExceptionThat().hasMessageThat().isEqualTo("bork");
     fs.stubbedStatErrors.remove(foo.asFragment());
     differencer.inject(
         fileStateSkyKey("foo"),
-        FileStateValue.create(
-            RootedPath.toRootedPath(pkgRoot, foo),
-            new TimestampGranularityMonitor(BlazeClock.instance())));
+        Delta.justNew(
+            FileStateValue.create(
+                RootedPath.toRootedPath(pkgRoot, foo),
+                SyscallCache.NO_CACHE,
+                new TimestampGranularityMonitor(BlazeClock.instance()))));
     result = evaluator.evaluate(ImmutableList.of(fooKey), evaluationContext);
     assertThatEvaluationResult(result).hasNoError();
     assertThat(result.get(fooKey).exists()).isTrue();
@@ -1396,7 +1380,7 @@ public class FileFunctionTest {
       fail(String.format("Evaluation error for %s: %s", key, result.getError()));
     }
     FileValue fileValue = (FileValue) result.get(key);
-    assertThat(fileValue.realRootedPath().asPath().toString())
+    assertThat(fileValue.realRootedPath((RootedPath) key.argument()).asPath().toString())
         .isEqualTo(pkgRoot.getRelative(expectedRealPathString).toString());
   }
 
@@ -1405,10 +1389,11 @@ public class FileFunctionTest {
     symlink("a", "b");
     symlink("b", "c");
     directory("c");
-    FileValue fileValue = valueForPath(path("a"));
+    RootedPath rootedPath = rootedPath("a");
+    FileValue fileValue = valueForRootedPath(rootedPath);
     assertThat(fileValue).isInstanceOf(SymlinkFileValueWithStoredChain.class);
     assertThat(fileValue.getUnresolvedLinkTarget()).isEqualTo(PathFragment.create("b"));
-    assertThat(fileValue.logicalChainDuringResolution())
+    assertThat(fileValue.logicalChainDuringResolution(rootedPath))
         .containsExactly(rootedPath("a"), rootedPath("b"), rootedPath("c"))
         .inOrder();
   }
@@ -1418,10 +1403,11 @@ public class FileFunctionTest {
     symlink("a", "b");
     symlink("b", "c");
     directory("c/d");
-    FileValue fileValue = valueForPath(path("a/d"));
+    RootedPath rootedPath = rootedPath("a/d");
+    FileValue fileValue = valueForRootedPath(rootedPath);
     assertThat(fileValue).isInstanceOf(DifferentRealPathFileValueWithStoredChain.class);
-    assertThat(fileValue.realRootedPath()).isEqualTo(rootedPath("c/d"));
-    assertThat(fileValue.logicalChainDuringResolution())
+    assertThat(fileValue.realRootedPath(rootedPath)).isEqualTo(rootedPath("c/d"));
+    assertThat(fileValue.logicalChainDuringResolution(rootedPath))
         .containsExactly(rootedPath("a/d"), rootedPath("b/d"), rootedPath("c/d"))
         .inOrder();
   }
@@ -1431,10 +1417,12 @@ public class FileFunctionTest {
     symlink("a", "b");
     symlink("b", "c");
     file("c");
-    FileValue fileValue = valueForPath(path("a"));
+    RootedPath rootedPath = rootedPath("a");
+    FileValue fileValue = valueForRootedPath(rootedPath);
     assertThat(fileValue).isInstanceOf(SymlinkFileValueWithoutStoredChain.class);
     assertThat(fileValue.getUnresolvedLinkTarget()).isEqualTo(PathFragment.create("b"));
-    assertThrows(IllegalStateException.class, fileValue::logicalChainDuringResolution);
+    assertThrows(
+        IllegalStateException.class, () -> fileValue.logicalChainDuringResolution(rootedPath));
   }
 
   @Test
@@ -1442,10 +1430,12 @@ public class FileFunctionTest {
     symlink("a", "b");
     symlink("b", "c");
     file("c/d");
-    FileValue fileValue = valueForPath(path("a/d"));
+    RootedPath rootedPath = rootedPath("a/d");
+    FileValue fileValue = valueForRootedPath(rootedPath);
     assertThat(fileValue).isInstanceOf(DifferentRealPathFileValueWithoutStoredChain.class);
-    assertThat(fileValue.realRootedPath()).isEqualTo(rootedPath("c/d"));
-    assertThrows(IllegalStateException.class, fileValue::logicalChainDuringResolution);
+    assertThat(fileValue.realRootedPath(rootedPath)).isEqualTo(rootedPath("c/d"));
+    assertThrows(
+        IllegalStateException.class, () -> fileValue.logicalChainDuringResolution(rootedPath));
   }
 
   @Test
@@ -1458,10 +1448,11 @@ public class FileFunctionTest {
     directory("g");
     symlink("g/f", "../h");
     directory("h");
-    FileValue fileValue = valueForPath(path("a/d"));
+    RootedPath rootedPath = rootedPath("a/d");
+    FileValue fileValue = valueForRootedPath(rootedPath);
     assertThat(fileValue).isInstanceOf(DifferentRealPathFileValueWithStoredChain.class);
-    assertThat(fileValue.realRootedPath()).isEqualTo(rootedPath("h"));
-    assertThat(fileValue.logicalChainDuringResolution())
+    assertThat(fileValue.realRootedPath(rootedPath)).isEqualTo(rootedPath("h"));
+    assertThat(fileValue.logicalChainDuringResolution(rootedPath))
         .containsExactly(
             rootedPath("a/d"),
             rootedPath("b/d"),
@@ -1550,8 +1541,8 @@ public class FileFunctionTest {
   }
 
   /** Returns the files that would be changed/created if {@code path} were to be changed/created. */
-  private static ImmutableList<String> filesTouchedIfTouched(Path path) {
-    List<String> filesToBeTouched = Lists.newArrayList();
+  private static ImmutableList<String> filesTouchedIfTouched(Path path) throws IOException {
+    List<String> filesToBeTouched = new ArrayList<>();
     do {
       filesToBeTouched.add(path.getPathString());
       path = path.getParentDirectory();
@@ -1563,18 +1554,18 @@ public class FileFunctionTest {
    * Changes the contents of the FileValue for the given file in some way e.g.
    *
    * <ul>
-   * <li> If it's a regular file, the contents will be changed.
-   * <li> If it's a non-existent file, it will be created.
-   *     <ul>
-   *     and then returns the file(s) changed paired with a callback to undo the change. Not meant
-   *     to be called directly by tests.
+   *   <li>If it's a regular file, the contents will be changed.
+   *   <li>If it's a non-existent file, it will be created.
+   *       <ul>
+   *         and then returns the file(s) changed paired with a callback to undo the change. Not
+   *         meant to be called directly by tests.
    */
   private Pair<ImmutableList<String>, Runnable> changeFile(String fileStringToChange)
       throws Exception {
     Path fileToChange = path(fileStringToChange);
     if (fileToChange.exists()) {
       final byte[] oldContents = FileSystemUtils.readContent(fileToChange);
-      try (OutputStream outputStream = fileToChange.getOutputStream(/*append=*/ true)) {
+      try (OutputStream outputStream = fileToChange.getOutputStream(/* append= */ true)) {
         outputStream.write(new byte[] {(byte) 42}, 0, 1);
       }
       return Pair.of(
@@ -1591,11 +1582,11 @@ public class FileFunctionTest {
    * Changes the contents of the FileValue for the given directory in some way e.g.
    *
    * <ul>
-   * <li> If it exists, the directory will be deleted.
-   * <li> If it doesn't exist, the directory will be created.
-   *     <ul>
-   *     and then returns the file(s) changed paired with a callback to undo the change. Not meant
-   *     to be called directly by tests.
+   *   <li>If it exists, the directory will be deleted.
+   *   <li>If it doesn't exist, the directory will be created.
+   *       <ul>
+   *         and then returns the file(s) changed paired with a callback to undo the change. Not
+   *         meant to be called directly by tests.
    */
   private Pair<ImmutableList<String>, Runnable> changeDirectory(String directoryStringToChange)
       throws Exception {
@@ -1694,12 +1685,8 @@ public class FileFunctionTest {
 
     SkyValue newValue = result.get(key);
     assertWithMessage(
-            String.format(
-                "Changing the contents of %s %s should%s change the value for file %s.",
-                isFile ? "file" : "directory",
-                changedPathString,
-                changes ? "" : " not",
-                pathString))
+            "Changing the contents of %s %s should%s change the value for file %s.",
+            isFile ? "file" : "directory", changedPathString, changes ? "" : " not", pathString)
         .that(changes != newValue.equals(oldValue))
         .isTrue();
 
@@ -1718,7 +1705,7 @@ public class FileFunctionTest {
     EvaluationResult<FileValue> result;
     result = evaluator.evaluate(ImmutableList.of(key), EVALUATION_OPTIONS);
     assertWithMessage(
-            "Did not expect error while evaluating " + pathString + ", got " + result.get(key))
+            "Did not expect error while evaluating %s, got %s", pathString, result.get(key))
         .that(result.hasError())
         .isFalse();
   }
@@ -1732,7 +1719,7 @@ public class FileFunctionTest {
     SkyKey key = skyKey(pathString);
     EvaluationResult<FileValue> result;
     result = evaluator.evaluate(ImmutableList.of(key), EVALUATION_OPTIONS);
-    assertWithMessage("Expected error while evaluating " + pathString + ", got " + result.get(key))
+    assertWithMessage("Expected error while evaluating %s, got %s", pathString, result.get(key))
         .that(result.hasError())
         .isTrue();
     assertThat(
@@ -1772,13 +1759,12 @@ public class FileFunctionTest {
   }
 
   private RootedPath rootedPath(String pathString) {
-    Path path = path(pathString);
-    for (Root root : pkgLocator.getPathEntries()) {
-      if (root.contains(path)) {
-        return RootedPath.toRootedPath(root, path);
-      }
-    }
-    return RootedPath.toRootedPath(Root.absoluteRoot(fs), path);
+    ImmutableList<Root> roots =
+        ImmutableList.<Root>builder()
+            .addAll(pkgLocator.getPathEntries())
+            .add(outputBaseRoot)
+            .build();
+    return RootedPath.toRootedPathMaybeUnderRoot(path(pathString), roots);
   }
 
   private SkyKey skyKey(String pathString) {
@@ -1791,9 +1777,9 @@ public class FileFunctionTest {
 
   private class CustomInMemoryFs extends InMemoryFileSystem {
 
-    private final Map<PathFragment, FileStatus> stubbedStats = Maps.newHashMap();
-    private final Map<PathFragment, IOException> stubbedStatErrors = Maps.newHashMap();
-    private final Map<PathFragment, IOException> stubbedFastDigestErrors = Maps.newHashMap();
+    private final Map<PathFragment, FileStatus> stubbedStats = new HashMap<>();
+    private final Map<PathFragment, IOException> stubbedStatErrors = new HashMap<>();
+    private final Map<PathFragment, IOException> stubbedFastDigestErrors = new HashMap<>();
 
     CustomInMemoryFs(ManualClock manualClock) {
       super(manualClock, DigestHashFunction.SHA256);
@@ -1805,7 +1791,7 @@ public class FileFunctionTest {
 
     @Override
     @SuppressWarnings("UnsynchronizedOverridesSynchronized")
-    protected byte[] getFastDigest(PathFragment path) throws IOException {
+    public byte[] getFastDigest(PathFragment path) throws IOException {
       if (stubbedFastDigestErrors.containsKey(path)) {
         throw stubbedFastDigestErrors.get(path);
       }

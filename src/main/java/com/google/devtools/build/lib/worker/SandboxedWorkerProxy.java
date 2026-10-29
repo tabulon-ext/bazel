@@ -15,9 +15,11 @@
 package com.google.devtools.build.lib.worker;
 
 import com.google.common.base.Joiner;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.flogger.GoogleLogger;
+import com.google.devtools.build.lib.exec.TreeDeleter;
 import com.google.devtools.build.lib.sandbox.SandboxHelpers;
 import com.google.devtools.build.lib.sandbox.SandboxHelpers.SandboxInputs;
 import com.google.devtools.build.lib.sandbox.SandboxHelpers.SandboxOutputs;
@@ -37,17 +39,21 @@ import java.util.Set;
  */
 public class SandboxedWorkerProxy extends WorkerProxy {
   private static final GoogleLogger logger = GoogleLogger.forEnclosingClass();
+
   /** The sandbox directory for the current request, inside {@code workDir}. */
   private final Path sandboxDir;
 
   private final PathFragment sandboxName;
+
+  private final TreeDeleter treeDeleter;
 
   SandboxedWorkerProxy(
       WorkerKey workerKey,
       int workerId,
       Path logFile,
       WorkerMultiplexer workerMultiplexer,
-      Path workDir) {
+      Path workDir,
+      TreeDeleter treeDeleter) {
     super(workerKey, workerId, logFile, workerMultiplexer, workDir);
     sandboxName =
         PathFragment.create(
@@ -57,6 +63,7 @@ public class SandboxedWorkerProxy extends WorkerProxy {
                     Integer.toString(workerId),
                     workerKey.getExecRoot().getBaseName()));
     sandboxDir = this.workDir.getRelative(sandboxName);
+    this.treeDeleter = treeDeleter;
   }
 
   @Override
@@ -66,9 +73,13 @@ public class SandboxedWorkerProxy extends WorkerProxy {
 
   @Override
   public void prepareExecution(
-      SandboxInputs inputFiles, SandboxOutputs outputs, Set<PathFragment> workerFiles)
-      throws IOException {
-    workerMultiplexer.createSandboxedProcess(workDir, workerFiles, inputFiles);
+      SandboxInputs inputFiles,
+      SandboxOutputs outputs,
+      Set<PathFragment> workerFiles,
+      ImmutableMap<String, String> clientEnv)
+      throws IOException, InterruptedException {
+    workerMultiplexer.createSandboxedProcess(
+        workDir, workerFiles, inputFiles, treeDeleter, clientEnv);
 
     sandboxDir.createDirectoryAndParents();
     LinkedHashSet<PathFragment> dirsToCreate = new LinkedHashSet<>();
@@ -79,13 +90,17 @@ public class SandboxedWorkerProxy extends WorkerProxy {
         inputsToCreate,
         dirsToCreate,
         Iterables.concat(inputFiles.getFiles().keySet(), inputFiles.getSymlinks().keySet()),
-        outputs.files(),
-        outputs.dirs());
+        outputs);
     SandboxHelpers.cleanExisting(
-        sandboxDir.getParentDirectory(), inputFiles, inputsToCreate, dirsToCreate, sandboxDir);
+        sandboxDir.getParentDirectory(),
+        inputFiles,
+        inputsToCreate,
+        dirsToCreate,
+        sandboxDir,
+        treeDeleter);
     // Finally, create anything that is still missing. This is non-strict only for historical
     // reasons, we haven't seen what would break if we make it strict.
-    SandboxHelpers.createDirectories(dirsToCreate, sandboxDir, /* strict=*/ false);
+    SandboxHelpers.createDirectories(dirsToCreate, sandboxDir, /* strict= */ false);
     WorkerExecRoot.createInputs(inputsToCreate, inputFiles, sandboxDir);
   }
 
@@ -100,7 +115,9 @@ public class SandboxedWorkerProxy extends WorkerProxy {
   }
 
   @Override
-  public void finishExecution(Path execRoot, SandboxOutputs outputs) throws IOException {
+  public void finishExecution(Path execRoot, SandboxOutputs outputs)
+      throws IOException, InterruptedException {
+    super.finishExecution(execRoot, outputs);
     SandboxHelpers.moveOutputs(outputs, sandboxDir, execRoot);
   }
 
@@ -108,7 +125,7 @@ public class SandboxedWorkerProxy extends WorkerProxy {
   synchronized void destroy() {
     super.destroy();
     try {
-      workDir.deleteTree();
+      sandboxDir.deleteTree();
     } catch (IOException e) {
       logger.atWarning().withCause(e).log("Caught IOException while deleting workdir.");
     }

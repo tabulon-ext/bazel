@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Copyright 2018 The Bazel Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,10 +15,27 @@
 #
 # Tests of the bazel client.
 
+# Disable the package loader sanity check since many of these tests use fifos
+# for controlling access to BUILD files. (This only has an effect at Google.)
+export DONT_SANITY_CHECK_WITH_PACKAGE_LOADER=1
+
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${CURRENT_DIR}/../integration_test_setup.sh" \
   || { echo "integration_test_setup.sh not found!" >&2; exit 1; }
 
+function strip_lines_from_bazel_cc() {
+  # sed can't redirect back to its input file (it'll only generate an empty
+  # file). In newer versions of gnu sed there is a -i option to edit in place.
+
+  # Ignore common warnings caused by the environment on our CI workers.
+  clean_log=$(\
+    sed \
+    -e '/^WARNING: ignoring JAVA_TOOL_OPTIONS in environment.$/d' \
+    -e '/^\.\.\. still trying to connect to local B[azel]* server ([1-9][0-9]*) after [1-9][0-9]* seconds \.\.\.\.*$/d' \
+    $TEST_log)
+
+  echo "$clean_log" > $TEST_log
+}
 
 #### TESTS #############################################################
 
@@ -44,14 +61,14 @@ function test_client_debug() {
 
 function test_client_debug_change_does_not_restart_server() {
   local server_pid1=$(bazel --client_debug info server_pid 2>$TEST_log)
-  local server_pid2=$(bazel info server_pid 2>$TEST_log)
+  local server_pid2=$(bazel --noclient_debug info server_pid 2>$TEST_log)
   assert_equals "$server_pid1" "$server_pid2"
   expect_not_log "WARNING.* Running B\\(azel\\|laze\\) server needs to be killed"
 }
 
 function test_server_restart_due_to_startup_options() {
-  local server_pid1=$(bazel --write_command_log info server_pid 2>$TEST_log)
-  local server_pid2=$(bazel --nowrite_command_log info server_pid 2>$TEST_log)
+  local server_pid1=$(bazel --idle_server_tasks info server_pid 2>$TEST_log)
+  local server_pid2=$(bazel --noidle_server_tasks info server_pid 2>$TEST_log)
   assert_not_equals "$server_pid1" "$server_pid2" # pid changed.
   expect_log "WARNING.* Running B\\(azel\\|laze\\) server needs to be killed"
 }
@@ -140,27 +157,27 @@ function test_shutdown() {
   local server_pid2=$(bazel info server_pid 2>$TEST_log)
   assert_not_equals "$server_pid1" "$server_pid2"
   expect_not_log "WARNING.* Running B\\(azel\\|laze\\) server needs to be killed"
-  expect_log "Starting local B\\(azel\\|laze\\) server and connecting to it"
+  expect_log "Starting local B\\(azel\\|laze\\) server (.*) and connecting to it"
 }
 
 function test_shutdown_different_options() {
   bazel --host_jvm_args=-Di.am.a=teapot info >& $TEST_log || fail "Expected success"
   bazel shutdown >& $TEST_log || fail "Expected success"
   expect_log "WARNING.* Running B\\(azel\\|laze\\) server needs to be killed"
-  expect_not_log "Starting local B\\(azel\\|laze\\) server and connecting to it"
+  expect_not_log "Starting local B\\(azel\\|laze\\) server (.*) and connecting to it"
 }
 
 function test_server_restart_due_to_startup_options_with_client_debug_information() {
   # Using --write_command_log for no particular reason, if that flag is removed, another startup
   # option will do just fine.
-  local server_pid1=$(bazel --client_debug --write_command_log info server_pid 2>$TEST_log)
-  local server_pid2=$(bazel --client_debug --nowrite_command_log info server_pid 2>$TEST_log)
+  local server_pid1=$(bazel --client_debug --idle_server_tasks info server_pid 2>$TEST_log)
+  local server_pid2=$(bazel --client_debug --noidle_server_tasks info server_pid 2>$TEST_log)
   assert_not_equals "$server_pid1" "$server_pid2" # pid changed.
   expect_log "\\[WARNING .*\\] Running B\\(azel\\|laze\\) server needs to be killed"
   expect_log "\\[INFO .*\\] Args from the running server that are not included in the current request:"
-  expect_log "\\[INFO .*\\]   --write_command_log"
+  expect_log "\\[INFO .*\\]   --idle_server_tasks"
   expect_log "\\[INFO .*\\] Args from the current request that were not included when creating the server:"
-  expect_log "\\[INFO .*\\]   --nowrite_command_log"
+  expect_log "\\[INFO .*\\]   --noidle_server_tasks"
 }
 
 function test_exit_code() {
@@ -199,13 +216,518 @@ function test_install_base_races_dont_leave_temp_files() {
   for pid in "${client_pids[@]}"; do
     wait $pid
   done
-  # Expect "install" to be the only thing in the "race" directory.
-  assert_equals "install" "$(ls "$TEST_TMPDIR/race/")"
+  # Expect the "race" directory to contain only "install" and "install.lock".
+  for filename in $(ls "$TEST_TMPDIR/race/"); do
+    assert_one_of install install.lock "$filename"
+  done
+}
+
+# Regression test for b/1295038.
+function test_install_base_corrupted_by_deleted_file() {
+  local -r install_base="$TEST_TMPDIR/corrupted_install_base"
+
+  bazel --install_base="$install_base" shutdown || fail "Expected success"
+
+  rm "$install_base/process-wrapper"
+
+  bazel --install_base="$install_base" >& $TEST_log || fail "Expected success"
+  expect_log "Corrupt installation: file '.*process-wrapper' is missing or modified."
+  expect_log "Removing previous installation."
+  local capitalized_product_name="$(echo "$PRODUCT_NAME" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
+  expect_log "Extracting $capitalized_product_name installation..."
+  expect_log "Usage: $PRODUCT_NAME"  # phew
+}
+
+function test_install_base_corrupted_by_touched_file() {
+  local -r install_base="$TEST_TMPDIR/corrupted_install_base"
+
+  bazel --install_base="$install_base" shutdown || fail "Expected success"
+
+  touch "$install_base/process-wrapper"
+
+  bazel --install_base="$install_base" >&$TEST_log || fail "Expected success"
+  expect_log "Corrupt installation: file '.*process-wrapper' is missing or modified."
+  expect_log "Removing previous installation."
+  local capitalized_product_name="$(echo "$PRODUCT_NAME" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
+  expect_log "Extracting $capitalized_product_name installation..."
+  expect_log "Usage: $PRODUCT_NAME"  # phew
+}
+
+# Regression test for b/380443969.
+function test_readonly_install_base() {
+  local -r install_base_parent="$TEST_TMPDIR/install_base_parent"
+  local -r install_base="$install_base_parent/install_base"
+
+  mkdir -p "$install_base_parent" || fail "mkdir failed"
+
+  # First install ourselves.
+  bazel --install_base="$install_base" shutdown || fail "Expected success"
+
+  # Make the install base deeply read-only, including its parent directory.
+  chmod -R a-w "$install_base_parent" || fail "chmod failed"
+
+  # Check that we're still able to run.
+  bazel --install_base="$install_base" shutdown || fail "Expected success"
+}
+
+function test_output_user_root() {
+  # Test absolute path
+  bazel --output_user_root=$TEST_TMPDIR/user info output_base >& $TEST_log \
+      || fail "Expected success"
+  expect_log "$TEST_TMPDIR/user/[0-9a-f]\{32\}"
+
+  # Test relative path
+  bazel --output_user_root=../user info output_base >& $TEST_log \
+      || fail "Expected success"
+  expect_log "$(cd .. && pwd)/user/[0-9a-f]\{32\}"
+}
+
+function test_multiple_commands_same_output_base() {
+  # This test verifies that competing Bazel commands for the same output base
+  # will run sequentially. It also verifies that the messages printed by Bazel
+  # to tell the user that other processes are waited for are correct.
+  #
+  # This is a complex test because it deals with non-determinism: once we have
+  # started Bazel commands in parallel, we can't tell how they will
+  # finish... nor how they'll even start.  To address this, we force each
+  # invocation to get "stuck" within a genrule and unblock it in a controlled
+  # manner.  This lets us capture the order in which the commands complete so
+  # that we can later make assertions on them.
+
+  mkdir pkg
+
+  local -r invocations=3  # Number of concurrent invocations.
+
+  declare -a ready  # Files created by the wait[i] genrules when entered.
+  declare -a lock  # Files on which the wait[i] genrules wait for.
+  for i in $(seq ${invocations}); do
+    ready[$i]="${TEST_TMPDIR}/ready.$i"
+    lock[$i]="${TEST_TMPDIR}/fifo.$i"; mkfifo "${lock[$i]}"
+
+    # Make sure the actions run locally, even if Bazel is configured to run them
+    # remotely (which is the case when this test is run at Google), because we
+    # must be able to synchronize with them through the fifos.
+    cat >>pkg/BUILD <<EOF
+genrule(name='wait$i', local = True, outs=['out.$i'],
+        cmd='touch ${ready[$i]}; sleep 5; cat ${lock[$i]} >\$@')
+EOF
+  done
+
+  declare -a log  # Paths to the outputs of the Bazel invocations.
+  declare -a pid  # PIDs of the Bazel invocations.
+  for i in $(seq ${invocations}); do
+    log[$i]="${TEST_TMPDIR}/log.$i"
+    bazel build "//pkg:wait$i" >>"${log[$i]}" 2>&1 &
+    pid[$i]="${!}"
+  done
+
+  # The various Bazel invocations are now competing to run.  Wait for them
+  # to start, in any order, and then allow them to proceed, recording the order
+  # in which they actually started running the command.
+  declare -a order
+  local position=1
+  while [ ${position} -le ${invocations} ]; do
+    for i in $(seq ${invocations}); do
+      if [ -e "${ready[$i]}" ]; then
+        order[$i]=${position}; position=$((position + 1))
+        echo unlock >"${lock[$i]}"
+        rm "${ready[$i]}"
+      fi
+    done
+    sleep 1
+  done
+  wait  # We unblocked all genrules so wait for actual terminations.
+
+  # Dump outputs to the test log for debugging in case of test failure.
+  for i in $(seq ${invocations}); do
+    sed "s,^,bazel $i: ," "${log[$i]}" >>"${TEST_log}"
+  done
+
+  # Reorder invocations in the order they ran their commands so we can make
+  # assertions more easily.
+  declare -a orderedlog orderedpid
+  for i in $(seq ${invocations}); do
+    echo "bazel ${i} finished in position ${order[$i]} with PID ${pid[$i]}" \
+        >>"${TEST_log}"
+    orderedlog[${order[$i]}]="${log[$i]}"
+    orderedpid[${order[$i]}]="${pid[$i]}"
+  done
+
+  # Helper function to check if the ith Bazel log contains the a regexp.
+  expect_ith_log() {
+    local i="${1}"; shift
+    local re="${1}"; shift
+    if ! grep -qE "${re}" "${orderedlog[$i]}"; then
+      fail "$*: cannot find '${re}' in ${orderedlog[$i]}"
+    fi
+  }
+
+  # Helper function to check if the ith Bazel log does not contain a regexp.
+  not_expect_ith_log() {
+    local i="${1}"; shift
+    local re="${1}"; shift
+    if grep -qE "${re}" "${orderedlog[$i]}"; then
+      fail "$*: found '${re}' in ${orderedlog[$i]}"
+    fi
+  }
+
+  # Expectations for the first invocation to run are easy: we know that it
+  # didn't have to wait for anything.
+  not_expect_ith_log 1 "Another command.*is running" \
+    "first invocation waited but should not have"
+
+  # Expectations for all other invocations are... tricky.  We can't tell how
+  # ran, because of how locking works: sometimes we wait on the client and
+  # sometimes we wait on the server.  Furthermore, the loop that used to check
+  # if the PIDs have changed are time-based, so whether we detect a PID change
+  # or not in the logs is also subject to timing.  Better to not even try.
+  for i in $(seq 2 ${invocations}); do
+    expect_ith_log $i \
+        "\\(pid=${orderedpid[1]}\\).*on the (client|server)..." \
+        "invocation $i did not wait for first one with pid ${orderedpid[1]}"
+
+    # Make sure the trailing messages added to the wait lines are never seen on
+    # their own.
+    not_expect_ith_log $i "^ *lock taken by another server" \
+        "lock taken message did not follow waiting message"
+  done
+}
+
+function test_multiple_commands_different_output_base() {
+  # This test verifies that competing Bazel commands for different output bases
+  # will run in parallel.
+  #
+  # It works by having two concurrent commands, each running a non-hermetic test
+  # that synchronizes with the other through a FIFO. If the tests time out, it
+  # likely means one command was stuck waiting for the other.
+
+  # The output bases for the two commands.
+  local -r output_base_1="$TEST_TMPDIR/output_base_1"
+  local -r output_base_2="$TEST_TMPDIR/output_base_2"
+
+  # The FIFO used by the test to communicate.
+  local -r fifo="$TEST_TMPDIR/fifo"
+  mkfifo "$fifo" || fail "couldn't create fifo"
+
+  # The test target.
+  # Make sure it runs locally even if Bazel is configured to run actions
+  # remotely (which is the case when this test is run at Google), because it
+  # must be able to synchronize through the FIFO.
+  add_rules_shell "MODULE.bazel"
+  mkdir -p x
+  cat > x/BUILD <<'EOF'
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+sh_test(name = "x", srcs = ["x.sh"], local = True)
+EOF
+
+  # The test script, whose arguments are:
+  # - one of "read" or "write"
+  # - the path to the fifo
+  cat > x/x.sh <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "read" ]]; then
+  cat "$2" > /dev/null
+elif [[ "$1" == "write" ]]; then
+  echo 1 > "$2"
+else
+  echo "invalid argument: $1"
+  exit 1
+fi
+EOF
+  chmod +x x/x.sh
+
+  # Launch two commands concurrently.
+
+  bazel --output_base="$output_base_1" test //x:x \
+      --test_arg=read --test_arg="$fifo" --test_timeout=10 \
+      &> "$TEST_log-1" &
+  local -r pid_1="$!"
+
+  bazel --output_base="$output_base_2" test //x:x \
+      --test_arg=write --test_arg="$fifo" --test_timeout=10 \
+      &> "$TEST_log-2" &
+  local -r pid_2="$!"
+
+  # Wait for both commands to complete.
+
+  if ! wait "$pid_1"; then
+    cat "$TEST_log-1" >> "$TEST_log"
+    fail "first command failed"
+  fi
+
+  if ! wait "$pid_2"; then
+    cat "$TEST_log-2" >> "$TEST_log"
+    fail "second command failed"
+  fi
+}
+
+# Kills the client of a build blocked in an action, then reports how many seconds the
+# server took to release the command lock, or nothing at all if it never did.
+function kill_client_of_blocked_build() {
+  local -r extra_flag="$1"
+  # Before anything takes the lock: asking later would queue behind the very command
+  # this function is about to abandon.
+  local -r server_pid_file="$(bazel info output_base)/server/server.pid.txt"
+  local -r ready="${TEST_TMPDIR}/ready"  # entered by the genrule
+  local -r lock="${TEST_TMPDIR}/lock"  # waited on by the genrule
+  mkfifo "${ready}" || fail "couldn't create fifo ready"
+  mkfifo "${lock}" || fail "couldn't create fifo lock"
+  mkdir -p a
+  cat > a/BUILD <<EOF
+genrule(name = "a", outs = ["a.out"], local = True,
+        cmd = "cat ${ready} >/dev/null; cat ${lock} >/dev/null; touch \$@")
+EOF
+
+  # Local strategy, so that the action reaches both fifos.
+  bazel --client_debug build --spawn_strategy=local ${extra_flag} //a:a >"$TEST_log" 2>&1 &
+  local -r client_job_pid="$!"
+
+  # This write returns once the action reads it, which then blocks on the lock fifo.
+  echo entered > "${ready}"
+  local -r client_pid="$(cat "$TEST_log" | scrape_client_pid)"
+
+  # SIGKILL rather than SIGTERM, which would let the client send a Cancel RPC: the server
+  # has always acted upon those, so these tests would then pass either way.
+  kill -9 "${client_pid}" || fail "couldn't kill client ${client_pid}"
+  # Reap the backgrounded job so its "Killed" notice does not surface later.
+  wait "${client_job_pid}" || true
+
+  local exit_code=0
+  local i
+  for i in $(seq 1 30); do
+    exit_code=0
+    bazel --client_debug --noblock_for_lock info >"$TEST_log-2" 2>&1 || exit_code=$?
+    if [[ "${exit_code}" -eq 0 ]]; then
+      break
+    fi
+    sleep 1
+  done
+
+  # Free the slot *before* the caller checks expectations, otherwise the rest of the suite
+  # waits for this very command. Writing to the lock fifo would hang once the action is gone,
+  # leaving the server as the only way to release the lock, as on a CI runner holding a stale one.
+  if [[ -f "${server_pid_file}" ]]; then
+    local -r server_pid="$(cat "${server_pid_file}")"
+    kill -0 "${server_pid}" 2>/dev/null && kill "${server_pid}"
+  fi
+  rm -rf a "${ready}" "${lock}"
+
+  cat "$TEST_log-2" >> "$TEST_log"
+  return "${exit_code}"
+}
+
+function test_command_lock_released_when_client_dies() {
+  # A command whose client is killed must not keep the server's command lock: the next
+  # invocation would then wait for a command nobody waits for, until its own timeout.
+  # Progress reporting gives the server a write, hence a chance to notice the client is
+  # gone, but that interrupt has to reach the command rather than the reporting thread.
+  # See https://github.com/bazelbuild/bazel/issues/30954.
+  local exit_code=0
+  kill_client_of_blocked_build "" || exit_code=$?
+  assert_equals 0 "${exit_code}" # 9 would be LOCK_HELD_NOBLOCK_FOR_LOCK
+}
+
+function test_command_lock_released_when_client_dies_without_further_output() {
+  # Same, for a command that reports nothing at all: with no write left to carry it, the
+  # interrupt has to come from the cancellation itself.
+  # See https://github.com/bazelbuild/bazel/issues/30954.
+  local exit_code=0
+  kill_client_of_blocked_build "--noshow_progress" || exit_code=$?
+  assert_equals 0 "${exit_code}" # 9 would be LOCK_HELD_NOBLOCK_FOR_LOCK
+}
+
+function test_noblock_for_lock_reuse_server() {
+  # Use a FIFO to spoonfeed the Bazel server.
+  mkdir -p a && mkfifo a/BUILD || fail "couldn't create fifo a"
+  mkdir -p b && mkfifo b/BUILD || fail "couldn't create fifo b"
+  bazel --client_debug build --nobuild //a:a &> "$TEST_log" &
+  local -r subshell_pid="$!"
+
+  # Wait until Bazel reads a/BUILD. After that, it will block on b/BUILD.
+  echo "filegroup(name='a', srcs=['//b:b'])" > a/BUILD
+
+  # Get the client pid from the log. This isn't necessarily the subshell pid
+  # because there might be wrapper scripts in between.
+  local -r client_pid="$(cat "$TEST_log" | scrape_client_pid)"
+
+  # Run another command in the same workspace but different startup options,
+  # which requires a server restart. Since the server is currently running the
+  # first command, it cannot restart immediately.
+  local exit_code=0
+  bazel --client_debug --noblock_for_lock info &> "$TEST_log-2" || exit_code=$?
+
+  # Unstick the first server *before* checking expectations, otherwise the test
+  # suite will hang.
+  echo "filegroup(name='b', visibility=['//visibility:public'])" > b/BUILD
+  wait "$subshell_pid" || fail "Couldn't wait"
+  rm -rf a b
+
+  assert_equals 9 "$exit_code" # LOCK_HELD_NOBLOCK_FOR_LOCK
+
+  cat "$TEST_log-2" >> "$TEST_log"
+  expect_log \
+      "Another command (pid=$client_pid) is running. Exiting immediately."
+}
+
+function test_noblock_for_lock_new_server() {
+  # Use a FIFO to spoonfeed the Bazel server.
+  mkdir -p a && mkfifo a/BUILD || fail "couldn't create fifo a"
+  mkdir -p b && mkfifo b/BUILD || fail "couldn't create fifo b"
+  bazel --client_debug build --nobuild //a:a &> "$TEST_log" &
+  local -r subshell_pid="$!"
+
+  # Wait until Bazel reads a/BUILD. After that, it will block on b/BUILD.
+  echo "filegroup(name='a', srcs=['//b:b'])" > a/BUILD
+
+  # Run another command in the same workspace with the same startup options, so
+  # that the server can be reused. Since the server is currently running the
+  # first command, the second command cannot be immediately run.
+  local exit_code=0
+  bazel --client_debug --noblock_for_lock --host_jvm_args=-Dchampagne.supernova=1 info \
+      &> "$TEST_log-2" || exit_code=$?
+
+  # Unstick the first server *before* checking expectations, otherwise the test
+  # suite will hang.
+  echo "filegroup(name='b', visibility=['//visibility:public'])" > b/BUILD
+  wait "$subshell_pid" || fail "Couldn't wait"
+  rm -rf a b
+
+  assert_equals 9 "$exit_code" # LOCK_HELD_NOBLOCK_FOR_LOCK
+
+  cat "$TEST_log-2" >> "$TEST_log"
+  # Note: In this case, the user does not get a "pid=#" description of the
+  # client blocking the call. See the todo in KillRunningServer for a
+  # potential fix.
+  expect_log \
+      "Exiting because the lock is held and --noblock_for_lock was given"
+}
+
+function test_noblock_for_lock_with_batch() {
+  # Use a FIFO to spoonfeed the Bazel server.
+  mkdir -p a && mkfifo a/BUILD || fail "couldn't create fifo a"
+  mkdir -p b && mkfifo b/BUILD || fail "couldn't create fifo b"
+  bazel --client_debug --batch build --nobuild //a:a &>"$TEST_log" &
+  local -r subshell_pid="$!"
+
+  # Wait until Bazel reads a/BUILD. After that, it will block on b/BUILD.
+  echo "filegroup(name='a', srcs=['//b:b'])" > a/BUILD
+
+  # Get the client pid from the log. This isn't necessarily the subshell pid
+  # because there might be wrapper scripts in between.
+  local -r client_pid="$(cat "$TEST_log" | scrape_client_pid)"
+
+  local exit_code=0
+  bazel --client_debug --batch --noblock_for_lock info &>"$TEST_log-2" || exit_code=$?
+
+  # Unstick the first server *before* checking expectations, otherwise the test
+  # suite will hang.
+  echo "filegroup(name='b', visibility=['//visibility:public'])" > b/BUILD
+  wait "$subshell_pid" || fail "Couldn't wait"
+  rm -rf a b
+
+  assert_equals 9 "$exit_code" # LOCK_HELD_NOBLOCK_FOR_LOCK
+
+  cat "$TEST_log-2" >> "$TEST_log"
+  expect_log "Another command holds the output base lock"
+  expect_log "pid=$client_pid"
+  expect_log \
+      "Exiting because the output base lock is held and --noblock_for_lock was given"
+}
+
+function test_block_for_lock_timeout_reuse_server() {
+  # Use a FIFO to spoonfeed the Bazel server.
+  mkdir -p a && mkfifo a/BUILD || fail "couldn't create fifo a"
+  mkdir -p b && mkfifo b/BUILD || fail "couldn't create fifo b"
+  bazel --client_debug build --nobuild //a:a &> "$TEST_log" &
+  local -r subshell_pid="$!"
+
+  # Wait until Bazel reads a/BUILD. After that, it will block on b/BUILD.
+  echo "filegroup(name='a', srcs=['//b:b'])" > a/BUILD
+
+  # Get the client pid from the log.
+  local -r client_pid="$(cat "$TEST_log" | scrape_client_pid)"
+
+  # Run another command in the same workspace with a 1-second lock timeout.
+  local exit_code=0
+  bazel --client_debug --block_for_lock=1s info &> "$TEST_log-2" || exit_code=$?
+
+  # Unstick the first server *before* checking expectations.
+  echo "filegroup(name='b', visibility=['//visibility:public'])" > b/BUILD
+  wait "$subshell_pid" || fail "Couldn't wait"
+  rm -rf a b
+
+  assert_equals 9 "$exit_code" # LOCK_HELD_NOBLOCK_FOR_LOCK
+
+  cat "$TEST_log-2" >> "$TEST_log"
+  expect_log \
+      "Another command (pid=$client_pid) is running. Exiting because --block_for_lock=1000ms timeout expired."
+}
+
+function test_block_for_lock_released_before_timeout() {
+  # Use a FIFO to spoonfeed the Bazel server.
+  mkdir -p a && mkfifo a/BUILD || fail "couldn't create fifo a"
+  mkdir -p b && mkfifo b/BUILD || fail "couldn't create fifo b"
+  bazel --client_debug build --nobuild //a:a &> "$TEST_log" &
+  local -r subshell_pid="$!"
+
+  # Wait until Bazel reads a/BUILD. After that, it will block on b/BUILD.
+  echo "filegroup(name='a', srcs=['//b:b'])" > a/BUILD
+
+  # Run another command in the background with a 10-second timeout.
+  bazel --client_debug --block_for_lock=10s info &> "$TEST_log-2" &
+  local -r second_pid="$!"
+
+  # Sleep briefly to ensure the second command is waiting on the lock.
+  sleep 1
+
+  # Unstick the first server so the second command can acquire the lock.
+  echo "filegroup(name='b', visibility=['//visibility:public'])" > b/BUILD
+  wait "$subshell_pid" || fail "First command failed"
+
+  local exit_code=0
+  wait "$second_pid" || exit_code=$?
+  rm -rf a b
+
+  assert_equals 0 "$exit_code"
+}
+
+function test_block_for_lock_timeout_with_batch() {
+  # Use a FIFO to spoonfeed the Bazel server.
+  mkdir -p a && mkfifo a/BUILD || fail "couldn't create fifo a"
+  mkdir -p b && mkfifo b/BUILD || fail "couldn't create fifo b"
+  bazel --client_debug --batch build --nobuild //a:a &>"$TEST_log" &
+  local -r subshell_pid="$!"
+
+  # Wait until Bazel reads a/BUILD. After that, it will block on b/BUILD.
+  echo "filegroup(name='a', srcs=['//b:b'])" > a/BUILD
+
+  local -r client_pid="$(cat "$TEST_log" | scrape_client_pid)"
+
+  local exit_code=0
+  bazel --client_debug --batch --block_for_lock=1s info &>"$TEST_log-2" || exit_code=$?
+
+  # Unstick the first server *before* checking expectations.
+  echo "filegroup(name='b', visibility=['//visibility:public'])" > b/BUILD
+  wait "$subshell_pid" || fail "Couldn't wait"
+  rm -rf a b
+
+  assert_equals 9 "$exit_code" # LOCK_HELD_NOBLOCK_FOR_LOCK
+
+  cat "$TEST_log-2" >> "$TEST_log"
+  expect_log "Another command holds the output base lock"
+  expect_log "pid=$client_pid"
+  expect_log \
+      "Exiting because the output base lock is held and --block_for_lock=1000ms timeout expired."
 }
 
 function test_no_arguments() {
   bazel >&$TEST_log || fail "Expected zero exit"
   expect_log "Usage: b\\(laze\\|azel\\)"
+}
+
+function test_empty_command() {
+  bazel '' >&$TEST_log && fail "Expected non-zero exit"
+  expect_log "Command cannot be the empty string."
 }
 
 function test_local_startup_timeout() {
@@ -232,7 +754,7 @@ function test_local_startup_timeout() {
     sleep 1
   done
 
-  expect_log "Starting local.*server and connecting to it"
+  expect_log "Starting local.*server (.*) and connecting to it"
   expect_log "FATAL: couldn't connect to server"
 }
 
@@ -255,9 +777,15 @@ function test_max_idle_secs() {
   done
 
   bazel "${options[@]}" info >"$TEST_log" 2>&1 || fail "bazel info failed"
-  expect_log "Starting local.*server and connecting to it"
+  expect_log "Starting local.*server (.*) and connecting to it"
   # Ensure the restart was not triggered by different startup options.
   expect_not_log "WARNING: Running B\\(azel\\|laze\\) server needs to be killed"
+
+  # Shut down the server started with --max_idle_secs=1 so that subsequent tests
+  # do not reuse it (--max_idle_secs is a volatile startup option that does not
+  # trigger a server restart) and experience an idle shutdown right as they
+  # connect.
+  bazel shutdown
 }
 
 function test_dashdash_before_command() {
@@ -332,21 +860,17 @@ function test_bad_command_nobatch() {
 
 function get_pid_environment() {
   local pid="$1"
-  case "$(uname -s)" in
-    Linux)
-      cat "/proc/${pid}/environ" | tr '\0' '\n'
-      ;;
-    Darwin)
-      if ! ps > /dev/null; then
-        echo "Cannot use ps command, probably due to sandboxing." >&2
-        return 1
-      fi
-      ps eww -o command "${pid}" | tr ' ' '\n'
-      ;;
-    *)
-      false
-      ;;
-  esac
+  if is_linux; then
+    cat "/proc/${pid}/environ" | tr '\0' '\n'
+  elif is_darwin; then
+    if ! ps > /dev/null; then
+      echo "Cannot use ps command, probably due to sandboxing." >&2
+      return 1
+    fi
+    ps eww -o command "${pid}" | tr ' ' '\n'
+  else
+    return 1
+  fi
 }
 
 function test_proxy_settings() {
@@ -377,12 +901,12 @@ function test_proxy_settings() {
         "${TEST_TMPDIR}/server_env"
     done
   else
-    echo "Cannot not test server process environment on this platform"
+    echo "cannot test server process environment on this platform"
   fi
 }
 
 function test_macos_qos_class() {
-  for class in utility background; do
+  for class in default utility background; do
     bazel --macos_qos_class="${class}" info >"${TEST_log}" 2>&1 \
       || fail "Unknown QoS class ${class}"
     # On macOS it'd be nice to verify that the server is indeed running at the
@@ -392,13 +916,225 @@ function test_macos_qos_class() {
     # real thing would be quite expensive.
   done
 
-  for class in user-interactive user-initiated default ; do
+  for class in user-interactive user-initiated ; do
     bazel --macos_qos_class="${class}" >"${TEST_log}" 2>&1 \
       && fail "Expected failure with invalid QoS class name"
     expect_log "Invalid argument.*qos_class.*${class}"
   done
+}
 
+function test_ignores_jdk_option_environment_variables() {
+  bazel shutdown  # Environment variables are only checked on server startup
+  _JAVA_OPTIONS=--wat1 JDK_JAVA_OPTIONS=--wat2 JAVA_TOOL_OPTIONS=--wat3 \
+    bazel version >&$TEST_log || fail "_JAVA_OPTIONS not ignored"
 
+  expect_log ".*ignoring _JAVA_OPTIONS"
+  expect_log ".*ignoring JDK_JAVA_OPTIONS"
+  expect_log ".*ignoring JAVA_TOOL_OPTIONS"
+}
+
+# Demonstrates that the client program prints exactly what we expect to stderr
+# and stdout. Notably by default (--client_debug=false) there should be no debug
+# log statements from our own codebase (or even from libraries we use!) printed
+# to stderr.
+function test_client_is_quiet_by_default() {
+  local capitalized_product_name="$(echo "$PRODUCT_NAME" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
+  # Ensure we don't have a server running. Also ensure we've already extracted
+  # the installation (that way we don't expect an informational message about
+  # that).
+  bazel shutdown &> /dev/null
+
+  bazel info server_pid > stdout 2> stderr || fail "bazel info failed"
+  cp stderr $TEST_log || fail "cp failed"
+
+  strip_lines_from_bazel_cc
+
+  lines=$(cat $TEST_log | wc -l)
+  [[ $lines -ge 2 && $lines -le 3 ]] || fail "Log has incorrect number of lines"
+  expect_log "^\$TEST_TMPDIR defined, some defaults will be overridden"
+  expect_log "^Starting local $capitalized_product_name server (.*) and connecting to it...$"
+  cp stdout $TEST_log || fail "cp failed"
+
+  strip_lines_from_bazel_cc
+
+  assert_equals 1 $(cat $TEST_log | wc -l)
+  expect_log "^[0-9]\+$"
+
+  rm stderr stdout || fail "rm failed"
+  bazel info server_pid > stdout 2> stderr || fail "bazel info failed"
+  cp stderr $TEST_log || fail "cp failed"
+
+  strip_lines_from_bazel_cc
+
+  lines=$(cat $TEST_log | wc -l)
+  [[ $lines -ge 1 && $lines -le 2 ]] || fail "Log has incorrect number of lines"
+  expect_log "^\$TEST_TMPDIR defined, some defaults will be overridden"
+  cp stdout $TEST_log || fail "cp failed"
+
+  strip_lines_from_bazel_cc
+
+  assert_equals 1 $(cat $TEST_log | wc -l)
+  expect_log "^[0-9]\+$"
+}
+
+function test_sigquit() {
+  # Use a FIFO to spoonfeed the Bazel server.
+  mkdir -p a && mkfifo a/BUILD || fail "couldn't create fifo a"
+  mkdir -p b && mkfifo b/BUILD || fail "couldn't create fifo b"
+  bazel --client_debug build --nobuild //a:a &> "$TEST_log" &
+  local -r subshell_pid="$!"
+
+  # Wait until Bazel reads a/BUILD. After that, it will block on b/BUILD.
+  echo "filegroup(name='a', srcs=['//b:b'])" > a/BUILD
+
+  # Get the client pid from the log. This isn't necessarily the subshell pid
+  # because there might be wrapper scripts in between.
+  local -r client_pid="$(cat "$TEST_log" | scrape_client_pid)"
+
+  # Send a SIGQUIT to the client.
+  kill -SIGQUIT "$client_pid"
+
+  # Unstick the server *before* checking expectations, otherwise the test suite
+  # will hang.
+  echo "filegroup(name='b', visibility=['//visibility:public'])" > b/BUILD
+  wait "$subshell_pid" || fail "Couldn't wait"
+  rm -rf a b
+
+  # Get the jvm.out location.
+  local -r jvm_out="$(bazel --client_debug info output_base)/server/jvm.out"
+
+  # Look for a distinctive string indicating the presence of a thread dump.
+  assert_contains "Full thread dump" "$jvm_out"
+}
+
+function scrape_client_pid() {
+  sed -nr 's/.*Running \(pid=([0-9]+)\)/\1/p'
+}
+
+function assert_output_base_deleted() {
+  local prefix="$1"
+  for i in $(seq 1 60); do
+    local found
+    found=$(ls -d "${prefix}"* 2>/dev/null || true)
+    if [[ -z "${found}" ]]; then
+      break
+    fi
+    sleep 0.2
+  done
+  local found
+  found=$(ls -d "${prefix}"* 2>/dev/null || true)
+  if [[ -n "${found}" ]]; then
+    fail "Output base (or temp shutdown dir) was not deleted: ${found}"
+  fi
+}
+
+function test_delete_output_base_on_shutdown() {
+  local my_output_base="${TEST_TMPDIR}/my_ob"
+  bazel --output_base="${my_output_base}" --delete_output_base_on_shutdown info >& "$TEST_log" || fail "Expected success"
+  if [[ ! -d "${my_output_base}" ]]; then
+    fail "Output base should exist while server is running"
+  fi
+  bazel --output_base="${my_output_base}" shutdown >& "$TEST_log" || fail "Expected success"
+  assert_output_base_deleted "${my_output_base}"
+}
+
+function test_delete_output_base_on_shutdown_batch() {
+  local my_output_base="${TEST_TMPDIR}/my_ob_batch"
+  bazel --output_base="${my_output_base}" --batch --delete_output_base_on_shutdown info >& "$TEST_log" || fail "Expected success"
+  assert_output_base_deleted "${my_output_base}"
+}
+
+function test_delete_output_base_on_shutdown_removes_convenience_symlinks() {
+  mkdir -p symlink_pkg
+  cat > symlink_pkg/BUILD <<'EOF'
+genrule(
+  name = "dummy",
+  outs = ["dummy.out"],
+  cmd = "touch $@",
+  local = 1,
+)
+EOF
+  local my_output_base="${TEST_TMPDIR}/my_ob_symlinks"
+  bazel --output_base="${my_output_base}" --delete_output_base_on_shutdown build --genrule_strategy=local //symlink_pkg:dummy >& "$TEST_log" || fail "Build failed"
+  local bin_link="${PRODUCT_NAME}-bin"
+  if [[ ! -L "${bin_link}" ]]; then
+    fail "Convenience symlink ${bin_link} was not created"
+  fi
+  bazel --output_base="${my_output_base}" shutdown >& "$TEST_log" || fail "Shutdown failed"
+  assert_output_base_deleted "${my_output_base}"
+  if [[ -L "${bin_link}" || -e "${bin_link}" ]]; then
+    fail "Convenience symlink ${bin_link} was not removed"
+  fi
+
+  local my_custom_ob="${TEST_TMPDIR}/my_ob_custom_symlinks"
+  bazel --output_base="${my_custom_ob}" --delete_output_base_on_shutdown build --symlink_prefix=custom- --genrule_strategy=local //symlink_pkg:dummy >& "$TEST_log" || fail "Build failed"
+  local custom_bin_link="custom-bin"
+  if [[ ! -L "${custom_bin_link}" ]]; then
+    fail "Convenience symlink ${custom_bin_link} was not created"
+  fi
+  bazel --output_base="${my_custom_ob}" shutdown >& "$TEST_log" || fail "Shutdown failed"
+  assert_output_base_deleted "${my_custom_ob}"
+  if [[ -L "${custom_bin_link}" || -e "${custom_bin_link}" ]]; then
+    fail "Convenience symlink ${custom_bin_link} was not removed"
+  fi
+}
+
+function test_delete_output_base_on_shutdown_default_retained() {
+  local my_output_base="${TEST_TMPDIR}/my_ob_retained"
+  bazel --output_base="${my_output_base}" info >& "$TEST_log" || fail "Expected success"
+  if [[ ! -d "${my_output_base}" ]]; then
+    fail "Output base should exist while server is running"
+  fi
+  bazel --output_base="${my_output_base}" shutdown >& "$TEST_log" || fail "Expected success"
+  sleep 1
+  if [[ ! -d "${my_output_base}" ]]; then
+    fail "Output base should be retained by default when flag is omitted"
+  fi
+}
+
+function test_delete_output_base_on_shutdown_readonly_files() {
+  local my_output_base="${TEST_TMPDIR}/my_ob_readonly"
+  bazel --output_base="${my_output_base}" --delete_output_base_on_shutdown info >& "$TEST_log" || fail "Expected success"
+  if [[ ! -d "${my_output_base}" ]]; then
+    fail "Output base should exist while server is running"
+  fi
+  mkdir -p "${my_output_base}/readonly_dir"
+  touch "${my_output_base}/readonly_dir/file.txt"
+  chmod 0555 "${my_output_base}/readonly_dir"
+  bazel --output_base="${my_output_base}" shutdown >& "$TEST_log" || fail "Expected success"
+  assert_output_base_deleted "${my_output_base}"
+}
+
+function test_delete_output_base_on_shutdown_directory_with_spaces() {
+  local my_output_base="${TEST_TMPDIR}/my ob with spaces"
+  bazel --output_base="${my_output_base}" --delete_output_base_on_shutdown info >& "$TEST_log" || fail "Expected success"
+  if [[ ! -d "${my_output_base}" ]]; then
+    fail "Output base should exist while server is running"
+  fi
+  bazel --output_base="${my_output_base}" shutdown >& "$TEST_log" || fail "Expected success"
+  assert_output_base_deleted "${my_output_base}"
+}
+
+function test_delete_output_base_on_shutdown_directory_with_quotes() {
+  local my_output_base="${TEST_TMPDIR}/my ob with 'single' and \"double\" quotes"
+  bazel --output_base="${my_output_base}" --delete_output_base_on_shutdown info >& "$TEST_log" || fail "Expected success"
+  if [[ ! -d "${my_output_base}" ]]; then
+    fail "Output base should exist while server is running"
+  fi
+  mkdir -p "${my_output_base}/readonly_dir"
+  touch "${my_output_base}/readonly_dir/file.txt"
+  chmod 0555 "${my_output_base}/readonly_dir"
+  bazel --output_base="${my_output_base}" shutdown >& "$TEST_log" || fail "Expected success"
+  assert_output_base_deleted "${my_output_base}"
+}
+
+function test_delete_output_base_on_shutdown_idle_timeout() {
+  local my_output_base="${TEST_TMPDIR}/my_ob_idle"
+  bazel --output_base="${my_output_base}" --delete_output_base_on_shutdown --max_idle_secs=1 info >& "$TEST_log" || fail "Expected success"
+  if [[ ! -d "${my_output_base}" ]]; then
+    fail "Output base should exist while server is running"
+  fi
+  assert_output_base_deleted "${my_output_base}"
 }
 
 run_suite "Tests of the bazel client."

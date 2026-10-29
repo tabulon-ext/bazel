@@ -20,6 +20,7 @@ import com.google.devtools.build.skyframe.SkyFunction;
 import com.google.devtools.build.skyframe.SkyFunctionException;
 import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.SkyValue;
+import javax.annotation.Nullable;
 
 /**
  * A {@link SkyFunction} for {@link DirectoryListingValue}s.
@@ -27,6 +28,7 @@ import com.google.devtools.build.skyframe.SkyValue;
 public final class DirectoryListingFunction implements SkyFunction {
 
   @Override
+  @Nullable
   public SkyValue compute(SkyKey skyKey, Environment env)
       throws DirectoryListingFunctionException, InterruptedException {
     RootedPath dirRootedPath = (RootedPath) skyKey.argument();
@@ -36,7 +38,7 @@ public final class DirectoryListingFunction implements SkyFunction {
       return null;
     }
 
-    RootedPath realDirRootedPath = dirFileValue.realRootedPath();
+    RootedPath realDirRootedPath = dirFileValue.realRootedPath(dirRootedPath);
     if (!dirFileValue.isDirectory()) {
       // Recall that the directory is assumed to exist (see DirectoryListingValue#key).
       throw new DirectoryListingFunctionException(new InconsistentFilesystemException(

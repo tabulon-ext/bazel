@@ -17,8 +17,10 @@ package net.starlark.java.eval;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.util.Map;
 import java.util.TreeMap;
+import net.starlark.java.syntax.FileOptions;
 
 /**
  * A StarlarkSemantics is an immutable set of optional name/value pairs that affect the dynamic
@@ -40,7 +42,7 @@ import java.util.TreeMap;
  * <p>For options that affect the static behavior of the Starlark frontend (lexer, parser,
  * validator, compiler), see {@link FileOptions}.
  */
-public final class StarlarkSemantics {
+public class StarlarkSemantics {
 
   /**
    * Returns the empty semantics, in which every option has its default value.
@@ -65,8 +67,12 @@ public final class StarlarkSemantics {
     this.hashCode = map.hashCode();
   }
 
+  protected StarlarkSemantics(StarlarkSemantics otherSemantics) {
+    this(otherSemantics.map);
+  }
+
   /** Returns the value of a boolean option, which must have a [+-] prefix. */
-  public boolean getBool(String name) {
+  public final boolean getBool(String name) {
     char prefix = name.charAt(0);
     Preconditions.checkArgument(prefix == '+' || prefix == '-');
     boolean defaultValue = prefix == '+';
@@ -75,7 +81,7 @@ public final class StarlarkSemantics {
   }
 
   /** Returns the value of the option denoted by {@code key}. */
-  public <T> T get(Key<T> key) {
+  public final <T> T get(Key<T> key) {
     @SuppressWarnings("unchecked") // safe, if Key.names are unique
     T v = (T) map.get(key.name);
     return v != null ? v : key.defaultValue;
@@ -88,7 +94,7 @@ public final class StarlarkSemantics {
    * Returns the value of the option with the given name, or the default value if it is not set or
    * does not exist.
    */
-  public Object getGeneric(String name, Object defaultValue) {
+  public final Object getGeneric(String name, Object defaultValue) {
     Object v = map.get(name);
     // Try boolean prefixes if that didn't work.
     if (v == null) {
@@ -101,7 +107,7 @@ public final class StarlarkSemantics {
   }
 
   /** A Key identifies an option, providing its name, type, and default value. */
-  public static class Key<T> {
+  public static final class Key<T> {
     public final String name;
     public final T defaultValue;
 
@@ -125,7 +131,7 @@ public final class StarlarkSemantics {
   /**
    * Returns a new builder that initially holds the same key/value pairs as this StarlarkSemantics.
    */
-  public Builder toBuilder() {
+  public final Builder toBuilder() {
     return new Builder(new TreeMap<>(map));
   }
 
@@ -143,6 +149,7 @@ public final class StarlarkSemantics {
     }
 
     /** Sets the value for the specified key. */
+    @CanIgnoreReturnValue
     public <T> Builder set(Key<T> key, T value) {
       if (!value.equals(key.defaultValue)) {
         map.put(key.name, value);
@@ -153,6 +160,7 @@ public final class StarlarkSemantics {
     }
 
     /** Sets the value for the boolean key, which must have a [+-] prefix. */
+    @CanIgnoreReturnValue
     public Builder setBool(String name, boolean value) {
       char prefix = name.charAt(0);
       Preconditions.checkArgument(prefix == '+' || prefix == '-');
@@ -167,6 +175,9 @@ public final class StarlarkSemantics {
 
     /** Returns an immutable StarlarkSemantics. */
     public StarlarkSemantics build() {
+      if (map.isEmpty()) {
+        return DEFAULT;
+      }
       return new StarlarkSemantics(ImmutableMap.copyOf(map));
     }
   }
@@ -184,7 +195,7 @@ public final class StarlarkSemantics {
    *   <li>It is illegal to pass both parameters as non-empty.
    * </ul>
    */
-  boolean isFeatureEnabledBasedOnTogglingFlags(String enablingFlag, String disablingFlag) {
+  final boolean isFeatureEnabledBasedOnTogglingFlags(String enablingFlag, String disablingFlag) {
     Preconditions.checkArgument(
         enablingFlag.isEmpty() || disablingFlag.isEmpty(),
         "at least one of 'enablingFlag' or 'disablingFlag' must be empty");
@@ -197,13 +208,21 @@ public final class StarlarkSemantics {
     }
   }
 
+  /**
+   * Returns a possibly different {@link StarlarkSemantics} instance that is equivalent to this one
+   * for the purpose of caching the methods available on any given Starlark class.
+   */
+  public StarlarkSemantics getBuiltinManagerCacheKey() {
+    return this;
+  }
+
   @Override
-  public int hashCode() {
+  public final int hashCode() {
     return hashCode;
   }
 
   @Override
-  public boolean equals(Object that) {
+  public final boolean equals(Object that) {
     return this == that
         || (that instanceof StarlarkSemantics && this.map.equals(((StarlarkSemantics) that).map));
   }
@@ -212,7 +231,7 @@ public final class StarlarkSemantics {
    * Returns a representation of this StarlarkSemantics' non-default key/value pairs in key order.
    */
   @Override
-  public String toString() {
+  public final String toString() {
     // Print "StarlarkSemantics{k=v, ...}", without +/- prefixes.
     StringBuilder buf = new StringBuilder();
     buf.append("StarlarkSemantics{");
@@ -231,6 +250,26 @@ public final class StarlarkSemantics {
     return buf.append('}').toString();
   }
 
+  /** Makes a {@link FileOptions.Builder} consistent with this {@link StarlarkSemantics}. */
+  @CanIgnoreReturnValue
+  public FileOptions.Builder updateFileOptions(FileOptions.Builder builder) {
+    boolean needsTypeInfo =
+        getBool(EXPERIMENTAL_STARLARK_STATIC_TYPE_CHECKING)
+            || getBool(EXPERIMENTAL_STARLARK_DYNAMIC_TYPE_CHECKING);
+    builder
+        .allowTypeSyntax(getBool(EXPERIMENTAL_STARLARK_TYPE_SYNTAX))
+        .resolveTypeSyntax(needsTypeInfo);
+    if (needsTypeInfo) {
+      builder.tolerateInvalidTypeExpressions(false);
+    }
+    return builder;
+  }
+
+  /** Returns the default {@link FileOptions} consistent with this {@link StarlarkSemantics}. */
+  public FileOptions getDefaultFileOptions() {
+    return updateFileOptions(FileOptions.builder()).build();
+  }
+
   // -- semantics options affecting the Starlark interpreter itself --
 
   /** Change the behavior of 'print' statements. Used in tests to verify flag propagation. */
@@ -241,4 +280,45 @@ public final class StarlarkSemantics {
    * unconditionally prohibits recursion.
    */
   public static final String ALLOW_RECURSION = "-allow_recursion";
+
+  /** Whether StarlarkSet objects may be constructed by the interpreter. */
+  public static final String EXPERIMENTAL_ENABLE_STARLARK_SET = "+experimental_enable_starlark_set";
+
+  /** Whether the Starlark interpreter uses UTF-8 byte strings instead of UTF-16 strings. */
+  public static final String INTERNAL_BAZEL_ONLY_UTF_8_BYTE_STRINGS =
+      "-internal_bazel_only_utf_8_byte_strings";
+
+  /**
+   * Whether to allow type annotation syntax in Starlark.
+   *
+   * <p>Type annotation syntax is not really relevant to evaluation per se, but we store it here in
+   * order to thread it through to {@link FileOptions}.
+   */
+  public static final String EXPERIMENTAL_STARLARK_TYPE_SYNTAX =
+      // LINT.IfChange
+      "+experimental_starlark_type_syntax";
+
+  // LINT.ThenChange(//src/main/java/net/starlark/java/syntax/FileOptions.java)
+
+  /**
+   * Whether static type checking should be performed.
+   *
+   * <p>Static type checking is not really relevant to evaluation per se, but we store it here in
+   * order to thread it through to {@link FileOptions}.
+   */
+  public static final String EXPERIMENTAL_STARLARK_STATIC_TYPE_CHECKING =
+      // LINT.IfChange
+      "+experimental_starlark_static_type_checking";
+
+  // LINT.ThenChange(//src/main/java/net/starlark/java/syntax/FileOptions.java)
+
+  /** Whether dynamic type checking should be performed. */
+  public static final String EXPERIMENTAL_STARLARK_DYNAMIC_TYPE_CHECKING =
+      // LINT.IfChange
+      "-experimental_starlark_dynamic_type_checking";
+
+  // LINT.ThenChange(//src/main/java/net/starlark/java/syntax/FileOptions.java)
+
+  /** Globally Override fail(stack_trace=) to true. Flag default is false. */
+  public static final String FORCE_STARLARK_STACK_TRACE = "-force_starlark_stack_trace";
 }

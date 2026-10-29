@@ -15,15 +15,14 @@
 package com.google.devtools.build.lib.skyframe.serialization;
 
 import static com.google.common.base.Preconditions.checkNotNull;
-import static com.google.common.base.Preconditions.checkState;
+import static com.google.devtools.build.lib.unsafe.UnsafeProvider.unsafe;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.collect.ClassToInstanceMap;
 import com.google.common.collect.ImmutableClassToInstanceMap;
-import com.google.common.collect.Maps;
-import com.google.devtools.build.lib.skyframe.serialization.ObjectCodec.MemoizationStrategy;
+import com.google.common.util.concurrent.ListenableFuture;
 import com.google.devtools.build.lib.skyframe.serialization.ObjectCodecRegistry.CodecDescriptor;
-import com.google.errorprone.annotations.CheckReturnValue;
+import com.google.devtools.build.skyframe.SkyKey;
+
+import com.google.errorprone.annotations.ForOverride;
 import com.google.protobuf.CodedInputStream;
 import java.io.IOException;
 import javax.annotation.Nullable;
@@ -34,135 +33,162 @@ import javax.annotation.Nullable;
  * thread-safe and should only be accessed on a single thread for deserializing one serialized
  * object (that may contain other serialized objects inside it).
  */
-public class DeserializationContext implements SerializationDependencyProvider {
+public abstract class DeserializationContext implements AsyncDeserializationContext {
   private final ObjectCodecRegistry registry;
   private final ImmutableClassToInstanceMap<Object> dependencies;
-  @Nullable private final Memoizer.Deserializer deserializer;
 
-  private DeserializationContext(
-      ObjectCodecRegistry registry,
-      ImmutableClassToInstanceMap<Object> dependencies,
-      @Nullable Memoizer.Deserializer deserializer) {
+  DeserializationContext(
+      ObjectCodecRegistry registry, ImmutableClassToInstanceMap<Object> dependencies) {
     this.registry = registry;
     this.dependencies = dependencies;
-    this.deserializer = deserializer;
   }
 
-  @VisibleForTesting
-  public DeserializationContext(
-      ObjectCodecRegistry registry, ImmutableClassToInstanceMap<Object> dependencies) {
-    this(registry, dependencies, /*deserializer=*/ null);
-  }
-
-  @VisibleForTesting
-  public DeserializationContext(ImmutableClassToInstanceMap<Object> dependencies) {
-    this(AutoRegistry.get(), dependencies);
-  }
-
-  // TODO(shahan): consider making codedIn a member of this class.
-  @SuppressWarnings({"TypeParameterUnusedInFormals"})
-  public <T> T deserialize(CodedInputStream codedIn) throws IOException, SerializationException {
-    return deserializeInternal(codedIn, /*customMemoizationStrategy=*/ null);
-  }
-
-  @SuppressWarnings({"TypeParameterUnusedInFormals"})
-  public <T> T deserializeWithAdHocMemoizationStrategy(
-      CodedInputStream codedIn, MemoizationStrategy memoizationStrategy)
-      throws IOException, SerializationException {
-    return deserializeInternal(codedIn, memoizationStrategy);
-  }
-
+  @Nullable
   @SuppressWarnings({"TypeParameterUnusedInFormals", "unchecked"})
-  private <T> T deserializeInternal(
-      CodedInputStream codedIn, @Nullable MemoizationStrategy customMemoizationStrategy)
+  public final <T> T deserialize(CodedInputStream codedIn)
       throws IOException, SerializationException {
-    int tag = codedIn.readSInt32();
-    if (tag == 0) {
-      return null;
-    }
-    if (tag < 0) {
-      // Subtract 1 to undo transformation from SerializationContext to avoid null.
-      return (T) deserializer.getMemoized(-tag - 1); // unchecked cast
-    }
-    T constant = (T) registry.maybeGetConstantByTag(tag);
-    if (constant != null) {
-      return constant;
-    }
-    CodecDescriptor codecDescriptor = registry.getCodecDescriptorByTag(tag);
-    if (deserializer == null) {
-      return (T) codecDescriptor.deserialize(this, codedIn); // unchecked cast
-    } else {
-      @SuppressWarnings("unchecked")
-      ObjectCodec<T> castCodec = (ObjectCodec<T>) codecDescriptor.getCodec();
-      MemoizationStrategy memoizationStrategy =
-          customMemoizationStrategy != null ? customMemoizationStrategy : castCodec.getStrategy();
-      return deserializer.deserialize(this, castCodec, memoizationStrategy, codedIn);
-    }
+    return (T) makeSynchronous(processTagAndDeserialize(codedIn));
   }
-
 
   /**
-   * Register an initial value for the currently deserializing value, for use by child objects that
-   * may have references to it.
+   * Deserializes into {@code parent} using {@code setter}.
    *
-   * <p>This is a noop when memoization is disabled.
+   * <p>This allows custom processing of the deserialized object.
    */
-  public <T> void registerInitialValue(T initialValue) {
-    if (deserializer != null) {
-      deserializer.registerInitialValue(initialValue);
+  @Override
+  public <T> void deserialize(CodedInputStream codedIn, T parent, FieldSetter<? super T> setter)
+      throws IOException, SerializationException {
+    Object value = deserialize(codedIn);
+    if (value == null) {
+      return;
     }
+    setter.set(parent, value);
+  }
+
+  // TODO: b/386384684 - remove Unsafe usage
+  @Override
+  @SuppressWarnings("SunApi") // TODO: b/331765692 - delete this
+  public void deserialize(CodedInputStream codedIn, Object parent, long offset)
+      throws IOException, SerializationException {
+    unsafe().putObject(parent, offset, deserialize(codedIn));
   }
 
   @Override
-  public <T> T getDependency(Class<T> type) {
+  public void deserializeArrayElement(CodedInputStream codedIn, Object[] arr, int index)
+      throws IOException, SerializationException {
+    Object value = deserialize(codedIn);
+    if (value == null) {
+      return;
+    }
+    arr[index] = value;
+  }
+
+  @Override
+  public void deserializeArrayElement(
+      CodedInputStream codedIn, Object[] arr, int index, Runnable done)
+      throws IOException, SerializationException {
+    deserializeArrayElement(codedIn, arr, index);
+    done.run();
+  }
+
+  @Override
+  public <T> void getSharedValue(
+      CodedInputStream codedIn,
+      @Nullable Object distinguisher,
+      DeferredObjectCodec<?> codec,
+      T parent,
+      FieldSetter<? super T> setter)
+      throws IOException, SerializationException {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public <T> void getSkyValue(SkyKey key, T parent, FieldSetter<? super T> setter)
+      throws SerializationException {
+    throw new UnsupportedOperationException("Only supported by SharedValueDeserializationContext");
+  }
+
+  @Override
+  public final <T> T getDependency(Class<T> type) {
     return checkNotNull(dependencies.getInstance(type), "Missing dependency of type %s", type);
   }
 
+  /** Returns a copy of the context with reset state. */
+  // TODO: b/297857068 - Only the NestedSetCodecWithStore requires this method. Delete it when it is
+  // no longer needed.
+  public abstract DeserializationContext getFreshContext();
+
+  final ObjectCodecRegistry getRegistry() {
+    return registry;
+  }
+
+  final ImmutableClassToInstanceMap<Object> getDependencies() {
+    return dependencies;
+  }
+
   /**
-   * Returns a {@link DeserializationContext} that will memoize values it encounters (using
-   * reference equality), the inverse of the memoization performed by a {@link SerializationContext}
-   * returned by {@link SerializationContext#getMemoizingContext}. The context returned here should
-   * be used instead of the original: memoization may only occur when using the returned context.
+   * Deserializes from {@code codedIn} using {@code codec}.
    *
-   * <p>This method is idempotent: calling it on an already memoizing context will return the same
-   * context.
+   * <p>This extension point allows the implementation optionally apply memoization logic.
+   *
+   * <p>Returns either a deserialized value or a {@link ListenableFuture}. A {@link
+   * ListenableFuture} is only possible for {@link SharedValueDeserializationContext}.
    */
-  @CheckReturnValue
-  public DeserializationContext getMemoizingContext() {
-    if (deserializer != null) {
-      return this;
+  @ForOverride
+  abstract Object deserializeAndMaybeMemoize(ObjectCodec<?> codec, CodedInputStream codedIn)
+      throws SerializationException, IOException;
+
+  /**
+   * Reads the tag and uses its value to deserialize the next value.
+   *
+   * <ul>
+   *   <li>null, if the value was null;
+   *   <li>a {@link ListenableFuture} that produces the value; or
+   *   <li>the value directly.
+   * </ul>
+   *
+   * <p>{@link ListenableFuture} is only possible for {@link SharedValueDeserializationContext}.
+   */
+  @Nullable
+  final Object processTagAndDeserialize(CodedInputStream codedIn)
+      throws SerializationException, IOException {
+    int typedTag = codedIn.readRawVarint32();
+    if (typedTag == 0) {
+      return null;
     }
-    return getNewMemoizingContext();
+    int tag = WireType.getTagNumber(typedTag);
+    int wireType = WireType.getWireTypeIndex(typedTag);
+    Object constant = registry.maybeGetConstantByTag(typedTag);
+    if (constant != null) {
+      return constant;
+    }
+    // Micro-optimization: avoid looking up an actual WireType enum value. We don't actually need a
+    // WireType value, we just need to know how to interpret the tag.
+    if (wireType == WireType.BACKREFERENCE_VALUE) {
+      return getMemoizedBackReference(tag);
+    }
+    // Performs deserialization using the specified codec.
+    CodecDescriptor codec = registry.getCodecDescriptorByTag(typedTag);
+    return deserializeAndMaybeMemoize(codec.codec(), codedIn);
   }
 
-  /**
-   * Returns a new memoizing {@link DeserializationContext}, as {@link #getMemoizingContext}. Unlike
-   * {@link #getMemoizingContext}, this method is not idempotent - the returned context will always
-   * be fresh.
-   */
-  public DeserializationContext getNewMemoizingContext() {
-    return new DeserializationContext(registry, dependencies, new Memoizer.Deserializer());
+  @Nullable
+  final Object maybeGetConstantByTag(int tag) throws SerializationException {
+    return registry.maybeGetConstantByTag(tag);
   }
 
+  abstract Object getMemoizedBackReference(int memoIndex) throws SerializationException;
+
   /**
-   * Returns a new {@link DeserializationContext} mostly identical to this one, but with a
-   * dependency map composed by applying overrides to this context's dependencies.
+   * Returns the result value.
    *
-   * <p>The given {@code dependencyOverrides} may contain keys already present (in which case the
-   * dependency is replaced) or new keys (in which case the dependency is added).
-   *
-   * <p>Must only be called on a base context (no memoization state), since changing dependencies
-   * may change deserialization semantics.
+   * <p>In the {@link SharedValueDeserializationContext}, {@link
+   * DeserializationContext#deserializeAndMaybeMemoize} may produce futures. This method is
+   * overridden to unwrap them.
    */
-  @CheckReturnValue
-  public DeserializationContext withDependencyOverrides(ClassToInstanceMap<?> dependencyOverrides) {
-    checkState(deserializer == null, "Must only be called on base DeserializationContext");
-    return new DeserializationContext(
-        registry,
-        ImmutableClassToInstanceMap.builder()
-            .putAll(Maps.filterKeys(dependencies, k -> !dependencyOverrides.containsKey(k)))
-            .putAll(dependencyOverrides)
-            .build(),
-        /*deserializer=*/ null);
+  @SuppressWarnings("CanIgnoreReturnValueSuggester")
+  @ForOverride
+  Object makeSynchronous(Object obj) throws SerializationException {
+    return obj;
   }
 }

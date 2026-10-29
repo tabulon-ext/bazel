@@ -14,12 +14,25 @@
 
 package com.google.devtools.build.lib.skyframe;
 
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.hash.HashFunction;
 import com.google.devtools.build.lib.actions.FileValue;
+import com.google.devtools.build.lib.cmdline.BazelCompileContext;
 import com.google.devtools.build.lib.cmdline.Label;
+import com.google.devtools.build.lib.cmdline.LabelSyntaxException;
+import com.google.devtools.build.lib.cmdline.PackageIdentifier;
 import com.google.devtools.build.lib.events.Event;
+import com.google.devtools.build.lib.events.EventHandler;
+import com.google.devtools.build.lib.io.InconsistentFilesystemException;
 import com.google.devtools.build.lib.packages.BazelStarlarkEnvironment;
-import com.google.devtools.build.lib.packages.PackageFactory;
+import com.google.devtools.build.lib.packages.BuildFileNotFoundException;
+import com.google.devtools.build.lib.packages.PackageLoadingListener;
+import com.google.devtools.build.lib.packages.semantics.BuildLanguageOptions;
+import com.google.devtools.build.lib.skyframe.BzlCompileValue.TypeOptions;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.RootedPath;
@@ -29,13 +42,27 @@ import com.google.devtools.build.skyframe.SkyFunctionException.Transience;
 import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.SkyValue;
 import java.io.IOException;
-import java.util.Map;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import javax.annotation.Nullable;
 import net.starlark.java.eval.Module;
 import net.starlark.java.eval.StarlarkSemantics;
+import net.starlark.java.syntax.AssignmentStatement;
+import net.starlark.java.syntax.DictExpression;
+import net.starlark.java.syntax.Expression;
 import net.starlark.java.syntax.FileOptions;
+import net.starlark.java.syntax.FloatLiteral;
+import net.starlark.java.syntax.Identifier;
+import net.starlark.java.syntax.IntLiteral;
+import net.starlark.java.syntax.ListExpression;
+import net.starlark.java.syntax.Location;
 import net.starlark.java.syntax.ParserInput;
 import net.starlark.java.syntax.Program;
+import net.starlark.java.syntax.Resolver;
 import net.starlark.java.syntax.StarlarkFile;
+import net.starlark.java.syntax.Statement;
+import net.starlark.java.syntax.StringLiteral;
 import net.starlark.java.syntax.SyntaxError;
 
 /**
@@ -49,12 +76,17 @@ import net.starlark.java.syntax.SyntaxError;
 // TODO(adonovan): actually compile. The name is a step ahead of the implementation.
 public class BzlCompileFunction implements SkyFunction {
 
-  private final PackageFactory packageFactory;
+  private final BazelStarlarkEnvironment bazelStarlarkEnvironment;
   private final HashFunction hashFunction;
+  private final PackageLoadingListener packageLoadingListener;
 
-  public BzlCompileFunction(PackageFactory packageFactory, HashFunction hashFunction) {
-    this.packageFactory = packageFactory;
+  public BzlCompileFunction(
+      BazelStarlarkEnvironment bazelStarlarkEnvironment,
+      HashFunction hashFunction,
+      PackageLoadingListener packageLoadingListener) {
+    this.bazelStarlarkEnvironment = bazelStarlarkEnvironment;
     this.hashFunction = hashFunction;
+    this.packageLoadingListener = packageLoadingListener;
   }
 
   @Override
@@ -62,21 +94,33 @@ public class BzlCompileFunction implements SkyFunction {
       throws SkyFunctionException, InterruptedException {
     try {
       return computeInline(
-          (BzlCompileValue.Key) skyKey.argument(), env, packageFactory, hashFunction);
+          (BzlCompileValue.Key) skyKey.argument(),
+          env,
+          bazelStarlarkEnvironment,
+          hashFunction,
+          packageLoadingListener);
     } catch (FailedIOException e) {
       throw new FunctionException(e);
     }
   }
 
+  @Nullable
   static BzlCompileValue computeInline(
       BzlCompileValue.Key key,
       Environment env,
-      PackageFactory packageFactory,
-      HashFunction hashFunction)
+      BazelStarlarkEnvironment bazelStarlarkEnvironment,
+      HashFunction hashFunction,
+      PackageLoadingListener packageLoadingListener)
       throws FailedIOException, InterruptedException {
     byte[] bytes;
     byte[] digest;
     String inputName;
+    RootedPath rootedPath = null;
+
+    StarlarkSemantics semantics = PrecomputedValue.STARLARK_SEMANTICS.get(env);
+    if (semantics == null) {
+      return null;
+    }
 
     if (key.kind == BzlCompileValue.Kind.EMPTY_PRELUDE) {
       // Default prelude is empty.
@@ -84,9 +128,8 @@ public class BzlCompileFunction implements SkyFunction {
       digest = null;
       inputName = "<default prelude>";
     } else {
-
       // Obtain the file.
-      RootedPath rootedPath = RootedPath.toRootedPath(key.root, key.label.toPathFragment());
+      rootedPath = RootedPath.toRootedPath(key.root, key.label.toPathFragment());
       SkyKey fileSkyKey = FileValue.key(rootedPath);
       FileValue fileValue = null;
       try {
@@ -106,16 +149,44 @@ public class BzlCompileFunction implements SkyFunction {
                   "cannot load '%s': not a regular file (dangling link?)", key.label);
         }
 
-        // Read the file.
         Path path = rootedPath.asPath();
+        Location location = Location.fromFile(path.toString());
+
+        long fileSize = fileValue.getSize();
+        // Special files (such as named pipes or sockets used to coordinate timing in tests) do not
+        // report a meaningful size in stat(), so their size is checked after reading below.
+        if (key.kind == BzlCompileValue.Kind.NORMAL && !fileValue.isSpecialFile()) {
+          BzlCompileValue limitFailure =
+              checkHardFileSizeLimit(key, fileSize, location, semantics, env);
+          if (env.valuesMissing()) {
+            return null;
+          }
+          if (limitFailure != null) {
+            return limitFailure;
+          }
+        }
+
+        // Read the file.
         try {
           bytes =
               fileValue.isSpecialFile()
                   ? FileSystemUtils.readContent(path)
-                  : FileSystemUtils.readWithKnownFileSize(path, fileValue.getSize());
+                  : FileSystemUtils.readWithKnownFileSize(path, fileSize);
         } catch (IOException e) {
           throw new FailedIOException(e, Transience.TRANSIENT);
         }
+
+        if (key.kind == BzlCompileValue.Kind.NORMAL && fileValue.isSpecialFile()) {
+          BzlCompileValue limitFailure =
+              checkHardFileSizeLimit(key, bytes.length, location, semantics, env);
+          if (env.valuesMissing()) {
+            return null;
+          }
+          if (limitFailure != null) {
+            return limitFailure;
+          }
+        }
+
         digest = fileValue.getDigest(); // may be null
         inputName = path.toString();
       } else {
@@ -135,46 +206,101 @@ public class BzlCompileFunction implements SkyFunction {
       digest = hashFunction.hashBytes(bytes).asBytes();
     }
 
-    StarlarkSemantics semantics = PrecomputedValue.STARLARK_SEMANTICS.get(env);
-    if (semantics == null) {
-      return null;
-    }
+    TypeOptions typeOptions = getTypeOptions(semantics, key);
+    boolean resolveTypeSyntax =
+        typeOptions.wantStaticTypeChecking() || typeOptions.wantDynamicTypeChecking();
 
-    Map<String, Object> predeclared;
-    BazelStarlarkEnvironment starlarkEnv = packageFactory.getBazelStarlarkEnvironment();
-    if (key.kind == BzlCompileValue.Kind.BUILTINS) {
-      predeclared = starlarkEnv.getBuiltinsBzlEnv();
+    ImmutableMap<String, Object> predeclared;
+    if (key.isSclDialect()) {
+      predeclared = bazelStarlarkEnvironment.getStarlarkGlobals().getSclToplevels();
+    } else if (key.kind == BzlCompileValue.Kind.BUILTINS) {
+      predeclared =
+          resolveTypeSyntax
+              ? bazelStarlarkEnvironment.getBuiltinsBzlEnvWithExtraTypeConstructors()
+              : bazelStarlarkEnvironment.getBuiltinsBzlEnv();
     } else {
       // Use the predeclared environment for BUILD-loaded bzl files, ignoring injection. It is not
       // the right env for the actual evaluation of BUILD-loaded bzl files because it doesn't
       // map to the injected symbols. But the names of the symbols are the same, and the names are
-      // all we need to do symbol resolution (modulo FlagGuardedValues -- see TODO in
-      // PackageFactory.createBuildBzlEnvUsingInjection()).
+      // all we need to do symbol resolution.
+      //
       // For WORKSPACE-loaded bzl files, the env isn't quite right not because of injection but
       // because the "native" object is different. But A) that will be fixed with #11954, and B) we
       // don't care for the same reason as above.
-      predeclared = starlarkEnv.getUninjectedBuildBzlEnv();
+
+      predeclared =
+          resolveTypeSyntax
+              ? bazelStarlarkEnvironment.getUninjectedBuildBzlEnvWithExtraTypeConstructors()
+              : bazelStarlarkEnvironment.getUninjectedBuildBzlEnv();
     }
 
     // We have all deps. Parse, resolve, and return.
-    ParserInput input = ParserInput.fromLatin1(bytes, inputName);
-    FileOptions options =
+    ParserInput input;
+    try {
+      input =
+          StarlarkUtil.createParserInput(
+              bytes,
+              inputName,
+              semantics.get(BuildLanguageOptions.INCOMPATIBLE_ENFORCE_STARLARK_UTF8),
+              env.getListener());
+    } catch (
+        @SuppressWarnings("UnusedException") // createParserInput() reports its own error message
+        StarlarkUtil.InvalidUtf8Exception e) {
+      return BzlCompileValue.noFile("compilation of '%s' failed", inputName);
+    }
+
+    FileOptions.Builder optionsBuilder =
         FileOptions.builder()
             // By default, Starlark load statements create file-local bindings.
             // However, the BUILD prelude typically contains nothing but load
             // statements whose bindings are intended to be visible in all BUILD
             // files. The loadBindsGlobally flag allows us to retrieve them.
             .loadBindsGlobally(key.isBuildPrelude())
-            .build();
-    StarlarkFile file = StarlarkFile.parse(input, options);
+            // .scl files should be ASCII-only in string literals.
+            // TODO(bazel-team): It'd be nice if we could intercept non-ASCII errors from the lexer,
+            // and modify the displayed message to clarify to the user that the string would be
+            // permitted in a .bzl file. But there's no easy way to do that short of either string
+            // matching the error message or reworking the interpreter API to put more structured
+            // detail in errors (i.e. new fields or error subclasses).
+            .stringLiteralsAreAsciiOnly(key.isSclDialect());
+    updateFileOptions(optionsBuilder, typeOptions);
+    StarlarkFile file = StarlarkFile.parse(input, optionsBuilder.build());
+
+    if (key.kind == BzlCompileValue.Kind.NORMAL) {
+      BzlCompileValue softLimitFailure =
+          checkSoftFileSizeLimit(
+              key, bytes.length, file, Location.fromFile(inputName), semantics, env);
+      if (env.valuesMissing()) {
+        return null;
+      }
+      if (softLimitFailure != null) {
+        return softLimitFailure;
+      }
+    }
 
     // compile
-    Module module = Module.withPredeclared(semantics, predeclared);
+    final Module module;
+
+    if (key.kind == BzlCompileValue.Kind.EMPTY_PRELUDE) {
+      // The empty prelude has no label, so we can't use it to filter the predeclareds.
+      // This doesn't matter since the empty prelude doesn't attempt to access any predeclareds
+      // anyway.
+      module = Module.withPredeclared(semantics, predeclared);
+    } else {
+      // The BazelCompileContext holds additional contextual info to be associated with the Module
+      // The information is used to filter predeclareds
+      BazelCompileContext bazelCompileContext =
+          BazelCompileContext.create(key.label, file.getName());
+      module = Module.withPredeclaredAndData(semantics, predeclared, bazelCompileContext);
+    }
     try {
       Program prog = Program.compileFile(file, module);
-      return BzlCompileValue.withProgram(prog, digest);
+      if (key.kind == BzlCompileValue.Kind.NORMAL) {
+        packageLoadingListener.onBzlCompileCompleteAndSuccessful(rootedPath, bytes.length);
+      }
+      return BzlCompileValue.withProgram(prog, digest, typeOptions);
     } catch (SyntaxError.Exception ex) {
-      Event.replayEventsOn(env.getListener(), ex.errors());
+      addSyntaxErrorsToListener(env.getListener(), ex.errors(), key);
       return BzlCompileValue.noFile(
           "compilation of module '%s'%s failed",
           key.label.toPathFragment(),
@@ -182,10 +308,82 @@ public class BzlCompileFunction implements SkyFunction {
     }
   }
 
+  /**
+   * Whether the file should permit type syntax (annotations, etc.) based on flags and the type of
+   * file.
+   */
+  private static TypeOptions getTypeOptions(StarlarkSemantics semantics, BzlCompileValue.Key key) {
+    boolean typeSyntaxFlag = semantics.getBool(StarlarkSemantics.EXPERIMENTAL_STARLARK_TYPE_SYNTAX);
+    List<String> allowlist =
+        semantics.get(BuildLanguageOptions.EXPERIMENTAL_STARLARK_TYPES_ALLOWED_PATHS);
+
+    boolean okFiletype =
+        // annotations in prelude not allowed (it has null key.label)
+        !key.isBuildPrelude()
+            // annotations in SCL not allowed (not yet compatible with Go-Starlark interpreter)
+            && !key.isSclDialect();
+
+    boolean useTypeSyntax = false;
+    if (okFiletype) {
+      if (typeSyntaxFlag) {
+        if (allowlist.isEmpty()
+            || allowlist.stream().anyMatch(s -> key.label.getCanonicalForm().startsWith(s))) {
+          useTypeSyntax = true;
+        }
+      }
+      if (key.isBuiltins()) {
+        // Always enable type syntax for @_builtins
+        useTypeSyntax = true;
+      }
+    }
+    boolean doStaticTypeChecking =
+        useTypeSyntax
+            && (semantics.getBool(StarlarkSemantics.EXPERIMENTAL_STARLARK_STATIC_TYPE_CHECKING)
+                // Always enable static type checking for @_builtins
+                || key.isBuiltins());
+    boolean doDynamicTypeChecking =
+        useTypeSyntax
+            && semantics.getBool(StarlarkSemantics.EXPERIMENTAL_STARLARK_DYNAMIC_TYPE_CHECKING);
+
+    return new TypeOptions(useTypeSyntax, doStaticTypeChecking, doDynamicTypeChecking);
+  }
+
+  private static void updateFileOptions(FileOptions.Builder builder, TypeOptions typeOptions) {
+    boolean needsTypeInfo =
+        typeOptions.wantStaticTypeChecking() || typeOptions.wantDynamicTypeChecking();
+    builder
+        .allowTypeSyntax(typeOptions.useTypeSyntax())
+        .resolveTypeSyntax(needsTypeInfo)
+        .tolerateInvalidTypeExpressions(!needsTypeInfo);
+  }
+
+  /**
+   * Replays the syntax errors from a file onto an event handler, adding more context if necessary.
+   */
+  private static void addSyntaxErrorsToListener(
+      EventHandler handler, List<SyntaxError> errors, BzlCompileValue.Key key) {
+    Event.replayEventsOn(handler, errors);
+    // If type annotations are disallowed, it could either be because the required flags aren't
+    // enabled or because the filetype disallows it.
+    for (var err : errors) {
+      if (err.message().contains(": type annotations are disallowed")) {
+        Location fileLoc = Location.fromFile(err.location().file());
+        String explanation =
+            key.isSclDialect()
+                ? "Type annotations are not permitted in .scl files."
+                : """
+                Type annotations syntax can be enabled with --experimental_starlark_type_syntax \
+                and/or --experimental_starlark_types_allowed_paths.\
+                """;
+        handler.handle(Event.error(fileLoc, explanation));
+      }
+    }
+  }
+
   static final class FailedIOException extends Exception {
     private final Transience transience;
 
-    private FailedIOException(IOException cause, Transience transience) {
+    FailedIOException(IOException cause, Transience transience) {
       super(cause.getMessage(), cause);
       this.transience = transience;
     }
@@ -199,5 +397,317 @@ public class BzlCompileFunction implements SkyFunction {
     private FunctionException(FailedIOException cause) {
       super(cause, cause.transience);
     }
+  }
+
+  private static final String KNOWN_OVERSIZED_BZL_FILE_SYMBOL = "_KNOWN_OVERSIZED_BZL_FILE";
+
+  private record AllowlistCheckResult(boolean allowlisted, @Nullable String errorMessage) {
+    static final AllowlistCheckResult ALLOWLISTED = new AllowlistCheckResult(true, null);
+    static final AllowlistCheckResult NOT_ALLOWLISTED = new AllowlistCheckResult(false, null);
+
+    static AllowlistCheckResult error(String errorMessage) {
+      return new AllowlistCheckResult(false, errorMessage);
+    }
+  }
+
+  private static final LoadingCache<BzlCompileValue, ParsedAllowlist> allowlistCache =
+      CacheBuilder.newBuilder()
+          .weakKeys()
+          .build(CacheLoader.from(BzlCompileFunction::evaluateAllowlist));
+
+  private record ParsedAllowlist(
+      @Nullable ImmutableSet<String> allowedEntries, @Nullable String errorMessage) {
+    static ParsedAllowlist error(String errorMessage) {
+      return new ParsedAllowlist(null, errorMessage);
+    }
+  }
+
+  private static ParsedAllowlist evaluateAllowlist(BzlCompileValue allowlistCompileValue) {
+    Program program = allowlistCompileValue.getProgram();
+    if (!program.getLoads().isEmpty()) {
+      return ParsedAllowlist.error("cannot contain load statements.");
+    }
+
+    Resolver.Function rfn = program.getResolvedFunction();
+    List<Statement> stmts = rfn.getBody();
+    if (rfn.getDocumentation() != null) {
+      stmts = stmts.subList(1, stmts.size());
+    }
+    Expression allowedRhs =
+        stmts.size() == 1 ? getSimpleAssignmentRhsMaybe(stmts.getFirst(), "ALLOWED") : null;
+    if (allowedRhs == null) {
+      return ParsedAllowlist.error("must only define a single top-level 'ALLOWED' symbol.");
+    }
+    if (!(allowedRhs instanceof DictExpression dictExpr)) {
+      return ParsedAllowlist.error("'ALLOWED' must be a dict with string keys.");
+    }
+
+    Set<String> allowed = new HashSet<>();
+    for (DictExpression.Entry entry : dictExpr.getEntries()) {
+      if (!(entry.getKey() instanceof StringLiteral keyLiteral)) {
+        return ParsedAllowlist.error("all keys in 'ALLOWED' must be string literals.");
+      }
+      String key = keyLiteral.getValue();
+      if (!isValidAllowlistKey(key)) {
+        return ParsedAllowlist.error(
+            String.format(
+                "invalid key \"%s\" in 'ALLOWED' at %s. Keys must be normalized paths relative to"
+                    + " the repository root, e.g. \"pkg/foo.bzl\" for the main repository or"
+                    + " \"@@repo//pkg/foo.bzl\" for other repositories.",
+                key, keyLiteral.getStartLocation()));
+      }
+      if (!allowed.add(key)) {
+        return ParsedAllowlist.error(
+            "duplicate key \"%s\" in 'ALLOWED' at %s."
+                .formatted(key, keyLiteral.getStartLocation()));
+      }
+      if (!isLiteralValue(entry.getValue())) {
+        return ParsedAllowlist.error(
+            "values in 'ALLOWED' must only contain literals (key \"%s\" at %s)."
+                .formatted(key, entry.getValue().getStartLocation()));
+      }
+    }
+    return new ParsedAllowlist(ImmutableSet.copyOf(allowed), null);
+  }
+
+  /**
+   * Returns the key under which {@code label} is listed in an allowlist's {@code ALLOWED} dict: the
+   * repository-relative path for the main repository, prefixed with {@code @@repo//} otherwise.
+   *
+   * <p>Uses {@link PackageIdentifier} to format and validate canonical {@code [@@repo//]path}
+   * strings even though the path fragment denotes a Starlark file rather than a package.
+   */
+  private static String allowlistKey(Label label) {
+    return PackageIdentifier.create(label.getRepository(), label.toPathFragment()).toString();
+  }
+
+  /** Whether {@code key} has the form produced by {@link #allowlistKey}. */
+  private static boolean isValidAllowlistKey(String key) {
+    try {
+      PackageIdentifier pkgId = PackageIdentifier.parse(key);
+      // PackageIdentifier.parse() accepts non-canonical forms like "//pkg/foo.bzl",
+      // "@@//pkg/foo.bzl", "@ext//pkg/foo.bzl", and "pkg/foo.bzl/..." whose toString()
+      // differs from key.
+      return !pkgId.getPackageFragment().isEmpty() && pkgId.toString().equals(key);
+    } catch (LabelSyntaxException e) {
+      return false;
+    }
+  }
+
+  private static boolean isLiteralValue(Expression expr) {
+    return switch (expr) {
+      case StringLiteral unused -> true;
+      case IntLiteral unused -> true;
+      case FloatLiteral unused -> true;
+      case Identifier id ->
+          id.getName().equals("True")
+              || id.getName().equals("False")
+              || id.getName().equals("None");
+      case ListExpression list ->
+          list.getElements().stream().allMatch(BzlCompileFunction::isLiteralValue);
+      case DictExpression dict ->
+          dict.getEntries().stream()
+              .allMatch(e -> isLiteralValue(e.getKey()) && isLiteralValue(e.getValue()));
+      default -> false;
+    };
+  }
+
+  @Nullable
+  private static BzlCompileValue checkHardFileSizeLimit(
+      BzlCompileValue.Key key,
+      long fileSize,
+      Location location,
+      StarlarkSemantics semantics,
+      Environment env)
+      throws InterruptedException {
+    long maxLimit = semantics.get(BuildLanguageOptions.MAX_BZL_FILE_SIZE);
+    if (maxLimit <= 0 || fileSize <= maxLimit) {
+      return null;
+    }
+    AllowlistCheckResult allowlistResult =
+        isFileAllowlisted(key, fileSize, maxLimit, semantics, env);
+    if (allowlistResult == null || allowlistResult.allowlisted()) {
+      return null;
+    }
+    String msg =
+        allowlistResult.errorMessage() != null
+            ? allowlistResult.errorMessage()
+            : String.format(
+                "File '%s' size (%d bytes) exceeds the maximum allowed size (%d bytes). Loading"
+                    + " oversized Starlark files is blocked to protect Blaze from JVM memory"
+                    + " exhaustion.",
+                key.label, fileSize, maxLimit);
+    env.getListener().handle(Event.error(location, msg));
+    return BzlCompileValue.noFile("%s", msg);
+  }
+
+  @Nullable
+  private static BzlCompileValue checkSoftFileSizeLimit(
+      BzlCompileValue.Key key,
+      long fileSize,
+      StarlarkFile file,
+      Location location,
+      StarlarkSemantics semantics,
+      Environment env)
+      throws InterruptedException {
+    long softLimit = semantics.get(BuildLanguageOptions.SOFT_MAX_BZL_FILE_SIZE);
+    if (softLimit <= 0 || fileSize <= softLimit || hasKnownOversizedOptOut(file)) {
+      return null;
+    }
+    AllowlistCheckResult allowlistResult =
+        isFileAllowlisted(key, fileSize, softLimit, semantics, env);
+    if (allowlistResult == null || allowlistResult.allowlisted()) {
+      return null;
+    }
+    String msg =
+        allowlistResult.errorMessage() != null
+            ? allowlistResult.errorMessage()
+            : String.format(
+                "File '%s' size (%d bytes) exceeds the soft maximum size (%d bytes). Split this"
+                    + " file or move data out of Starlark. To opt out up to the hard limit, set"
+                    + " `%s = \"%s\"` at the top level of the file.",
+                key.label,
+                fileSize,
+                softLimit,
+                KNOWN_OVERSIZED_BZL_FILE_SYMBOL,
+                BuildLanguageOptions.KNOWN_OVERSIZED_BZL_FILE_VALUE_EXAMPLE);
+    env.getListener().handle(Event.error(location, msg));
+    return BzlCompileValue.noFile("%s", msg);
+  }
+
+  static boolean registerAllowlistDepIfOversized(
+      BzlCompileValue.Key key, SkyValue bzlFileSkyValue, Environment env)
+      throws InterruptedException {
+    if (!(bzlFileSkyValue instanceof FileValue bzlFileValue)
+        || key.kind != BzlCompileValue.Kind.NORMAL
+        || !bzlFileValue.exists()
+        || !bzlFileValue.isFile()) {
+      return true;
+    }
+    StarlarkSemantics semantics = PrecomputedValue.STARLARK_SEMANTICS.get(env);
+    if (semantics == null) {
+      return false;
+    }
+    long maxLimit = semantics.get(BuildLanguageOptions.MAX_BZL_FILE_SIZE);
+    long softLimit = semantics.get(BuildLanguageOptions.SOFT_MAX_BZL_FILE_SIZE);
+    boolean exceedsLimit =
+        ((maxLimit > 0 || softLimit > 0) && bzlFileValue.isSpecialFile())
+            || (maxLimit > 0 && bzlFileValue.getSize() > maxLimit)
+            || (softLimit > 0 && bzlFileValue.getSize() > softLimit);
+    if (!exceedsLimit) {
+      return true;
+    }
+    return isFileAllowlisted(key, bzlFileValue.getSize(), maxLimit, semantics, env) != null;
+  }
+
+  private static boolean hasKnownOversizedOptOut(StarlarkFile file) {
+    for (Statement stmt : file.getStatements()) {
+      if (getSimpleAssignmentRhsMaybe(stmt, KNOWN_OVERSIZED_BZL_FILE_SYMBOL)
+              instanceof StringLiteral str
+          && BuildLanguageOptions.KNOWN_OVERSIZED_BZL_FILE_VALUE_PATTERN
+              .matcher(str.getValue())
+              .matches()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * If {@code stmt} is a plain assignment {@code <symbol> = <rhs>}, returns {@code <rhs>};
+   * otherwise returns {@code null}.
+   */
+  @Nullable
+  private static Expression getSimpleAssignmentRhsMaybe(Statement stmt, String symbol) {
+    if (stmt instanceof AssignmentStatement assignment
+        && !assignment.isAugmented()
+        && assignment.getLHS() instanceof Identifier id
+        && id.getName().equals(symbol)) {
+      return assignment.getRHS();
+    }
+    return null;
+  }
+
+  @Nullable
+  private static AllowlistCheckResult isFileAllowlisted(
+      BzlCompileValue.Key key,
+      long fileSize,
+      long limit,
+      StarlarkSemantics semantics,
+      Environment env)
+      throws InterruptedException {
+    String rawAllowlist = semantics.get(BuildLanguageOptions.BZL_FILE_SIZE_LIMIT_ALLOWLIST);
+    if (rawAllowlist.isEmpty()) {
+      return AllowlistCheckResult.NOT_ALLOWLISTED;
+    }
+    Label allowlistLabel = Label.parseCanonicalUnchecked(rawAllowlist);
+    if (allowlistLabel.equals(key.label)) {
+      return AllowlistCheckResult.error(
+          String.format(
+              "Allowlist file '%s' size (%d bytes) exceeds the maximum allowed size (%d bytes)."
+                  + " The allowlist file itself cannot be oversized to avoid dependency cycles.",
+              key.label, fileSize, limit));
+    }
+
+    PackageIdentifier dirId =
+        PackageIdentifier.create(
+            allowlistLabel.getRepository(), Label.getContainingDirectory(allowlistLabel));
+    ContainingPackageLookupValue packageLookup;
+    try {
+      packageLookup =
+          (ContainingPackageLookupValue)
+              env.getValueOrThrow(
+                  ContainingPackageLookupValue.key(dirId),
+                  BuildFileNotFoundException.class,
+                  InconsistentFilesystemException.class);
+    } catch (BuildFileNotFoundException | InconsistentFilesystemException e) {
+      return AllowlistCheckResult.error(
+          "Failed to find containing package for allowlist '%s': %s"
+              .formatted(allowlistLabel, e.getMessage()));
+    }
+    if (packageLookup == null) {
+      return null;
+    }
+    if (!packageLookup.hasContainingPackage()) {
+      return AllowlistCheckResult.error(
+          "Failed to load allowlist file '%s': no containing package".formatted(allowlistLabel));
+    }
+    if (!packageLookup.getContainingPackageName().equals(allowlistLabel.getPackageIdentifier())) {
+      return AllowlistCheckResult.error(
+          "Failed to load allowlist file '%s': %s"
+              .formatted(
+                  allowlistLabel,
+                  ContainingPackageLookupValue.getErrorMessageForLabelCrossingPackageBoundary(
+                      packageLookup.getContainingPackageRoot(), allowlistLabel, packageLookup)));
+    }
+
+    BzlCompileValue allowlistCompileValue;
+    try {
+      allowlistCompileValue =
+          (BzlCompileValue)
+              env.getValueOrThrow(
+                  BzlCompileValue.key(packageLookup.getContainingPackageRoot(), allowlistLabel),
+                  FailedIOException.class);
+    } catch (FailedIOException e) {
+      return AllowlistCheckResult.error(
+          "Failed to compile allowlist file '%s': %s".formatted(allowlistLabel, e.getMessage()));
+    }
+    if (allowlistCompileValue == null) {
+      return null;
+    }
+    if (!allowlistCompileValue.lookupSuccessful()) {
+      return AllowlistCheckResult.error(
+          "Failed to compile allowlist file '%s': %s"
+              .formatted(allowlistLabel, allowlistCompileValue.getError()));
+    }
+
+    ParsedAllowlist parsedAllowlist = allowlistCache.getUnchecked(allowlistCompileValue);
+    if (parsedAllowlist.errorMessage() != null) {
+      return AllowlistCheckResult.error(
+          "Allowlist file '%s': %s".formatted(allowlistLabel, parsedAllowlist.errorMessage()));
+    }
+    return parsedAllowlist.allowedEntries().contains(allowlistKey(key.label))
+        ? AllowlistCheckResult.ALLOWLISTED
+        : AllowlistCheckResult.NOT_ALLOWLISTED;
   }
 }

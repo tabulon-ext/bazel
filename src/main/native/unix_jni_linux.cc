@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include <errno.h>
+#include <jni.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -42,31 +44,14 @@ std::string ErrorMessage(int error_number) {
 #endif
 }
 
-int portable_fstatat(
-    int dirfd, char *name, portable_stat_struct *statbuf, int flags) {
-  return fstatat64(dirfd, name, statbuf, flags);
-}
-
-int StatSeconds(const portable_stat_struct &statbuf, StatTimes t) {
+int64_t StatEpochNanoseconds(const portable_stat_struct& statbuf, StatTimes t) {
   switch (t) {
     case STAT_ATIME:
-      return statbuf.st_atim.tv_sec;
+      return statbuf.st_atim.tv_sec * 1000000000L + statbuf.st_atim.tv_nsec;
     case STAT_CTIME:
-      return statbuf.st_ctim.tv_sec;
+      return statbuf.st_ctim.tv_sec * 1000000000L + statbuf.st_ctim.tv_nsec;
     case STAT_MTIME:
-      return statbuf.st_mtim.tv_sec;
-  }
-  return 0;
-}
-
-int StatNanoSeconds(const portable_stat_struct &statbuf, StatTimes t) {
-  switch (t) {
-    case STAT_ATIME:
-      return statbuf.st_atim.tv_nsec;
-    case STAT_CTIME:
-      return statbuf.st_ctim.tv_nsec;
-    case STAT_MTIME:
-      return statbuf.st_mtim.tv_nsec;
+      return statbuf.st_mtim.tv_sec * 1000000000L + statbuf.st_mtim.tv_nsec;
   }
   return 0;
 }
@@ -74,20 +59,17 @@ int StatNanoSeconds(const portable_stat_struct &statbuf, StatTimes t) {
 ssize_t portable_getxattr(const char *path, const char *name, void *value,
                           size_t size, bool *attr_not_found) {
   ssize_t result = ::getxattr(path, name, value, size);
-  *attr_not_found = (errno == ENODATA);
+  *attr_not_found =
+      (errno == ENODATA || errno == ENOTSUP || errno == EOPNOTSUPP);
   return result;
 }
 
 ssize_t portable_lgetxattr(const char *path, const char *name, void *value,
                            size_t size, bool *attr_not_found) {
   ssize_t result = ::lgetxattr(path, name, value, size);
-  *attr_not_found = (errno == ENODATA);
+  *attr_not_found =
+      (errno == ENODATA || errno == ENOTSUP || errno == EOPNOTSUPP);
   return result;
-}
-
-int portable_sysctlbyname(const char *name_chars, void *mibp, size_t *sizep) {
-  errno = ENOSYS;
-  return -1;
 }
 
 int portable_push_disable_sleep() {
@@ -143,6 +125,12 @@ void portable_start_cpu_speed_monitoring() {
 int portable_cpu_speed() {
   // Currently not implemented.
   return -1;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_google_devtools_build_lib_profiler_SystemNetworkStatsServiceImpl_getNetIoCountersNative(
+    JNIEnv* env, jclass clazz, jobject counters_map) {
+  // Currently not implemented.
 }
 
 }  // namespace blaze_jni

@@ -13,12 +13,18 @@
 // limitations under the License.
 package com.google.devtools.build.lib.runtime;
 
+import com.google.common.collect.ImmutableList;
 import com.google.devtools.build.lib.runtime.proto.InvocationPolicyOuterClass.InvocationPolicy;
+import com.google.devtools.build.lib.server.IdleTask;
+import com.google.devtools.build.lib.server.TerminalSizeMonitor;
 import com.google.devtools.build.lib.util.Pair;
+import com.google.devtools.build.lib.util.io.CommandExtensionReporter;
 import com.google.devtools.build.lib.util.io.OutErr;
 import com.google.protobuf.Any;
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 /**
  * Dispatches to the commands; that is, given a command line, this abstraction looks up the
@@ -26,10 +32,10 @@ import java.util.Optional;
  */
 public interface CommandDispatcher {
 
-  /** What to do if the command lock is not available. */
-  enum LockingMode {
-    WAIT, // Wait until it is available
-    ERROR_OUT, // Return with an error
+  /** How much output to emit on the console. */
+  enum UiVerbosity {
+    QUIET, // Only errors
+    NORMAL, // Everything
   }
 
   /**
@@ -41,10 +47,47 @@ public interface CommandDispatcher {
       InvocationPolicy invocationPolicy,
       List<String> args,
       OutErr outErr,
-      LockingMode lockingMode,
+      Duration blockForLockTimeout,
+      UiVerbosity uiVerbosity,
       String clientDescription,
       long firstContactTimeMillis,
       Optional<List<Pair<String, String>>> startupOptionsTaggedWithBazelRc,
-      List<Any> commandExtensions)
+      Supplier<ImmutableList<IdleTask.Result>> idleTaskResultsSupplier,
+      List<Any> commandExtensions,
+      CommandExtensionReporter commandExtensionReporter)
       throws InterruptedException;
+
+  /**
+   * Executes a single command with a monitor carrying terminal size updates from the client.
+   *
+   * <p>The default implementation ignores terminal size updates so tests and embedders that do not
+   * render Bazel's terminal UI do not need to implement this overload.
+   */
+  default BlazeCommandResult exec(
+      InvocationPolicy invocationPolicy,
+      List<String> args,
+      OutErr outErr,
+      Duration blockForLockTimeout,
+      UiVerbosity uiVerbosity,
+      String clientDescription,
+      long firstContactTimeMillis,
+      Optional<List<Pair<String, String>>> startupOptionsTaggedWithBazelRc,
+      Supplier<ImmutableList<IdleTask.Result>> idleTaskResultsSupplier,
+      List<Any> commandExtensions,
+      CommandExtensionReporter commandExtensionReporter,
+      TerminalSizeMonitor terminalSizeMonitor)
+      throws InterruptedException {
+    return exec(
+        invocationPolicy,
+        args,
+        outErr,
+        blockForLockTimeout,
+        uiVerbosity,
+        clientDescription,
+        firstContactTimeMillis,
+        startupOptionsTaggedWithBazelRc,
+        idleTaskResultsSupplier,
+        commandExtensions,
+        commandExtensionReporter);
+  }
 }

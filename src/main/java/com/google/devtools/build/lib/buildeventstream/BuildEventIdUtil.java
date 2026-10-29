@@ -14,10 +14,13 @@
 
 package com.google.devtools.build.lib.buildeventstream;
 
+import com.google.common.collect.Interner;
+import com.google.common.collect.Interners;
 import com.google.devtools.build.lib.buildeventstream.BuildEventStreamProtos.BuildEventId;
 import com.google.devtools.build.lib.buildeventstream.BuildEventStreamProtos.BuildEventId.ActionCompletedId;
 import com.google.devtools.build.lib.buildeventstream.BuildEventStreamProtos.BuildEventId.ConfigurationId;
 import com.google.devtools.build.lib.cmdline.Label;
+import com.google.devtools.build.lib.skyframe.config.BuildConfigurationKey;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import java.util.List;
 import javax.annotation.Nullable;
@@ -33,6 +36,26 @@ import javax.annotation.concurrent.Immutable;
  */
 @Immutable
 public final class BuildEventIdUtil {
+  private static String internLabel(Label label) {
+    return label.toString().intern();
+  }
+
+  private static String internLabel(String label) {
+    return label.intern();
+  }
+
+  private static final Interner<ConfigurationId> CONFIGURATION_ID_INTERNER =
+      Interners.newWeakInterner();
+
+  private static ConfigurationId internConfigurationId(ConfigurationId id) {
+    return CONFIGURATION_ID_INTERNER.intern(id);
+  }
+
+  private static final ConfigurationId NULL_CONFIGURATION_ID_MESSAGE =
+      configurationIdMessage("none");
+  private static final BuildEventId NULL_CONFIGURATION_ID =
+      configurationId(NULL_CONFIGURATION_ID_MESSAGE);
+
   private BuildEventIdUtil() {}
 
   public static BuildEventId unknownBuildEventId(String details) {
@@ -89,19 +112,46 @@ public final class BuildEventIdUtil {
     return BuildEventId.newBuilder().setWorkspace(workspaceConfigId).build();
   }
 
-  static BuildEventId fetchId(String url) {
-    BuildEventId.FetchId fetchId = BuildEventId.FetchId.newBuilder().setUrl(url).build();
+  static BuildEventId fetchId(String url, BuildEventId.FetchId.Downloader downloader) {
+    BuildEventId.FetchId fetchId =
+        BuildEventId.FetchId.newBuilder().setUrl(url).setDownloader(downloader).build();
     return BuildEventId.newBuilder().setFetch(fetchId).build();
   }
 
+  public static BuildEventId configurationId(@Nullable BuildConfigurationKey key) {
+    return configurationId(configurationIdMessage(key));
+  }
+
+  private static BuildEventId configurationId(ConfigurationId id) {
+    return BuildEventId.newBuilder().setConfiguration(id).build();
+  }
+
   public static BuildEventId configurationId(String id) {
-    BuildEventId.ConfigurationId configurationId =
-        BuildEventId.ConfigurationId.newBuilder().setId(id).build();
-    return BuildEventId.newBuilder().setConfiguration(configurationId).build();
+    return configurationId(configurationIdMessage(id));
+  }
+
+  public static ConfigurationId configurationIdMessage(@Nullable BuildConfigurationKey key) {
+    return key == null
+        ? nullConfigurationIdMessage()
+        : configurationIdMessage(key.getOptions().checksum());
+  }
+
+  public static ConfigurationId configurationIdMessage(String checksum) {
+    return internConfigurationId(ConfigurationId.newBuilder().setId(checksum).build());
+  }
+
+  public static BuildEventId execRequestId() {
+    return BuildEventId.newBuilder()
+        .setExecRequest(BuildEventId.ExecRequestId.getDefaultInstance())
+        .build();
   }
 
   public static BuildEventId nullConfigurationId() {
-    return configurationId("none");
+    return NULL_CONFIGURATION_ID;
+  }
+
+  public static ConfigurationId nullConfigurationIdMessage() {
+    return NULL_CONFIGURATION_ID_MESSAGE;
   }
 
   private static BuildEventId targetPatternExpanded(List<String> targetPattern, boolean skipped) {
@@ -126,14 +176,14 @@ public final class BuildEventIdUtil {
 
   public static BuildEventId targetConfigured(Label label) {
     BuildEventId.TargetConfiguredId configuredId =
-        BuildEventId.TargetConfiguredId.newBuilder().setLabel(label.toString()).build();
+        BuildEventId.TargetConfiguredId.newBuilder().setLabel(internLabel(label)).build();
     return BuildEventId.newBuilder().setTargetConfigured(configuredId).build();
   }
 
   public static BuildEventId aspectConfigured(Label label, String aspect) {
     BuildEventId.TargetConfiguredId configuredId =
         BuildEventId.TargetConfiguredId.newBuilder()
-            .setLabel(label.toString())
+            .setLabel(internLabel(label))
             .setAspect(aspect)
             .build();
     return BuildEventId.newBuilder().setTargetConfigured(configuredId).build();
@@ -143,25 +193,25 @@ public final class BuildEventIdUtil {
     BuildEventId.ConfigurationId configId = configuration.getConfiguration();
     BuildEventId.TargetCompletedId targetId =
         BuildEventId.TargetCompletedId.newBuilder()
-            .setLabel(target.toString())
+            .setLabel(internLabel(target))
             .setConfiguration(configId)
             .build();
     return BuildEventId.newBuilder().setTargetCompleted(targetId).build();
   }
 
-  public static BuildEventId configuredLabelId(Label label, BuildEventId configuration) {
-    BuildEventId.ConfigurationId configId = configuration.getConfiguration();
+  public static BuildEventId configuredLabelId(
+      Label label, BuildEventId.ConfigurationId configurationId) {
     BuildEventId.ConfiguredLabelId labelId =
         BuildEventId.ConfiguredLabelId.newBuilder()
-            .setLabel(label.toString())
-            .setConfiguration(configId)
+            .setLabel(internLabel(label))
+            .setConfiguration(configurationId)
             .build();
     return BuildEventId.newBuilder().setConfiguredLabel(labelId).build();
   }
 
   public static BuildEventId unconfiguredLabelId(Label label) {
     BuildEventId.UnconfiguredLabelId labelId =
-        BuildEventId.UnconfiguredLabelId.newBuilder().setLabel(label.toString()).build();
+        BuildEventId.UnconfiguredLabelId.newBuilder().setLabel(internLabel(label)).build();
     return BuildEventId.newBuilder().setUnconfiguredLabel(labelId).build();
   }
 
@@ -170,7 +220,7 @@ public final class BuildEventIdUtil {
     BuildEventId.ConfigurationId configId = configuration.getConfiguration();
     BuildEventId.TargetCompletedId targetId =
         BuildEventId.TargetCompletedId.newBuilder()
-            .setLabel(target.toString())
+            .setLabel(internLabel(target))
             .setConfiguration(configId)
             .setAspect(aspect)
             .build();
@@ -186,10 +236,10 @@ public final class BuildEventIdUtil {
     ActionCompletedId.Builder actionId =
         ActionCompletedId.newBuilder().setPrimaryOutput(path.toString());
     if (label != null) {
-      actionId.setLabel(label.toString());
+      actionId.setLabel(internLabel(label));
     }
     if (configurationChecksum != null) {
-      actionId.setConfiguration(ConfigurationId.newBuilder().setId(configurationChecksum));
+      actionId.setConfiguration(configurationIdMessage(configurationChecksum));
     }
     return BuildEventId.newBuilder().setActionCompleted(actionId).build();
   }
@@ -201,11 +251,11 @@ public final class BuildEventIdUtil {
   }
 
   public static BuildEventId testResult(
-      Label target, Integer run, Integer shard, Integer attempt, BuildEventId configuration) {
+      Label target, int run, int shard, int attempt, BuildEventId configuration) {
     BuildEventId.ConfigurationId configId = configuration.getConfiguration();
     BuildEventId.TestResultId resultId =
         BuildEventId.TestResultId.newBuilder()
-            .setLabel(target.toString())
+            .setLabel(internLabel(target))
             .setConfiguration(configId)
             .setRun(run + 1)
             .setShard(shard + 1)
@@ -215,15 +265,34 @@ public final class BuildEventIdUtil {
   }
 
   public static BuildEventId testResult(
-      Label target, Integer run, Integer shard, BuildEventId configuration) {
+      Label target, int run, int shard, BuildEventId configuration) {
     return testResult(target, run, shard, 1, configuration);
+  }
+
+  public static BuildEventId testProgressId(
+      String label,
+      BuildEventId.ConfigurationId configId,
+      int run,
+      int shard,
+      int attempt,
+      int opaqueCount) {
+    return BuildEventId.newBuilder()
+        .setTestProgress(
+            BuildEventId.TestProgressId.newBuilder()
+                .setLabel(internLabel(label))
+                .setConfiguration(configId)
+                .setRun(run)
+                .setShard(shard)
+                .setAttempt(attempt)
+                .setOpaqueCount(opaqueCount))
+        .build();
   }
 
   public static BuildEventId testSummary(Label target, BuildEventId configuration) {
     BuildEventId.ConfigurationId configId = configuration.getConfiguration();
     BuildEventId.TestSummaryId summaryId =
         BuildEventId.TestSummaryId.newBuilder()
-            .setLabel(target.toString())
+            .setLabel(internLabel(target))
             .setConfiguration(configId)
             .build();
     return BuildEventId.newBuilder().setTestSummary(summaryId).build();
@@ -233,7 +302,7 @@ public final class BuildEventIdUtil {
     BuildEventId.ConfigurationId configId = configuration.getConfiguration();
     BuildEventId.TargetSummaryId summaryId =
         BuildEventId.TargetSummaryId.newBuilder()
-            .setLabel(target.toString())
+            .setLabel(internLabel(target))
             .setConfiguration(configId)
             .build();
     return BuildEventId.newBuilder().setTargetSummary(summaryId).build();
@@ -260,6 +329,12 @@ public final class BuildEventIdUtil {
     return BuildEventId.newBuilder()
         .setConvenienceSymlinksIdentified(
             BuildEventId.ConvenienceSymlinksIdentifiedId.getDefaultInstance())
+        .build();
+  }
+
+  public static BuildEventId skyValueUploadedId(String key) {
+    return BuildEventId.newBuilder()
+        .setSkyvalueUploaded(BuildEventId.SkyValueUploadedId.newBuilder().setKey(key).build())
         .build();
   }
 }

@@ -13,10 +13,17 @@
 // limitations under the License.
 package com.google.devtools.build.lib.util;
 
+import static com.google.common.base.Preconditions.checkArgument;
+
+import com.google.common.base.Ascii;
 import com.google.common.base.Joiner;
+import com.google.common.collect.ImmutableList;
 import com.google.common.escape.CharEscaperBuilder;
 import com.google.common.escape.Escaper;
+import java.text.DecimalFormat;
+import java.text.DecimalFormatSymbols;
 import java.util.Collection;
+import java.util.Locale;
 
 /**
  * Various utility methods operating on strings.
@@ -80,9 +87,11 @@ public class StringUtilities {
     return result.toString();
   }
 
+  // TODO(tjgq): Unify prettyPrintBytes and bytesCountToDisplayString.
+
   /**
-   * Returns an easy-to-read string approximation of a number of bytes,
-   * e.g. "21MB".  Note, these are IEEE units, i.e. decimal not binary powers.
+   * Returns an easy-to-read string approximation of a number of bytes, e.g. "21MB". Note, these are
+   * IEEE units, i.e. decimal not binary powers.
    */
   public static String prettyPrintBytes(long bytes) {
     if (bytes < 1E4) {  // up to 10KB
@@ -96,11 +105,43 @@ public class StringUtilities {
     }
   }
 
+  private static final ImmutableList<String> UNITS = ImmutableList.of("KiB", "MiB", "GiB", "TiB");
+  // Format as single digit decimal number.
+  private static final DecimalFormat BYTE_COUNT_FORMAT =
+      new DecimalFormat("0.0", new DecimalFormatSymbols(Locale.US));
+
+  /**
+   * Converts the number of bytes to a human readable string, e.g. 1024 -> 1 KiB.
+   *
+   * <p>Negative numbers are not allowed.
+   */
+  public static String bytesCountToDisplayString(long bytes) {
+    checkArgument(bytes >= 0);
+
+    if (bytes < 1024) {
+      return bytes + " B";
+    }
+
+    int unitIndex = 0;
+    long value = bytes;
+    while ((unitIndex + 1) < UNITS.size() && value >= (1 << 20)) {
+      value >>= 10;
+      unitIndex++;
+    }
+
+    return String.format("%s %s", BYTE_COUNT_FORMAT.format(value / 1024.0), UNITS.get(unitIndex));
+  }
+
   /**
    * Replace control characters with visible strings.
    * @return the sanitized string.
    */
   public static String sanitizeControlChars(String message) {
     return CONTROL_CHAR_ESCAPER.escape(message);
+  }
+
+  /** Capitalize the first character of a string, assuming ASCII charset. */
+  public static String capitalize(String s) {
+    return Ascii.toUpperCase(s.substring(0, 1)) + s.substring(1);
   }
 }

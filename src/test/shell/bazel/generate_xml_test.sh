@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright 2019 The Bazel Authors. All rights reserved.
 #
@@ -57,6 +57,10 @@ function test_simple_ascii() {
   assert_equals 'Simple ascii' "$(encode "Simple ascii")"
 }
 
+function test_ascii_cdata_escape() {
+  assert_equals 'Simple ascii ]]>]]<![CDATA[>' "$(encode "Simple ascii ]]>")"
+}
+
 function test_low_control_chars() {
   # Need echo to turn \t into a tab.
   assert_equals "$(echo -e '????????\t?')" \
@@ -78,6 +82,25 @@ function test_valid_three_byte_seq() {
 
 function test_invalid_two_byte_seq() {
   assert_equals '??' "$(encode '\xc0\xc0')"
+}
+
+function test_generated_testcase_has_classname() {
+  TEST_BINARY="../some/smoke_test" "$GENERATE_XML" \
+      "$TEST_TMPDIR/missing-test.log" "$TEST_TMPDIR/test.xml" 1 0
+
+  assert_contains '<testcase[^>]* classname=""' \
+      "$TEST_TMPDIR/test.xml"
+}
+
+function test_generated_log_trims_only_trailing_newlines() {
+  printf '\n\nstart\n\nend\n\n' >"$TEST_TMPDIR/test.log"
+  TEST_BINARY="some/test" "$GENERATE_XML" \
+      "$TEST_TMPDIR/test.log" "$TEST_TMPDIR/test.xml" 1 0
+
+  assert_equals \
+      "$(printf '<![CDATA[\n\nstart\n\nend]]>')" \
+      "$(sed -n '/^<!\[CDATA\[/,/^      <\/system-out>/p' \
+          "$TEST_TMPDIR/test.xml" | sed '$d')"
 }
 
 run_suite "generate-xml.sh tests"

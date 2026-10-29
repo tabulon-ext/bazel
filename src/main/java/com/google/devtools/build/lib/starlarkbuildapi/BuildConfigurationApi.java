@@ -19,6 +19,7 @@ import com.google.devtools.build.docgen.annot.DocCategory;
 import net.starlark.java.annot.StarlarkBuiltin;
 import net.starlark.java.annot.StarlarkMethod;
 import net.starlark.java.eval.EvalException;
+import net.starlark.java.eval.StarlarkSet;
 import net.starlark.java.eval.StarlarkThread;
 import net.starlark.java.eval.StarlarkValue;
 
@@ -27,9 +28,9 @@ import net.starlark.java.eval.StarlarkValue;
     name = "configuration",
     category = DocCategory.BUILTIN,
     doc =
-        "This object holds information about the environment in which the build is running. See"
-            + " the <a href='../rules.$DOC_EXT#configurations'>Rules page</a> for more on the"
-            + " general concept of configurations.")
+        "This object holds information about the environment in which the build is running. See the"
+            + " <a href='https://bazel.build/extending/rules#configurations'>Rules page</a> for"
+            + " more on the general concept of configurations.")
 public interface BuildConfigurationApi extends StarlarkValue {
 
   @StarlarkMethod(name = "bin_dir", structField = true, documented = false)
@@ -60,7 +61,7 @@ public interface BuildConfigurationApi extends StarlarkValue {
       structField = true,
       doc =
           "A dictionary containing user-specified test environment variables and their values, as"
-              + " set by the --test_env options. DO NOT USE! This is not the complete"
+              + " set by the <code>--test_env</code> options. DO NOT USE! This is not the complete"
               + " environment!")
   ImmutableMap<String, String> getTestEnv();
 
@@ -71,13 +72,57 @@ public interface BuildConfigurationApi extends StarlarkValue {
           "A boolean that tells whether code coverage is enabled for this run. Note that this does"
               + " not compute whether a specific rule should be instrumented for code coverage data"
               + " collection. For that, see the <a"
-              + " href=\"ctx.html#coverage_instrumented\"><code>ctx.coverage_instrumented</code></a>"
+              + " href=\"../builtins/ctx.html#coverage_instrumented\"><code>ctx.coverage_instrumented</code></a>"
               + " function.")
   boolean isCodeCoverageEnabled();
+
+  @StarlarkMethod(
+      name = "short_id",
+      structField = true,
+      doc =
+          """
+          A short identifier for this configuration understood by the <code>config</code> and \
+          </code>query</code> subcommands. \
+
+          <p>Use this to distinguish different configurations for the same target in a way that \
+          is friendly to humans and tool usage, for example in an aspect used by an IDE. \
+          Keep in mind the following caveats: \
+          <ul> \
+            <li>The value may differ across Bazel versions, including patch releases. \
+            <li>The value encodes the value of <b>every</b> flag, including those that aren't \
+                otherwise relevant for the current target and may thus invalidate caches more \
+                frequently. \
+          </ul>
+          """)
+  String getShortId();
 
   @StarlarkMethod(name = "stamp_binaries", documented = false, useStarlarkThread = true)
   boolean stampBinariesForStarlark(StarlarkThread thread) throws EvalException;
 
-  @StarlarkMethod(name = "is_tool_configuration", documented = false, useStarlarkThread = true)
-  boolean isToolConfigurationForStarlark(StarlarkThread thread) throws EvalException;
+  @StarlarkMethod(
+      name = "is_tool_configuration",
+      doc = "Returns true when building in the tool (exec) configuration.")
+  boolean isToolConfiguration();
+
+  @StarlarkMethod(
+      name = "has_separate_genfiles_directory",
+      documented = false,
+      useStarlarkThread = true)
+  boolean hasSeparateGenfilesDirectoryForStarlark(StarlarkThread thread) throws EvalException;
+
+  /**
+   * @deprecated Always returns false; the sibling repository layout no longer exists.
+   */
+  @Deprecated
+  @StarlarkMethod(
+      name = "is_sibling_repository_layout",
+      documented = false,
+      useStarlarkThread = true)
+  boolean isSiblingRepositoryLayoutForStarlark(StarlarkThread thread) throws EvalException;
+
+  @StarlarkMethod(name = "runfiles_enabled", documented = false, useStarlarkThread = true)
+  boolean runfilesEnabledForStarlark(StarlarkThread thread) throws EvalException;
+
+  @StarlarkMethod(name = "disabled_features", documented = false, useStarlarkThread = true)
+  StarlarkSet<String> getDisabledFeatures(StarlarkThread thread) throws EvalException;
 }

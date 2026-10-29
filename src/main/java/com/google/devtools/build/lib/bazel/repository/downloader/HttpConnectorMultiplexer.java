@@ -14,23 +14,26 @@
 
 package com.google.devtools.build.lib.bazel.repository.downloader;
 
-import com.google.common.base.Function;
-import com.google.common.base.Optional;
+import com.google.auth.Credentials;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Ascii;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.devtools.build.lib.analysis.BlazeVersionInfo;
+import com.google.devtools.build.lib.authandtls.StaticCredentials;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;
 import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.events.EventHandler;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
+import java.net.MalformedURLException;
 import java.net.URI;
-import java.net.URISyntaxException;
-import java.net.URL;
 import java.net.URLConnection;
-import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Class for establishing HTTP connections.
@@ -47,12 +50,12 @@ import java.util.Map;
 @ThreadSafe
 final class HttpConnectorMultiplexer {
 
-  private static final ImmutableMap<String, String> REQUEST_HEADERS =
+  private static final ImmutableMap<String, List<String>> REQUEST_HEADERS =
       ImmutableMap.of(
           "Accept-Encoding",
-          "gzip",
+          ImmutableList.of("gzip"),
           "User-Agent",
-          "Bazel/" + BlazeVersionInfo.instance().getReleaseName());
+          ImmutableList.of("Bazel/" + BlazeVersionInfo.instance().getReleaseName()));
 
   private final EventHandler eventHandler;
   private final HttpConnector connector;
@@ -70,8 +73,8 @@ final class HttpConnectorMultiplexer {
     this.httpStreamFactory = httpStreamFactory;
   }
 
-  public HttpStream connect(URL url, Optional<Checksum> checksum) throws IOException {
-    return connect(url, checksum, ImmutableMap.of(), Optional.absent());
+  public HttpStream connect(URI url, Optional<Checksum> checksum) throws IOException {
+    return connect(url, checksum, ImmutableMap.of(), StaticCredentials.EMPTY, Optional.empty());
   }
 
   /**
@@ -82,60 +85,92 @@ final class HttpConnectorMultiplexer {
    * uncompressed files. It reports download progress. It enforces a SHA-256 checksum which
    * continues to be enforced even after this method returns.
    *
-   * @param url the URL to conenct to. can be: file, http, or https
+   * @param url the URI to connect to. can be: file, http, or https
    * @param checksum checksum lazily checked on entire payload, or empty to disable
-   * @return an {@link InputStream} of response payload
+   * @param credentials the credentials
    * @param type extension, e.g. "tar.gz" to force on downloaded filename, or empty to not do this
+   * @return an {@link InputStream} of response payload
    * @throws IOException if all mirrors are down and contains suppressed exception of each attempt
    * @throws InterruptedIOException if current thread is being cast into oblivion
    * @throws IllegalArgumentException if {@code urls} is empty or has an unsupported protocol
    */
   public HttpStream connect(
-      URL url,
+      URI url,
       Optional<Checksum> checksum,
-      Map<URI, Map<String, String>> authHeaders,
+      Map<String, List<String>> headers,
+      Credentials credentials,
       Optional<String> type)
       throws IOException {
     Preconditions.checkArgument(HttpUtils.isUrlSupportedByDownloader(url));
     if (Thread.interrupted()) {
       throw new InterruptedIOException();
     }
-    Function<URL, ImmutableMap<String, String>> headerFunction =
-        getHeaderFunction(REQUEST_HEADERS, authHeaders);
+    ImmutableMap.Builder<String, List<String>> baseHeaders = new ImmutableMap.Builder<>();
+    baseHeaders.putAll(headers);
+    // REQUEST_HEADERS should not be overridable by user provided headers
+    baseHeaders.putAll(REQUEST_HEADERS);
+
+    HttpConnector.RequestHeadersProvider headerFunction =
+        getHeaderFunction(url, baseHeaders.buildKeepingLast(), credentials);
     URLConnection connection = connector.connect(url, headerFunction);
     return httpStreamFactory.create(
         connection,
         url,
         checksum,
-        (Throwable cause, ImmutableMap<String, String> extraHeaders) -> {
+        (Throwable cause, ImmutableMap<String, List<String>> extraHeaders) -> {
           eventHandler.handle(
               Event.progress(String.format("Lost connection for %s due to %s", url, cause)));
           return connector.connect(
-              connection.getURL(),
+              HttpUtils.toUri(connection),
               newUrl ->
-                  new ImmutableMap.Builder<String, String>()
-                      .putAll(headerFunction.apply(newUrl))
+                  new ImmutableMap.Builder<String, List<String>>()
+                      .putAll(headerFunction.get(newUrl))
                       .putAll(extraHeaders)
                       .buildOrThrow());
         },
         type);
   }
 
-  public static Function<URL, ImmutableMap<String, String>> getHeaderFunction(
-      Map<String, String> baseHeaders, Map<URI, Map<String, String>> additionalHeaders) {
+  @VisibleForTesting
+  static HttpConnector.RequestHeadersProvider getHeaderFunction(
+      URI originalUrl, Map<String, List<String>> baseHeaders, Credentials credentials) {
+    Preconditions.checkNotNull(originalUrl);
+    Preconditions.checkNotNull(baseHeaders);
+    Preconditions.checkNotNull(credentials);
+
     return url -> {
-      ImmutableMap<String, String> headers = ImmutableMap.copyOf(baseHeaders);
-      try {
-        if (additionalHeaders.containsKey(url.toURI())) {
-          Map<String, String> newHeaders = new HashMap<>(headers);
-          newHeaders.putAll(additionalHeaders.get(url.toURI()));
-          headers = ImmutableMap.copyOf(newHeaders);
+      ImmutableMap.Builder<String, List<String>> headers = new ImmutableMap.Builder<>();
+      boolean sameOrigin =
+          Ascii.equalsIgnoreCase(originalUrl.getScheme(), url.getScheme())
+              && Ascii.equalsIgnoreCase(originalUrl.getHost(), url.getHost())
+              && getEffectivePort(originalUrl) == getEffectivePort(url);
+      if (sameOrigin) {
+        headers.putAll(baseHeaders);
+      } else {
+        for (Map.Entry<String, List<String>> entry : baseHeaders.entrySet()) {
+          String key = entry.getKey();
+          if (!Ascii.equalsIgnoreCase(key, "Authorization")
+              && !Ascii.equalsIgnoreCase(key, "Proxy-Authorization")
+              && !Ascii.equalsIgnoreCase(key, "Cookie")
+              && !Ascii.equalsIgnoreCase(key, "Cookie2")) {
+            headers.put(entry);
+          }
         }
-      } catch (URISyntaxException e) {
-        // If we can't convert the URL to a URI (because it is syntactically malformed), still try
-        // to do the connection, not adding authentication information as we cannot look it up.
       }
-      return headers;
+      headers.putAll(credentials.getRequestMetadata(url));
+      return headers.buildKeepingLast();
     };
+  }
+
+  private static int getEffectivePort(URI uri) {
+    int port = uri.getPort();
+    if (port != -1) {
+      return port;
+    }
+    try {
+      return uri.toURL().getDefaultPort();
+    } catch (MalformedURLException | IllegalArgumentException e) {
+      return -1;
+    }
   }
 }

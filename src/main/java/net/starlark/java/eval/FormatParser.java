@@ -46,7 +46,9 @@ final class FormatParser {
    * @param kwargs Named arguments
    * @return The formatted string
    */
-  String format(String input, List<Object> args, Map<String, Object> kwargs) throws EvalException {
+  String format(
+      String input, List<Object> args, Map<String, Object> kwargs, StarlarkSemantics semantics)
+      throws EvalException {
     char[] chars = input.toCharArray();
     StringBuilder output = new StringBuilder();
     History history = new History();
@@ -56,7 +58,7 @@ final class FormatParser {
       int advancePos = 0;
 
       if (current == '{') {
-        advancePos = processOpeningBrace(chars, pos, args, kwargs, history, output);
+        advancePos = processOpeningBrace(chars, pos, args, kwargs, history, output, semantics);
       } else if (current == '}') {
         advancePos = processClosingBrace(chars, pos, output);
       } else {
@@ -88,7 +90,8 @@ final class FormatParser {
       List<Object> args,
       Map<String, Object> kwargs,
       History history,
-      StringBuilder output)
+      StringBuilder output,
+      StarlarkSemantics semantics)
       throws EvalException {
     Printer printer = new Printer(output);
     if (has(chars, pos + 1, '{')) {
@@ -120,7 +123,7 @@ final class FormatParser {
     }
 
     // Format object for output
-    printer.str(value);
+    printer.str(value, semantics);
 
     // Advances the current position to the index of the closing brace of the
     // replacement field. Due to the definition of the enclosing for() loop,
@@ -176,31 +179,20 @@ final class FormatParser {
    * @return Name or index of the current replacement field
    */
   private String getFieldName(char[] chars, int openingBrace) throws EvalException {
-    StringBuilder result = new StringBuilder();
-    boolean foundClosingBrace = false;
-
     for (int pos = openingBrace + 1; pos < chars.length; ++pos) {
       char current = chars[pos];
 
       if (current == '}') {
-        foundClosingBrace = true;
-        break;
-      } else {
-        if (current == '{') {
-          throw Starlark.errorf("Nested replacement fields are not supported");
-        } else if (ILLEGAL_IN_FIELD.contains(current)) {
-          throw Starlark.errorf("Invalid character '%s' inside replacement field", current);
-        }
-
-        result.append(current);
+        int length = pos - openingBrace - 1;
+        return length == 0 ? "" : new String(chars, openingBrace + 1, length);
+      }
+      if (current == '{') {
+        throw Starlark.errorf("Nested replacement fields are not supported");
+      } else if (ILLEGAL_IN_FIELD.contains(current)) {
+        throw Starlark.errorf("Invalid character '%s' inside replacement field", current);
       }
     }
-
-    if (!foundClosingBrace) {
-      throw Starlark.errorf("Found '{' without matching '}'");
-    }
-
-    return result.toString();
+    throw Starlark.errorf("Found '{' without matching '}'");
   }
 
   /**

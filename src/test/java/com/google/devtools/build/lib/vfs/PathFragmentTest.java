@@ -15,24 +15,23 @@ package com.google.devtools.build.lib.vfs;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.devtools.build.lib.util.StringEncoding.unicodeToInternal;
 import static com.google.devtools.build.lib.vfs.PathFragment.EMPTY_FRAGMENT;
+import static com.google.devtools.build.lib.vfs.PathFragment.HIERARCHICAL_COMPARATOR;
 import static com.google.devtools.build.lib.vfs.PathFragment.create;
 import static org.junit.Assert.assertThrows;
 
-import com.google.common.collect.ImmutableClassToInstanceMap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Lists;
 import com.google.common.testing.EqualsTester;
-import com.google.devtools.build.lib.skyframe.serialization.DeserializationContext;
-import com.google.devtools.build.lib.skyframe.serialization.SerializationContext;
+import com.google.devtools.build.lib.skyframe.serialization.testutils.RoundTripping;
 import com.google.devtools.build.lib.skyframe.serialization.testutils.SerializationTester;
-import com.google.devtools.build.lib.skyframe.serialization.testutils.TestUtils;
 import com.google.devtools.build.lib.vfs.inmemoryfs.InMemoryFileSystem;
-import com.google.protobuf.ByteString;
 import com.google.testing.junit.testparameterinjector.TestParameter;
 import com.google.testing.junit.testparameterinjector.TestParameterInjector;
+import com.google.testing.junit.testparameterinjector.TestParameters;
 import java.io.File;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import org.junit.Test;
@@ -150,6 +149,20 @@ public final class PathFragmentTest {
   }
 
   @Test
+  public void getRelative_absolutePathArgument_returnsSameInstance(
+      @TestParameter({"/c/d", "c/d"}) String basePath) {
+    PathFragment absolute = PathFragment.create("/a/b");
+    assertThat(PathFragment.create(basePath).getRelative(absolute)).isSameInstanceAs(absolute);
+  }
+
+  @Test
+  public void getRelative_emptyBasePath_returnsSameInstance(
+      @TestParameter({"/a/b", "a/b"}) String argument) {
+    PathFragment instance = PathFragment.create(argument);
+    assertThat(EMPTY_FRAGMENT.getRelative(instance)).isSameInstanceAs(instance);
+  }
+
+  @Test
   public void testIsNormalizedRelativePath() {
     assertThat(PathFragment.isNormalizedRelativePath("/a")).isFalse();
     assertThat(PathFragment.isNormalizedRelativePath("a///b")).isFalse();
@@ -193,6 +206,9 @@ public final class PathFragmentTest {
   public void testEmptyPathToEmptyPath() {
     assertThat(create("/").getPathString()).isEqualTo("/");
     assertThat(create("").getPathString()).isEqualTo("");
+    assertThat(create(".")).isSameInstanceAs(EMPTY_FRAGMENT);
+    assertThat(create("a/..")).isSameInstanceAs(EMPTY_FRAGMENT);
+    assertThat(create("/").toRelative()).isSameInstanceAs(EMPTY_FRAGMENT);
   }
 
   @Test
@@ -345,28 +361,49 @@ public final class PathFragmentTest {
 
   @Test
   public void testSubFragment() {
-    assertThat(create("/foo/bar/baz").subFragment(0, 3).getPathString()).isEqualTo("/foo/bar/baz");
-    assertThat(create("foo/bar/baz").subFragment(0, 3).getPathString()).isEqualTo("foo/bar/baz");
+    PathFragment absFooBarBaz = create("/foo/bar/baz");
+    PathFragment relFooBarBaz = create("foo/bar/baz");
+    assertThat(absFooBarBaz.subFragment(0, 3)).isSameInstanceAs(absFooBarBaz);
+    assertThat(relFooBarBaz.subFragment(0, 3)).isSameInstanceAs(relFooBarBaz);
+    assertThat(absFooBarBaz.subFragment(0)).isSameInstanceAs(absFooBarBaz);
+    assertThat(relFooBarBaz.subFragment(0)).isSameInstanceAs(relFooBarBaz);
     assertThat(create("/foo/bar/baz").subFragment(0, 2).getPathString()).isEqualTo("/foo/bar");
     assertThat(create("/foo/bar/baz").subFragment(1, 3).getPathString()).isEqualTo("bar/baz");
     assertThat(create("/foo/bar/baz").subFragment(0, 1).getPathString()).isEqualTo("/foo");
     assertThat(create("/foo/bar/baz").subFragment(1, 2).getPathString()).isEqualTo("bar");
     assertThat(create("/foo/bar/baz").subFragment(2, 3).getPathString()).isEqualTo("baz");
     assertThat(create("/foo/bar/baz").subFragment(0, 0).getPathString()).isEqualTo("/");
-    assertThat(create("foo/bar/baz").subFragment(0, 0).getPathString()).isEqualTo("");
-    assertThat(create("foo/bar/baz").subFragment(1, 1).getPathString()).isEqualTo("");
+    assertThat(create("foo/bar/baz").subFragment(0, 0)).isSameInstanceAs(EMPTY_FRAGMENT);
+    assertThat(create("foo/bar/baz").subFragment(1, 1)).isSameInstanceAs(EMPTY_FRAGMENT);
 
-    assertThat(create("/foo/bar/baz").subFragment(0).getPathString()).isEqualTo("/foo/bar/baz");
-    assertThat(create("foo/bar/baz").subFragment(0).getPathString()).isEqualTo("foo/bar/baz");
     assertThat(create("/foo/bar/baz").subFragment(1).getPathString()).isEqualTo("bar/baz");
     assertThat(create("foo/bar/baz").subFragment(1).getPathString()).isEqualTo("bar/baz");
     assertThat(create("foo/bar/baz").subFragment(2).getPathString()).isEqualTo("baz");
-    assertThat(create("foo/bar/baz").subFragment(3).getPathString()).isEqualTo("");
+    assertThat(create("foo/bar/baz").subFragment(3)).isSameInstanceAs(EMPTY_FRAGMENT);
 
     assertThrows(IndexOutOfBoundsException.class, () -> create("foo/bar/baz").subFragment(3, 2));
     assertThrows(IndexOutOfBoundsException.class, () -> create("foo/bar/baz").subFragment(4, 4));
     assertThrows(IndexOutOfBoundsException.class, () -> create("foo/bar/baz").subFragment(3, 2));
     assertThrows(IndexOutOfBoundsException.class, () -> create("foo/bar/baz").subFragment(4));
+  }
+
+  @Test
+  public void testStripComponents() {
+    PathFragment pathFragmentStripZero = create("/foo/bar/baz");
+    assertThat(pathFragmentStripZero.stripComponents(0)).isSameInstanceAs(pathFragmentStripZero);
+
+    assertThat(create("/foo/bar/baz").stripComponents(0).getPathString()).isEqualTo("/foo/bar/baz");
+    assertThat(create("/foo/bar/baz").stripComponents(1).getPathString()).isEqualTo("bar/baz");
+    assertThat(create("/foo/bar/baz").stripComponents(2).getPathString()).isEqualTo("baz");
+    assertThat(create("/foo/bar/baz").stripComponents(3).getPathString()).isEqualTo("");
+    assertThat(create("/foo/bar/baz").stripComponents(4).getPathString()).isEqualTo("");
+
+    PathFragment pathFragmentStripAll = create("/foo/bar/baz");
+    assertThat(pathFragmentStripAll.stripComponents(3)).isSameInstanceAs(EMPTY_FRAGMENT);
+    assertThat(pathFragmentStripAll.stripComponents(4)).isSameInstanceAs(EMPTY_FRAGMENT);
+
+    PathFragment pathFragment = create("/foo/bar/baz");
+    assertThrows(IllegalArgumentException.class, () -> pathFragment.stripComponents(-2));
   }
 
   @Test
@@ -397,6 +434,57 @@ public final class PathFragmentTest {
     // (path, sibling) => false
     assertThat(create("/foo/wiz").startsWith(foobar)).isFalse();
     assertThat(foobar.startsWith(create("/foo/wiz"))).isFalse();
+
+    // (path, different case) => false
+    assertThat(foobar.startsWith(create("/Foo/bar"))).isFalse();
+    assertThat(foobar.startsWith(create("/Foo"))).isFalse();
+    assertThat(create(unicodeToInternal("/ÄÖÜ/bar")).startsWith(create(unicodeToInternal("/äöü"))))
+        .isFalse();
+    assertThat(create(unicodeToInternal("ÄÖÜ/bar")).startsWith(create(unicodeToInternal("äöü"))))
+        .isFalse();
+  }
+
+  @Test
+  public void testStartsWithIgnoringCase() {
+    PathFragment foobar = create("/foo/bar");
+    PathFragment foobarRelative = create("foo/bar");
+
+    // (path, prefix) => true
+    assertThat(foobar.startsWithIgnoringCase(foobar)).isTrue();
+    assertThat(foobar.startsWithIgnoringCase(create("/"))).isTrue();
+    assertThat(foobar.startsWithIgnoringCase(create("/foo"))).isTrue();
+    assertThat(foobar.startsWithIgnoringCase(create("/foo/"))).isTrue();
+    assertThat(foobar.startsWithIgnoringCase(create("/foo/bar/")))
+        .isTrue(); // Includes trailing slash.
+
+    // (prefix, path) => false
+    assertThat(create("/foo").startsWithIgnoringCase(foobar)).isFalse();
+    assertThat(create("/").startsWithIgnoringCase(foobar)).isFalse();
+
+    // (absolute, relative) => false
+    assertThat(foobar.startsWithIgnoringCase(foobarRelative)).isFalse();
+    assertThat(foobarRelative.startsWithIgnoringCase(foobar)).isFalse();
+
+    // (relative path, relative prefix) => true
+    assertThat(foobarRelative.startsWithIgnoringCase(foobarRelative)).isTrue();
+    assertThat(foobarRelative.startsWithIgnoringCase(create("foo"))).isTrue();
+    assertThat(foobarRelative.startsWithIgnoringCase(create(""))).isTrue();
+
+    // (path, sibling) => false
+    assertThat(create("/foo/wiz").startsWithIgnoringCase(foobar)).isFalse();
+    assertThat(foobar.startsWithIgnoringCase(create("/foo/wiz"))).isFalse();
+
+    // (path, different case) => false
+    assertThat(foobar.startsWithIgnoringCase(create("/Foo/bar"))).isTrue();
+    assertThat(foobar.startsWithIgnoringCase(create("/Foo"))).isTrue();
+    assertThat(
+            create(unicodeToInternal("/ÄÖÜ/bar"))
+                .startsWithIgnoringCase(create(unicodeToInternal("/äöü"))))
+        .isTrue();
+    assertThat(
+            create(unicodeToInternal("ÄÖÜ/bar"))
+                .startsWithIgnoringCase(create(unicodeToInternal("äöü"))))
+        .isTrue();
   }
 
   @Test
@@ -470,7 +558,7 @@ public final class PathFragmentTest {
   }
 
   private static List<PathFragment> toPaths(List<String> strs) {
-    List<PathFragment> paths = Lists.newArrayList();
+    List<PathFragment> paths = new ArrayList<>();
     for (String s : strs) {
       paths.add(create(s));
     }
@@ -487,7 +575,7 @@ public final class PathFragmentTest {
 
   @Test
   public void testCompareTo() {
-    List<String> pathStrs =
+    ImmutableList<String> pathStrs =
         ImmutableList.of(
             "",
             "/",
@@ -541,6 +629,109 @@ public final class PathFragmentTest {
   }
 
   @Test
+  @TestParameters("{first: '', second: '', length: 0}")
+  @TestParameters("{first: '', second: 'a/b', length: 0}")
+  @TestParameters("{first: 'a/b', second: 'a/b', length: 3}")
+  @TestParameters("{first: 'a/b', second: 'x/b', length: 0}")
+  @TestParameters("{first: 'a/b', second: 'A/b', length: 0}")
+  @TestParameters("{first: 'a/b', second: 'a/b/c', length: 3}")
+  @TestParameters("{first: 'a/b', second: 'a/bc', length: 3}")
+  @TestParameters("{first: 'foo/bar', second: 'foo/baz', length: 6}")
+  @TestParameters("{first: '/', second: '/foo', length: 1}")
+  @TestParameters("{first: '/foo', second: 'foo', length: 0}")
+  @TestParameters("{first: 'C:/foo', second: 'D:/foo', length: 0}")
+  @TestParameters("{first: 'C:/foo', second: 'C:/far', length: 4}")
+  @TestParameters("{first: 'a/é', second: 'a/ê', length: 3}")
+  @TestParameters("{first: 'a/é', second: 'a/é/b', length: 4}")
+  @TestParameters("{first: 'a/😀', second: 'a/😁', length: 5}")
+  public void testCommonPrefixLength(String first, String second, int length) {
+    PathFragment p1 = create(unicodeToInternal(first));
+    // Ensure equal strings are also compared without taking the identity fast path.
+    PathFragment p2 = create(new String(unicodeToInternal(second).toCharArray()));
+
+    assertThat(p1.getCommonPrefixLength(p2)).isEqualTo(length);
+    assertThat(p2.getCommonPrefixLength(p1)).isEqualTo(length);
+    assertThat(p1.getCommonPrefixLength(p1)).isEqualTo(p1.getPathString().length());
+  }
+
+  @Test
+  public void testCommonPrefixLength_longPrefix(
+      @TestParameter({"7", "8", "9", "15", "16", "31", "32", "63", "64", "65"}) int length) {
+    String prefix = "a".repeat(length);
+
+    assertThat(create(prefix + "b").getCommonPrefixLength(create(prefix + "c"))).isEqualTo(length);
+    assertThat(create(prefix).getCommonPrefixLength(create(prefix + "b"))).isEqualTo(length);
+  }
+
+  @Test
+  public void testHierarchicalComparator() {
+    List<String> pathStrs =
+        ImmutableList.of(
+            "",
+            "/",
+            "foo",
+            "/foo",
+            "foo/bar",
+            "foo.bar",
+            "foo/bar.baz",
+            "foo/bar/baz",
+            "foo/barfile",
+            "foo/Bar",
+            "Foo/bar",
+            unicodeToInternal("foo/é"),
+            unicodeToInternal("foo/é/baz"),
+            unicodeToInternal("foo/é-baz"),
+            unicodeToInternal("foo/ê"),
+            unicodeToInternal("foo/😀"));
+    List<PathFragment> paths = toPaths(pathStrs);
+    // First test that compareTo is self-consistent.
+    for (PathFragment x : paths) {
+      for (PathFragment y : paths) {
+        for (PathFragment z : paths) {
+          // Anti-symmetry
+          assertThat(-1 * Integer.signum(HIERARCHICAL_COMPARATOR.compare(y, x)))
+              .isEqualTo(Integer.signum(HIERARCHICAL_COMPARATOR.compare(x, y)));
+          // Transitivity
+          if (HIERARCHICAL_COMPARATOR.compare(x, y) > 0
+              && HIERARCHICAL_COMPARATOR.compare(y, z) > 0) {
+            assertThat(HIERARCHICAL_COMPARATOR.compare(x, z)).isGreaterThan(0);
+          }
+          // "Substitutability"
+          if (HIERARCHICAL_COMPARATOR.compare(x, y) == 0) {
+            assertThat(Integer.signum(HIERARCHICAL_COMPARATOR.compare(y, z)))
+                .isEqualTo(Integer.signum(HIERARCHICAL_COMPARATOR.compare(x, z)));
+          }
+          // Consistency with equals
+          assertThat(x.equals(y)).isEqualTo(HIERARCHICAL_COMPARATOR.compare(x, y) == 0);
+        }
+      }
+    }
+    // Now test that compareTo does what we expect.  The exact ordering here doesn't matter much.
+    Collections.shuffle(paths);
+    paths.sort(HIERARCHICAL_COMPARATOR);
+    List<PathFragment> expectedOrder =
+        toPaths(
+            ImmutableList.of(
+                "",
+                "/",
+                "/foo",
+                "Foo/bar",
+                "foo",
+                "foo/Bar",
+                "foo/bar",
+                "foo/bar/baz",
+                "foo/bar.baz",
+                "foo/barfile",
+                unicodeToInternal("foo/é"),
+                unicodeToInternal("foo/é/baz"),
+                unicodeToInternal("foo/é-baz"),
+                unicodeToInternal("foo/ê"),
+                unicodeToInternal("foo/😀"),
+                "foo.bar"));
+    assertThat(paths).isEqualTo(expectedOrder);
+  }
+
+  @Test
   public void testGetSafePathString() {
     assertThat(create("/").getSafePathString()).isEqualTo("/");
     assertThat(create("/abc").getSafePathString()).isEqualTo("/abc");
@@ -559,7 +750,7 @@ public final class PathFragmentTest {
     assertThat(create("a/../..")).isEqualTo(create(".."));
     assertThat(create("a/../b")).isEqualTo(create("b"));
     assertThat(create("a/b/../b")).isEqualTo(create("a/b"));
-    assertThat(create("/..")).isEqualTo(create("/.."));
+    assertThat(create("/..")).isEqualTo(create("/"));
     assertThat(create("..")).isEqualTo(create(".."));
   }
 
@@ -608,29 +799,22 @@ public final class PathFragmentTest {
 
   @Test
   public void testSerializationSimple() throws Exception {
-    checkSerialization("a", 6);
+    checkSerialization("a");
   }
 
   @Test
   public void testSerializationAbsolute() throws Exception {
-    checkSerialization("/foo", 9);
-   }
+    checkSerialization("/foo");
+  }
 
   @Test
   public void testSerializationNested() throws Exception {
-    checkSerialization("foo/bar/baz", 16);
+    checkSerialization("foo/bar/baz");
   }
 
-  private static void checkSerialization(String pathFragmentString, int expectedSize)
-      throws Exception {
+  private static void checkSerialization(String pathFragmentString) throws Exception {
     PathFragment a = create(pathFragmentString);
-    ByteString sa =
-        TestUtils.toBytes(new SerializationContext(ImmutableClassToInstanceMap.of()), a);
-    assertThat(sa.size()).isEqualTo(expectedSize);
-
-    PathFragment a2 =
-        (PathFragment)
-            TestUtils.fromBytes(new DeserializationContext(ImmutableClassToInstanceMap.of()), sa);
+    PathFragment a2 = RoundTripping.roundTrip(a);
     assertThat(a2).isEqualTo(a);
   }
 

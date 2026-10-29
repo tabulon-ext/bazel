@@ -24,6 +24,7 @@ import com.google.devtools.common.options.OptionsParsingException;
 import com.google.devtools.common.options.OptionsParsingResult;
 import com.google.devtools.common.options.ParsedOptionDescription;
 import java.util.List;
+import javax.annotation.Nullable;
 
 /** Blaze-specific option utilities. */
 public final class OptionsUtils {
@@ -41,7 +42,14 @@ public final class OptionsUtils {
       if (result.length() != 0) {
         result.append(' ');
       }
-      result.append(option.getCanonicalFormWithValueEscaper(ShellEscaper::escapeString));
+      if (option.isFullyRedactedInLogs()) {
+        result
+            .append("--")
+            .append(option.getOptionDefinition().getOptionName())
+            .append("=<REDACTED>");
+      } else {
+        result.append(option.getCanonicalFormWithValueEscaper(ShellEscaper::escapeString));
+      }
     }
     return result.toString();
   }
@@ -64,7 +72,11 @@ public final class OptionsUtils {
       if (option.isHidden()) {
         continue;
       }
-      builder.add(option.getCanonicalForm());
+      if (option.isFullyRedactedInLogs()) {
+        builder.add("--" + option.getOptionDefinition().getOptionName() + "=<REDACTED>");
+      } else {
+        builder.add(option.getCanonicalForm());
+      }
     }
     return builder.build();
   }
@@ -95,7 +107,7 @@ public final class OptionsUtils {
   }
 
   /** Converter from String to PathFragment. */
-  public static class PathFragmentConverter implements Converter<PathFragment> {
+  public static class PathFragmentConverter extends Converter.Contextless<PathFragment> {
 
     @Override
     public PathFragment convert(String input) {
@@ -108,8 +120,26 @@ public final class OptionsUtils {
     }
   }
 
+  /** Converter from String to PathFragment. If the input is empty returns {@code null} instead. */
+  public static class EmptyToNullPathFragmentConverter extends Converter.Contextless<PathFragment> {
+
+    @Override
+    @Nullable
+    public PathFragment convert(String input) throws OptionsParsingException {
+      if (input.isEmpty()) {
+        return null;
+      }
+      return convertOptionsPathFragment(input);
+    }
+
+    @Override
+    public String getTypeDescription() {
+      return "a path";
+    }
+  }
+
   /** Converter from String to PathFragment requiring the provided path to be absolute. */
-  public static class AbsolutePathFragmentConverter implements Converter<PathFragment> {
+  public static class AbsolutePathFragmentConverter extends Converter.Contextless<PathFragment> {
 
     @Override
     public PathFragment convert(String input) throws OptionsParsingException {
@@ -126,32 +156,35 @@ public final class OptionsUtils {
     }
   }
 
-  /** Converter from String to PathFragment. If the input is empty returns {@code null} instead. */
-  public static class EmptyToNullRelativePathFragmentConverter implements Converter<PathFragment> {
+  /**
+   * Converter from String to PathFragment requiring the provided path to be a relative path without
+   * uplevel references ('..').
+   */
+  public static class WorkspacePathFragmentConverter extends Converter.Contextless<PathFragment> {
 
     @Override
     public PathFragment convert(String input) throws OptionsParsingException {
-      if (input.isEmpty()) {
-        return null;
+      PathFragment parsed = convertOptionsPathFragment(checkNotNull(input));
+      if (parsed.isAbsolute()) {
+        throw new OptionsParsingException(
+            String.format("Expected relative path but got '%s'.", input));
       }
-
-      PathFragment pathFragment = convertOptionsPathFragment(input);
-
-      if (pathFragment.isAbsolute()) {
-        throw new OptionsParsingException("Expected relative path but got '" + input + "'.");
+      if (parsed.containsUplevelReferences()) {
+        throw new OptionsParsingException(
+            String.format("Expected path without uplevel references ('..') but got '%s'.", input));
       }
-
-      return pathFragment;
+      return parsed;
     }
 
     @Override
     public String getTypeDescription() {
-      return "a relative path";
+      return "a workspace-relative path";
     }
   }
 
   /** Converts from a colon-separated list of strings into a list of PathFragment instances. */
-  public static class PathFragmentListConverter implements Converter<ImmutableList<PathFragment>> {
+  public static class PathFragmentListConverter
+      extends Converter.Contextless<ImmutableList<PathFragment>> {
 
     @Override
     public ImmutableList<PathFragment> convert(String input) {

@@ -13,12 +13,16 @@
 // limitations under the License.
 package com.google.devtools.build.lib.skyframe;
 
+import static com.google.common.base.Throwables.throwIfInstanceOf;
+import static com.google.common.base.Throwables.throwIfUnchecked;
+
 import com.google.common.base.Preconditions;
-import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.bugreport.BugReport;
+import com.google.devtools.build.lib.cmdline.IgnoredSubdirectories;
 import com.google.devtools.build.lib.cmdline.Label;
+import com.google.devtools.build.lib.cmdline.PackageIdentifier;
 import com.google.devtools.build.lib.cmdline.QueryExceptionMarkerInterface;
 import com.google.devtools.build.lib.cmdline.ResolvedTargets;
 import com.google.devtools.build.lib.cmdline.SignedTargetPattern;
@@ -38,7 +42,7 @@ import com.google.devtools.build.lib.pkgcache.TargetPatternPreloader;
 import com.google.devtools.build.lib.server.FailureDetails.TargetPatterns;
 import com.google.devtools.build.lib.skyframe.TargetPatternValue.TargetPatternKey;
 import com.google.devtools.build.lib.util.DetailedExitCode;
-import com.google.devtools.build.lib.vfs.PathFragment;
+import com.google.devtools.build.lib.vfs.DetailedIOException;
 import com.google.devtools.build.skyframe.ErrorInfo;
 import com.google.devtools.build.skyframe.EvaluationResult;
 import com.google.devtools.build.skyframe.SkyKey;
@@ -48,6 +52,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 
@@ -62,7 +67,7 @@ public final class SkyframeTargetPatternEvaluator implements TargetPatternPreloa
   @Override
   public Map<String, Collection<Target>> preloadTargetPatterns(
       ExtendedEventHandler eventHandler,
-      PathFragment relativeWorkingDirectory,
+      TargetPattern.Parser mainRepoTargetParser,
       Collection<String> patterns,
       boolean keepGoing)
       throws TargetParsingException, InterruptedException {
@@ -72,7 +77,7 @@ public final class SkyframeTargetPatternEvaluator implements TargetPatternPreloa
     for (String pattern : patterns) {
       Preconditions.checkArgument(!pattern.startsWith("-"));
       PatternLookup patternLookup =
-          createPatternLookup(relativeWorkingDirectory, eventHandler, pattern, keepGoing);
+          createPatternLookup(mainRepoTargetParser, eventHandler, pattern, keepGoing);
       if (patternLookup == null) {
         resultBuilder.put(pattern, ImmutableSet.of());
       } else {
@@ -85,9 +90,10 @@ public final class SkyframeTargetPatternEvaluator implements TargetPatternPreloa
         skyframeExecutor.targetPatterns(
             allKeys, SkyframeExecutor.DEFAULT_THREAD_COUNT, keepGoing, eventHandler);
     Exception catastrophe = result.getCatastrophe();
-    Throwables.propagateIfPossible(catastrophe, TargetParsingException.class);
     if (catastrophe != null) {
-      throw wrapException(catastrophe, null, result);
+      throwIfInstanceOf(catastrophe, TargetParsingException.class);
+      throwIfUnchecked(catastrophe);
+      throw wrapException(catastrophe, result);
     }
     WalkableGraph walkableGraph = Preconditions.checkNotNull(result.getWalkableGraph(), result);
     for (PatternLookup patternLookup : patternLookups) {
@@ -125,10 +131,10 @@ public final class SkyframeTargetPatternEvaluator implements TargetPatternPreloa
           // exception if there is a bug in error handling.
           Exception exception = error.getException();
           errorMessage = exception.getMessage();
-          if (exception instanceof TargetParsingException) {
-            targetParsingException = (TargetParsingException) exception;
+          if (exception instanceof TargetParsingException tpe) {
+            targetParsingException = tpe;
           } else {
-            targetParsingException = wrapException(exception, key, key);
+            targetParsingException = wrapException(exception, key);
           }
         } else {
           Preconditions.checkState(
@@ -157,18 +163,18 @@ public final class SkyframeTargetPatternEvaluator implements TargetPatternPreloa
     return resultBuilder.buildOrThrow();
   }
 
-  private static TargetParsingException wrapException(
-      Exception exception, @Nullable SkyKey key, Object debugging) {
-    if ((key == null || (key instanceof PackageValue.Key))
-        && (exception instanceof NoSuchPackageException)) {
-      // A "simple" target pattern (like "//pkg:t") doesn't have a TargetPatternKey, just a Package
-      // key, so it results in NoSuchPackageException that we transform here.
+  private static TargetParsingException wrapException(Exception exception, Object debugging) {
+    if (exception instanceof NoSuchPackageException noSuchPackageException) {
+      // Transform NoSuchPackageException into TargetParsingException to avoid triggering
+      // non-fatal bug reports on user errors (e.g. broken BUILD files).
       return new TargetParsingException(
-          exception.getMessage(),
-          exception,
-          ((NoSuchPackageException) exception).getDetailedExitCode());
+          exception.getMessage(), exception, noSuchPackageException.getDetailedExitCode());
     }
-    BugReport.sendBugReport(
+    if (exception instanceof DetailedIOException detailedException) {
+      return new TargetParsingException(
+          detailedException.getMessage(), exception, detailedException.getDetailedExitCode());
+    }
+    BugReport.sendNonFatalBugReport(
         new IllegalStateException("Unexpected exception: " + debugging, exception));
     String message = "Target parsing failed due to unexpected exception: " + exception.getMessage();
     DetailedExitCode detailedExitCode = DetailedException.getDetailedExitCode(exception);
@@ -177,8 +183,9 @@ public final class SkyframeTargetPatternEvaluator implements TargetPatternPreloa
         : new TargetParsingException(message, exception, TargetPatterns.Code.CANNOT_PRELOAD_TARGET);
   }
 
-  private PatternLookup createPatternLookup(
-      PathFragment offset,
+  @Nullable
+  private static PatternLookup createPatternLookup(
+      TargetPattern.Parser mainRepoTargetParser,
       ExtendedEventHandler eventHandler,
       String targetPattern,
       boolean keepGoing)
@@ -186,7 +193,7 @@ public final class SkyframeTargetPatternEvaluator implements TargetPatternPreloa
     try {
       TargetPatternKey key =
           TargetPatternValue.key(
-              SignedTargetPattern.parse(targetPattern, TargetPattern.mainRepoParser(offset)),
+              SignedTargetPattern.parse(targetPattern, mainRepoTargetParser),
               FilteringPolicies.NO_FILTER);
       return isSimple(key.getParsedPattern())
           ? new SimpleLookup(targetPattern, key)
@@ -268,11 +275,10 @@ public final class SkyframeTargetPatternEvaluator implements TargetPatternPreloa
     private final TargetPattern targetPattern;
 
     private SimpleLookup(String pattern, TargetPatternKey key) {
-      this(
-          pattern, PackageValue.key(key.getParsedPattern().getDirectory()), key.getParsedPattern());
+      this(pattern, key.getParsedPattern().getDirectory(), key.getParsedPattern());
     }
 
-    private SimpleLookup(String pattern, PackageValue.Key key, TargetPattern targetPattern) {
+    private SimpleLookup(String pattern, PackageIdentifier key, TargetPattern targetPattern) {
       super(pattern, key);
       this.targetPattern = targetPattern;
     }
@@ -292,13 +298,14 @@ public final class SkyframeTargetPatternEvaluator implements TargetPatternPreloa
               eventHandler,
               FilteringPolicies.NO_FILTER,
               /* packageSemaphore= */ null,
+              /* maxConcurrentGetTargetsTasks= */ Optional.empty(),
               SimplePackageIdentifierBatchingCallback::new);
       AtomicReference<Collection<Target>> result = new AtomicReference<>();
       try {
         targetPattern.eval(
             resolver,
-            /*ignoredSubdirectories=*/ ImmutableSet::of,
-            /*excludedSubdirectories=*/ ImmutableSet.of(),
+            /* ignoredSubdirectories= */ () -> IgnoredSubdirectories.EMPTY,
+            /* excludedSubdirectories= */ ImmutableSet.of(),
             partialResult ->
                 result.set(
                     partialResult instanceof Collection

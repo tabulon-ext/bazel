@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright 2017 The Bazel Authors. All rights reserved.
 #
@@ -45,28 +45,6 @@ fi
 
 source "$(rlocation "io_bazel/src/test/shell/integration_test_setup.sh")" \
   || { echo "integration_test_setup.sh not found!" >&2; exit 1; }
-
-# `uname` returns the current platform, e.g "MSYS_NT-10.0" or "Linux".
-# `tr` converts all upper case letters to lower case.
-# `case` matches the result if the `uname | tr` expression to string prefixes
-# that use the same wildcards as names do in Bash, i.e. "msys*" matches strings
-# starting with "msys", and "*" matches everything (it's the default case).
-case "$(uname -s | tr [:upper:] [:lower:])" in
-msys*)
-  # As of 2018-08-14, Bazel on Windows only supports MSYS Bash.
-  declare -r is_windows=true
-  ;;
-*)
-  declare -r is_windows=false
-  ;;
-esac
-
-if "$is_windows"; then
-  # Disable MSYS path conversion that converts path-looking command arguments to
-  # Windows paths (even if they arguments are not in fact paths).
-  export MSYS_NO_PATHCONV=1
-  export MSYS2_ARG_CONV_EXCL="*"
-fi
 
 # Text that will be appended to every print() output when the flag is enabled.
 MARKER="<== Starlark flag test ==>"
@@ -257,5 +235,61 @@ EOF
       || fail "Build should have succeeded at depth limit 4000"
 }
 
+
+function test_require_mnemonic() {
+  local -r pkg=$FUNCNAME
+  mkdir -p $pkg
+  cat > $pkg/BUILD <<EOF
+load(":starlark.bzl", "no_mnemonic_rule", "with_mnemonic_rule")
+
+no_mnemonic_rule(
+    name = "no_mnemonic",
+    out = "no_mnemonic.txt"
+)
+
+with_mnemonic_rule(
+    name = "with_mnemonic",
+    out = "with_mnemonic.txt"
+)
+EOF
+
+  cat >$pkg/starlark.bzl <<'EOF'
+def _no_mnemonic_impl(ctx):
+  ctx.actions.run_shell(outputs = [ctx.outputs.out],
+                        command = "touch " + ctx.outputs.out.path)
+  return [DefaultInfo(files = depset([ctx.outputs.out]))]
+
+no_mnemonic_rule = rule(
+    implementation=_no_mnemonic_impl,
+    attrs = {
+        "out": attr.output(mandatory = True),
+    },
+)
+
+def _with_mnemonic_impl(ctx):
+  ctx.actions.run_shell(outputs = [ctx.outputs.out],
+                        command = "touch " + ctx.outputs.out.path,
+                        mnemonic = "MyMnemonic")
+  return [DefaultInfo(files = depset([ctx.outputs.out]))]
+
+with_mnemonic_rule = rule(
+    implementation=_with_mnemonic_impl,
+    attrs = {
+        "out": attr.output(mandatory = True),
+    },
+)
+EOF
+
+  # 1. By default (flag is false), both should succeed.
+  bazel build //$pkg:with_mnemonic &> $TEST_log || fail "should have succeeded"
+  bazel build //$pkg:no_mnemonic &> $TEST_log || fail "should have succeeded"
+
+  # 2. When flag is true, with_mnemonic succeeds, no_mnemonic fails.
+  bazel build --incompatible_require_mnemonic_for_run_actions=true //$pkg:with_mnemonic &> $TEST_log || fail "should have succeeded"
+
+  bazel build --incompatible_require_mnemonic_for_run_actions=true //$pkg:no_mnemonic &> $TEST_log \
+      && fail "should have failed without explicit mnemonic"
+  expect_log "actions.run and actions.run_shell require an explicit mnemonic"
+}
 
 run_suite "starlark_flag_test"

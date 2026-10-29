@@ -13,23 +13,30 @@
 // limitations under the License.
 package com.google.devtools.build.lib.remote;
 
-import static com.google.common.base.Throwables.throwIfInstanceOf;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 
+import build.bazel.remote.execution.v2.ServerCapabilities;
+import com.google.common.base.Throwables;
 import com.google.common.util.concurrent.ListenableFuture;
-import com.google.devtools.build.lib.remote.grpc.ChannelConnectionFactory;
-import com.google.devtools.build.lib.remote.grpc.ChannelConnectionFactory.ChannelConnection;
+import com.google.common.util.concurrent.SettableFuture;
+import com.google.devtools.build.lib.profiler.Profiler;
+import com.google.devtools.build.lib.remote.ChannelConnectionWithServerCapabilitiesFactory.ChannelConnectionWithServerCapabilities;
 import com.google.devtools.build.lib.remote.grpc.DynamicConnectionPool;
 import com.google.devtools.build.lib.remote.grpc.SharedConnectionFactory.SharedConnection;
 import com.google.devtools.build.lib.remote.util.RxFutures;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import io.grpc.Channel;
 import io.netty.util.AbstractReferenceCounted;
 import io.netty.util.ReferenceCounted;
 import io.reactivex.rxjava3.annotations.CheckReturnValue;
 import io.reactivex.rxjava3.core.Single;
+import io.reactivex.rxjava3.core.SingleObserver;
 import io.reactivex.rxjava3.core.SingleSource;
+import io.reactivex.rxjava3.disposables.Disposable;
 import io.reactivex.rxjava3.functions.Function;
 import java.io.IOException;
+import java.util.concurrent.ExecutionException;
+import javax.annotation.Nullable;
 
 /**
  * A wrapper around a {@link DynamicConnectionPool} exposing {@link Channel} and a reference count.
@@ -57,43 +64,138 @@ public class ReferenceCountedChannel implements ReferenceCounted {
         }
       };
 
-  public ReferenceCountedChannel(ChannelConnectionFactory connectionFactory) {
-    this(connectionFactory, /*maxConnections=*/ 0);
+  public ReferenceCountedChannel(ChannelConnectionWithServerCapabilitiesFactory connectionFactory) {
+    this(connectionFactory, /* maxConnections= */ 0);
   }
 
-  public ReferenceCountedChannel(ChannelConnectionFactory connectionFactory, int maxConnections) {
+  public ReferenceCountedChannel(
+      ChannelConnectionWithServerCapabilitiesFactory connectionFactory, int maxConnections) {
     this.dynamicConnectionPool =
         new DynamicConnectionPool(
             connectionFactory, connectionFactory.maxConcurrency(), maxConnections);
+  }
+
+  /**
+   * Lazily caches the server capabilities retrieved on first access.
+   *
+   * <p>Acquiring a connection from {@link DynamicConnectionPool} to query capabilities on every
+   * {@link #getServerCapabilities()} call causes connection pool exhaustion and contention when
+   * multiple concurrent Skyframe action threads evaluate cache eligibility (e.g. via {@code
+   * CombinedCache.remoteActionCacheSupportsUpdate()}).
+   */
+  @Nullable private volatile ServerCapabilities cachedServerCapabilities;
+
+  /**
+   * Returns the {@link ServerCapabilities} of the remote server.
+   *
+   * <p>Uses double-checked locking to lazily fetch and memoize the capabilities from the underlying
+   * connection pool at most once per channel lifetime, ensuring subsequent calls across threads are
+   * non-blocking volatile reads.
+   */
+  public ServerCapabilities getServerCapabilities() throws IOException {
+    ServerCapabilities caps = cachedServerCapabilities;
+    if (caps == null) {
+      synchronized (this) {
+        caps = cachedServerCapabilities;
+        if (caps == null) {
+          try (var s = Profiler.instance().profile("getServerCapabilities")) {
+            caps =
+                blockingGet(
+                    withChannelConnection(
+                        ChannelConnectionWithServerCapabilities::getServerCapabilities));
+            cachedServerCapabilities = caps;
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException(e);
+          }
+        }
+      }
+    }
+    return caps;
+  }
+
+  public ListenableFuture<ServerCapabilities> serverCapabilities() {
+    return RxFutures.toListenableFuture(
+        withChannelConnection(ChannelConnectionWithServerCapabilities::getServerCapabilities));
   }
 
   public boolean isShutdown() {
     return dynamicConnectionPool.isClosed();
   }
 
+  /**
+   * A specialized {@link Function} that can only throw {@link IOException} and {@link
+   * InterruptedException}.
+   */
+  @FunctionalInterface
+  public interface IOFunction<T, R> extends Function<T, R> {
+    @Override
+    R apply(T t) throws IOException, InterruptedException;
+  }
+
   @CheckReturnValue
   public <T> ListenableFuture<T> withChannelFuture(
-      Function<Channel, ? extends ListenableFuture<T>> source) {
+      IOFunction<Channel, ? extends ListenableFuture<T>> source) {
     return RxFutures.toListenableFuture(
         withChannel(channel -> RxFutures.toSingle(() -> source.apply(channel), directExecutor())));
   }
 
-  public <T> T withChannelBlocking(Function<Channel, T> source)
+  public <T> T withChannelBlocking(IOFunction<Channel, T> source)
       throws IOException, InterruptedException {
+    return blockingGet(withChannel(channel -> Single.just(source.apply(channel))));
+  }
+
+  // prevents rxjava silent possible wrap of RuntimeException and misinterpretation
+  private <T> T blockingGet(Single<T> single) throws IOException, InterruptedException {
+    SettableFuture<T> future = SettableFuture.create();
+    single.subscribe(
+        new SingleObserver<T>() {
+          @Override
+          public void onError(Throwable t) {
+            future.setException(t);
+          }
+
+          @Override
+          public void onSuccess(T t) {
+            future.set(t);
+          }
+
+          @Override
+          public void onSubscribe(Disposable d) {
+            future.addListener(
+                () -> {
+                  if (future.isCancelled()) {
+                    d.dispose();
+                  }
+                },
+                directExecutor());
+          }
+        });
+
     try {
-      return withChannel(channel -> Single.just(source.apply(channel))).blockingGet();
-    } catch (RuntimeException e) {
-      Throwable cause = e.getCause();
-      if (cause != null) {
-        throwIfInstanceOf(cause, IOException.class);
-        throwIfInstanceOf(cause, InterruptedException.class);
-      }
+      return future.get();
+    } catch (InterruptedException e) {
+      // Dispose of the queued subscription, which would otherwise run its callback on the thread
+      // that returns the next permit.
+      future.cancel(/* mayInterruptIfRunning= */ false);
       throw e;
+    } catch (ExecutionException e) {
+      Throwable cause = e.getCause();
+      Throwables.throwIfInstanceOf(cause, IOException.class);
+      Throwables.throwIfInstanceOf(cause, InterruptedException.class);
+      Throwables.throwIfUnchecked(cause);
+      throw new IllegalStateException("Unexpected exception type", cause);
     }
   }
 
   @CheckReturnValue
   public <T> Single<T> withChannel(Function<Channel, ? extends SingleSource<? extends T>> source) {
+    return withChannelConnection(channelConnection -> source.apply(channelConnection.getChannel()));
+  }
+
+  private <T> Single<T> withChannelConnection(
+      Function<ChannelConnectionWithServerCapabilities, ? extends SingleSource<? extends T>>
+          source) {
     return dynamicConnectionPool
         .create()
         .flatMap(
@@ -101,10 +203,10 @@ public class ReferenceCountedChannel implements ReferenceCounted {
                 Single.using(
                     () -> sharedConnection,
                     conn -> {
-                      ChannelConnection connection =
-                          (ChannelConnection) sharedConnection.getUnderlyingConnection();
-                      Channel channel = connection.getChannel();
-                      return source.apply(channel);
+                      var connection =
+                          (ChannelConnectionWithServerCapabilities)
+                              sharedConnection.getUnderlyingConnection();
+                      return source.apply(connection);
                     },
                     SharedConnection::close));
   }
@@ -114,24 +216,28 @@ public class ReferenceCountedChannel implements ReferenceCounted {
     return referenceCounted.refCnt();
   }
 
+  @CanIgnoreReturnValue
   @Override
   public ReferenceCountedChannel retain() {
     referenceCounted.retain();
     return this;
   }
 
+  @CanIgnoreReturnValue
   @Override
   public ReferenceCountedChannel retain(int increment) {
     referenceCounted.retain(increment);
     return this;
   }
 
+  @CanIgnoreReturnValue
   @Override
   public ReferenceCounted touch() {
     referenceCounted.touch();
     return this;
   }
 
+  @CanIgnoreReturnValue
   @Override
   public ReferenceCounted touch(Object hint) {
     referenceCounted.touch(hint);

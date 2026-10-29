@@ -1,11 +1,14 @@
 load("@rules_java//java:defs.bzl", "java_library")
 
-package(default_visibility = ["//src:__subpackages__"])
+package(
+    default_applicable_licenses = ["//:license"],
+    default_visibility = ["//src/main/java/com/google/devtools/build/lib:build_lib"],
+)
 
 filegroup(
     name = "srcs",
     srcs = glob(["**"]),
-    visibility = ["//src:__subpackages__"],
+    visibility = ["//src/main/java/com/google/devtools/build/lib/server:__pkg__"],
 )
 
 java_library(
@@ -13,7 +16,5 @@ java_library(
     srcs = [
         "InterruptSignalHandler.java",
     ],
-    deps = [
-        "//third_party:guava",
-    ],
+    deps = ["//third_party/java/guava:base"],
 )

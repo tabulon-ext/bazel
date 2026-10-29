@@ -18,7 +18,7 @@ import com.google.testing.junit.runner.util.TestIntegration;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import javax.annotation.Nullable;
+import org.jspecify.annotations.Nullable;
 
 /** Result of executing a test suite or test case. */
 public final class TestResult {
@@ -82,7 +82,7 @@ public final class TestResult {
   private final String className;
   private final Map<String, String> properties;
   private final List<Throwable> failures;
-  @Nullable private final TestInterval runTime;
+  private final @Nullable TestInterval runTime;
   private final Set<TestIntegration> integrations;
   private final Status status;
   private final int numTests;
@@ -122,8 +122,7 @@ public final class TestResult {
     return integrations;
   }
 
-  @Nullable
-  public TestInterval getRunTimeInterval() {
+  public @Nullable TestInterval getRunTimeInterval() {
     return runTime;
   }
 
@@ -159,7 +158,7 @@ public final class TestResult {
     private String className = null;
     private Map<String, String> properties = null;
     private List<Throwable> failures = null;
-    @Nullable private TestInterval runTime = null;
+    private @Nullable TestInterval runTime = null;
     private Set<TestIntegration> integrations = null;
     private Status status = null;
     private Integer numTests = null;
@@ -168,31 +167,37 @@ public final class TestResult {
 
     public Builder() {}
 
+    @CanIgnoreReturnValue
     public Builder name(String name) {
       this.name = checkNullToNotNull(this.name, name, "name");
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder className(String className) {
       this.className = checkNullToNotNull(this.className, className, "className");
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder properties(Map<String, String> properties) {
       this.properties = checkNullToNotNull(this.properties, properties, "properties");
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder integrations(Set<TestIntegration> integrations) {
       this.integrations = checkNullToNotNull(this.integrations, integrations, "integrations");
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder failures(List<Throwable> failures) {
       this.failures = checkNullToNotNull(this.failures, failures, "failures");
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder runTimeInterval(@Nullable TestInterval runTime) {
       if (this.runTime != null) {
         throw new IllegalStateException("runTime already set");
@@ -201,21 +206,25 @@ public final class TestResult {
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder status(Status status) {
       this.status = checkNullToNotNull(this.status, status, "status");
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder numTests(int numTests) {
       this.numTests = checkNullToNotNull(this.numTests, numTests, "numTests");
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder numFailures(int numFailures) {
       this.numFailures = checkNullToNotNull(this.numFailures, numFailures, "numFailures");
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder childResults(List<TestResult> childResults) {
       this.childResults = checkNullToNotNull(this.childResults, childResults, "childResults");
       return this;

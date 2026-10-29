@@ -65,20 +65,11 @@ public abstract class SkyframeIntegrationTestBase extends BuildIntegrationTestCa
   protected void assertCharContentsIgnoringOrderAndWhitespace(
       String expectedCharContents, String target) throws Exception {
     Path path = Iterables.getOnlyElement(getArtifacts(target)).getPath();
-    char[] actualChars = FileSystemUtils.readContentAsLatin1(path);
+    char[] actualChars = FileSystemUtils.readContentAsLatin1(path).toCharArray();
     char[] expectedChars = expectedCharContents.toCharArray();
     Arrays.sort(actualChars);
     Arrays.sort(expectedChars);
     assertThat(new String(actualChars).trim()).isEqualTo(new String(expectedChars).trim());
-  }
-
-  protected void assertContents(String expectedContents, String target) throws Exception {
-    assertContents(expectedContents, Iterables.getOnlyElement(getArtifacts(target)).getPath());
-  }
-
-  protected void assertContents(String expectedContents, Path path) throws Exception {
-    String actualContents = new String(FileSystemUtils.readContentAsLatin1(path));
-    assertThat(actualContents.trim()).isEqualTo(expectedContents);
   }
 
   protected ImmutableList<String> getOnlyOutputContentAsLines(String target) throws Exception {

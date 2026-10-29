@@ -15,81 +15,89 @@
 
 #include <assert.h>
 
+#include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "src/main/cpp/blaze_util.h"
 #include "src/main/cpp/blaze_util_platform.h"
+#include "src/main/cpp/jvm_module_options.h"
 #include "src/main/cpp/util/errors.h"
 #include "src/main/cpp/util/exit_code.h"
 #include "src/main/cpp/util/file.h"
+#include "src/main/cpp/util/file_platform.h"
 #include "src/main/cpp/util/logging.h"
 #include "src/main/cpp/util/numbers.h"
-#include "src/main/cpp/util/path.h"
 #include "src/main/cpp/util/path_platform.h"
 #include "src/main/cpp/util/strings.h"
-#include "src/main/cpp/workspace_layout.h"
+#include "absl/time/time.h"
 
 namespace blaze {
 
 using std::string;
 using std::vector;
 
-void StartupOptions::RegisterNullaryStartupFlag(const std::string &flag_name,
-                                                bool *flag_value) {
+void StartupOptions::RegisterNullaryStartupFlag(const std::string& flag_name,
+                                                bool* flag_value) {
   all_nullary_startup_flags_[std::string("--") + flag_name] = flag_value;
   all_nullary_startup_flags_[std::string("--no") + flag_name] = flag_value;
 }
 
 void StartupOptions::RegisterNullaryStartupFlagNoRc(
-    const std::string &flag_name, bool *flag_value) {
+    const std::string& flag_name, bool* flag_value) {
   RegisterNullaryStartupFlag(flag_name, flag_value);
   no_rc_nullary_startup_flags_.insert(std::string("--") + flag_name);
   no_rc_nullary_startup_flags_.insert(std::string("--no") + flag_name);
 }
 
 void StartupOptions::RegisterSpecialNullaryStartupFlag(
-    const std::string &flag_name, SpecialNullaryFlagHandler handler) {
+    const std::string& flag_name, SpecialNullaryFlagHandler handler) {
   RegisterNullaryStartupFlag(flag_name, nullptr);
   special_nullary_startup_flags_[std::string("--") + flag_name] = handler;
   special_nullary_startup_flags_[std::string("--no") + flag_name] = handler;
 }
 
-void StartupOptions::RegisterUnaryStartupFlag(const std::string &flag_name) {
+void StartupOptions::RegisterUnaryStartupFlag(const std::string& flag_name) {
   valid_unary_startup_flags_.insert(std::string("--") + flag_name);
 }
 
-void StartupOptions::OverrideOptionSourcesKey(const std::string &flag_name,
-                                              const std::string &new_name) {
+void StartupOptions::OverrideOptionSourcesKey(const std::string& flag_name,
+                                              const std::string& new_name) {
   option_sources_key_override_[flag_name] = new_name;
 }
 
-StartupOptions::StartupOptions(const string &product_name,
-                               const WorkspaceLayout *workspace_layout)
+StartupOptions::StartupOptions(const string& product_name,
+                               bool lock_install_base)
     : product_name(product_name),
+      lock_install_base(lock_install_base),
       ignore_all_rc_files(false),
-      block_for_lock(true),
+      block_for_lock_timeout(absl::InfiniteDuration()),
       host_jvm_debug(false),
       autodetect_server_javabase(true),
       batch(false),
       batch_cpu_scheduling(false),
       io_nice_level(-1),
       shutdown_on_low_sys_mem(false),
+      delete_output_base_on_shutdown(false),
       oom_more_eagerly(false),
       oom_more_eagerly_threshold(100),
       write_command_log(true),
-      watchfs(false),
       fatal_event_bus_exceptions(false),
       command_port(0),
       connect_timeout_secs(30),
       local_startup_timeout_secs(120),
       have_invocation_policy_(false),
+      quiet(false),
       client_debug(false),
       preemptible(false),
       java_logging_formatter(
           "com.google.devtools.build.lib.util.SingleLineFormatter"),
-      expand_configs_in_place(true),
       digest_function(),
       idle_server_tasks(true),
       original_startup_options_(std::vector<RcStartupFlag>()),
@@ -97,21 +105,13 @@ StartupOptions::StartupOptions(const string &product_name,
       macos_qos_class(QOS_CLASS_UNSPECIFIED),
 #endif
       unlimit_coredumps(false),
-      windows_enable_symlinks(false) {
-  if (blaze::IsRunningWithinTest()) {
-    output_root = blaze_util::MakeAbsolute(blaze::GetPathEnv("TEST_TMPDIR"));
-    max_idle_secs = 15;
-    BAZEL_LOG(USER) << "$TEST_TMPDIR defined: output root default is '"
-                    << output_root << "' and max_idle_secs default is '"
-                    << max_idle_secs << "'.";
-  } else {
-    output_root = workspace_layout->GetOutputRoot();
-    max_idle_secs = 3 * 3600;
-    BAZEL_LOG(INFO) << "output root is '" << output_root
-                    << "' and max_idle_secs default is '" << max_idle_secs
-                    << "'.";
-  }
-
+#ifdef __linux__
+      cgroup_parent(),
+      run_in_user_cgroup(false),
+#endif
+      windows_enable_symlinks(false),
+      remote_repo_contents_cache(false),
+      use_compact_object_headers_(false) {
 #if defined(_WIN32) || defined(__CYGWIN__)
   string windows_unix_root = DetectBashAndExportBazelSh();
   if (!windows_unix_root.empty()) {
@@ -120,20 +120,22 @@ StartupOptions::StartupOptions(const string &product_name,
   }
 #endif  // defined(_WIN32) || defined(__CYGWIN__)
 
-  const string product_name_lower = GetLowercaseProductName();
-  output_user_root = blaze_util::JoinPath(
-      output_root, "_" + product_name_lower + "_" + GetUserName());
+  // Use a smaller default idle timer when in a test.
+  max_idle_secs = blaze::IsRunningWithinTest() ? 15 : 3 * 3600;
 
   // IMPORTANT: Before modifying the statements below please contact a Bazel
   // core team member that knows the internal procedure for adding/deprecating
   // startup flags.
   RegisterNullaryStartupFlag("batch", &batch);
   RegisterNullaryStartupFlag("batch_cpu_scheduling", &batch_cpu_scheduling);
-  RegisterNullaryStartupFlag("block_for_lock", &block_for_lock);
+  RegisterSpecialNullaryStartupFlag("block_for_lock", [this](bool enabled) {
+    this->block_for_lock_timeout =
+        enabled ? absl::InfiniteDuration() : absl::ZeroDuration();
+  });
+  RegisterUnaryStartupFlag("block_for_lock");
+  RegisterNullaryStartupFlag("quiet", &quiet);
   RegisterNullaryStartupFlag("client_debug", &client_debug);
   RegisterNullaryStartupFlag("preemptible", &preemptible);
-  RegisterNullaryStartupFlag("expand_configs_in_place",
-                             &expand_configs_in_place);
   RegisterNullaryStartupFlag("fatal_event_bus_exceptions",
                              &fatal_event_bus_exceptions);
   RegisterNullaryStartupFlag("host_jvm_debug", &host_jvm_debug);
@@ -142,12 +144,21 @@ StartupOptions::StartupOptions(const string &product_name,
   RegisterNullaryStartupFlag("idle_server_tasks", &idle_server_tasks);
   RegisterNullaryStartupFlag("shutdown_on_low_sys_mem",
                              &shutdown_on_low_sys_mem);
+  RegisterNullaryStartupFlag("delete_output_base_on_shutdown",
+                             &delete_output_base_on_shutdown);
   RegisterNullaryStartupFlagNoRc("ignore_all_rc_files", &ignore_all_rc_files);
   RegisterNullaryStartupFlag("unlimit_coredumps", &unlimit_coredumps);
-  RegisterNullaryStartupFlag("watchfs", &watchfs);
   RegisterNullaryStartupFlag("write_command_log", &write_command_log);
   RegisterNullaryStartupFlag("windows_enable_symlinks",
                              &windows_enable_symlinks);
+  RegisterNullaryStartupFlag("experimental_remote_repo_contents_cache",
+                             &remote_repo_contents_cache);
+  RegisterNullaryStartupFlag("experimental_use_compact_object_headers",
+                             &use_compact_object_headers_);
+#ifdef __linux__
+  RegisterNullaryStartupFlag("experimental_run_in_user_cgroup",
+                             &run_in_user_cgroup);
+#endif
   RegisterUnaryStartupFlag("command_port");
   RegisterUnaryStartupFlag("connect_timeout_secs");
   RegisterUnaryStartupFlag("local_startup_timeout_secs");
@@ -165,19 +176,22 @@ StartupOptions::StartupOptions(const string &product_name,
   RegisterUnaryStartupFlag("output_user_root");
   RegisterUnaryStartupFlag("server_jvm_out");
   RegisterUnaryStartupFlag("failure_detail_out");
+  RegisterUnaryStartupFlag("experimental_cgroup_parent");
+  RegisterUnaryStartupFlag("extra_classpath");
 }
 
 StartupOptions::~StartupOptions() {}
 
 string StartupOptions::GetLowercaseProductName() const {
-  string lowercase_product_name = product_name;
-  blaze_util::ToLower(&lowercase_product_name);
-  return lowercase_product_name;
+  return blaze_util::ToLower(product_name);
 }
 
-bool StartupOptions::IsUnary(const string &arg) const {
+bool StartupOptions::IsUnary(const string& arg) const {
   std::string::size_type i = arg.find_first_of('=');
   if (i == std::string::npos) {
+    if (arg == "--block_for_lock") {
+      return false;
+    }
     return valid_unary_startup_flags_.find(arg) !=
            valid_unary_startup_flags_.end();
   } else {
@@ -186,8 +200,8 @@ bool StartupOptions::IsUnary(const string &arg) const {
   }
 }
 
-bool StartupOptions::MaybeCheckValidNullary(const string &arg, bool *result,
-                                            std::string *error) const {
+bool StartupOptions::MaybeCheckValidNullary(const string& arg, bool* result,
+                                            std::string* error) const {
   std::string::size_type i = arg.find_first_of('=');
   if (i == std::string::npos) {
     *result = all_nullary_startup_flags_.find(arg) !=
@@ -195,6 +209,10 @@ bool StartupOptions::MaybeCheckValidNullary(const string &arg, bool *result,
     return true;
   }
   std::string f = arg.substr(0, i);
+  if (f == "--block_for_lock") {
+    *result = false;
+    return true;
+  }
   if (all_nullary_startup_flags_.find(f) == all_nullary_startup_flags_.end()) {
     *result = false;
     return true;
@@ -206,17 +224,48 @@ bool StartupOptions::MaybeCheckValidNullary(const string &arg, bool *result,
   return false;
 }
 
-void StartupOptions::AddExtraOptions(vector<string> *result) const {}
+static bool ParseBlockForLock(const string& value,
+                              absl::Duration* block_for_lock_timeout,
+                              string* error) {
+  if (value == "true") {
+    *block_for_lock_timeout = absl::InfiniteDuration();
+    return true;
+  }
+  if (value == "false") {
+    *block_for_lock_timeout = absl::ZeroDuration();
+    return true;
+  }
+  absl::Duration duration;
+  if (value.empty() || isdigit(value.back()) ||
+      !absl::ParseDuration(value, &duration) ||
+      duration < absl::ZeroDuration() ||
+      (duration > absl::ZeroDuration() && duration < absl::Milliseconds(1)) ||
+      duration == absl::InfiniteDuration()) {
+    blaze_util::StringPrintf(
+        error,
+        "Invalid argument to --block_for_lock: '%s'. "
+        "Expected boolean or duration (e.g. 'true', 'false', '30s', '1m').",
+        value.c_str());
+    return false;
+  }
+  *block_for_lock_timeout =
+      absl::Milliseconds(absl::ToInt64Milliseconds(duration));
+  return true;
+}
 
-blaze_exit_code::ExitCode StartupOptions::ProcessArg(
-      const string &argstr, const string &next_argstr, const string &rcfile,
-      bool *is_space_separated, string *error) {
+void StartupOptions::AddExtraOptions(vector<string>* result) const {}
+
+blaze_exit_code::ExitCode StartupOptions::ProcessArg(const string& argstr,
+                                                     const string& next_argstr,
+                                                     const string& rcfile,
+                                                     bool* is_space_separated,
+                                                     string* error) {
   // We have to parse a specific option syntax, so GNU getopts won't do.  All
   // options begin with "--" or "-". Values are given together with the option
   // delimited by '=' or in the next option.
   const char* arg = argstr.c_str();
-  const char *next_arg = next_argstr.empty() ? nullptr : next_argstr.c_str();
-  const char *value = nullptr;
+  const char* next_arg = next_argstr.empty() ? nullptr : next_argstr.c_str();
+  const char* value = nullptr;
 
   bool is_nullary;
   if (!MaybeCheckValidNullary(argstr, &is_nullary, error)) {
@@ -258,16 +307,23 @@ blaze_exit_code::ExitCode StartupOptions::ProcessArg(
     return blaze_exit_code::SUCCESS;
   }
 
-  if ((value = GetUnaryOption(arg, next_arg, "--output_base")) != nullptr) {
+  if ((value = blaze_util::var_strprefix(arg, "--block_for_lock=")) !=
+      nullptr) {
+    if (!ParseBlockForLock(value, &block_for_lock_timeout, error)) {
+      return blaze_exit_code::BAD_ARGV;
+    }
+    option_sources["block_for_lock"] = rcfile;
+  } else if ((value = GetUnaryOption(arg, next_arg, "--output_base")) !=
+             nullptr) {
     output_base = blaze_util::Path(blaze::AbsolutePathFromFlag(value));
     option_sources["output_base"] = rcfile;
   } else if ((value = GetUnaryOption(arg, next_arg, "--install_base")) !=
              nullptr) {
-    install_base = blaze::AbsolutePathFromFlag(value);
+    install_base = blaze_util::Path(blaze::AbsolutePathFromFlag(value));
     option_sources["install_base"] = rcfile;
   } else if ((value = GetUnaryOption(arg, next_arg, "--output_user_root")) !=
              nullptr) {
-    output_user_root = blaze::AbsolutePathFromFlag(value);
+    output_user_root = blaze_util::Path(blaze::AbsolutePathFromFlag(value));
     option_sources["output_user_root"] = rcfile;
   } else if ((value = GetUnaryOption(arg, next_arg, "--server_jvm_out")) !=
              nullptr) {
@@ -277,10 +333,6 @@ blaze_exit_code::ExitCode StartupOptions::ProcessArg(
              nullptr) {
     failure_detail_out = blaze_util::Path(blaze::AbsolutePathFromFlag(value));
     option_sources["failure_detail_out"] = rcfile;
-  } else if ((value = GetUnaryOption(arg, next_arg, "--host_jvm_profile")) !=
-             nullptr) {
-    host_jvm_profile = value;
-    option_sources["host_jvm_profile"] = rcfile;
   } else if ((value = GetUnaryOption(arg, next_arg, "--server_javabase")) !=
              nullptr) {
     // TODO(bazel-team): Consider examining the javabase and re-execing in case
@@ -292,11 +344,14 @@ blaze_exit_code::ExitCode StartupOptions::ProcessArg(
              nullptr) {
     host_jvm_args.push_back(value);
     option_sources["host_jvm_args"] = rcfile;  // NB: This is incorrect
+  } else if ((value = GetUnaryOption(arg, next_arg, "--extra_classpath"))) {
+    extra_classpath = value;
+    option_sources["extra_classpath"] = rcfile;
   } else if ((value = GetUnaryOption(arg, next_arg, "--io_nice_level")) !=
              nullptr) {
-    if (!blaze_util::safe_strto32(value, &io_nice_level) ||
-        io_nice_level > 7) {
-      blaze_util::StringPrintf(error,
+    if (!blaze_util::safe_strto32(value, &io_nice_level) || io_nice_level > 7) {
+      blaze_util::StringPrintf(
+          error,
           "Invalid argument to --io_nice_level: '%s'. Must not exceed 7.",
           value);
       return blaze_exit_code::BAD_ARGV;
@@ -304,10 +359,9 @@ blaze_exit_code::ExitCode StartupOptions::ProcessArg(
     option_sources["io_nice_level"] = rcfile;
   } else if ((value = GetUnaryOption(arg, next_arg, "--max_idle_secs")) !=
              nullptr) {
-    if (!blaze_util::safe_strto32(value, &max_idle_secs) ||
-        max_idle_secs < 0) {
-      blaze_util::StringPrintf(error,
-          "Invalid argument to --max_idle_secs: '%s'.", value);
+    if (!blaze_util::safe_strto32(value, &max_idle_secs) || max_idle_secs < 0) {
+      blaze_util::StringPrintf(
+          error, "Invalid argument to --max_idle_secs: '%s'.", value);
       return blaze_exit_code::BAD_ARGV;
     }
     option_sources["max_idle_secs"] = rcfile;
@@ -317,7 +371,11 @@ blaze_exit_code::ExitCode StartupOptions::ProcessArg(
     // macOS-specific to ensure that rc files mentioning it are valid.
     // There is also apparently "QOS_CLASS_MAINTENANCE", but this doesn't
     // appear to have been exposed in the public headers as of macOS 11.1.
-    if (strcmp(value, "utility") == 0) {
+    if (strcmp(value, "default") == 0) {
+#if defined(__APPLE__)
+      macos_qos_class = QOS_CLASS_UNSPECIFIED;
+#endif
+    } else if (strcmp(value, "utility") == 0) {
 #if defined(__APPLE__)
       macos_qos_class = QOS_CLASS_UTILITY;
 #endif
@@ -366,12 +424,12 @@ blaze_exit_code::ExitCode StartupOptions::ProcessArg(
     option_sources["unix_digest_hash_attribute_name"] = rcfile;
   } else if ((value = GetUnaryOption(arg, next_arg, "--command_port")) !=
              nullptr) {
-    if (!blaze_util::safe_strto32(value, &command_port) ||
-        command_port < 0 || command_port > 65535) {
+    if (!blaze_util::safe_strto32(value, &command_port) || command_port < 0 ||
+        command_port > 65535) {
       blaze_util::StringPrintf(error,
-          "Invalid argument to --command_port: '%s'.\n"
-          "Must be a valid port number or 0.\n",
-          value);
+                               "Invalid argument to --command_port: '%s'.\n"
+                               "Must be a valid port number or 0.\n",
+                               value);
       return blaze_exit_code::BAD_ARGV;
     }
     option_sources["command_port"] = rcfile;
@@ -382,10 +440,17 @@ blaze_exit_code::ExitCode StartupOptions::ProcessArg(
       invocation_policy = value;
       option_sources["invocation_policy"] = rcfile;
     } else {
-      *error = "The startup flag --invocation_policy cannot be specified "
+      *error =
+          "The startup flag --invocation_policy cannot be specified "
           "multiple times.";
       return blaze_exit_code::BAD_ARGV;
     }
+  } else if ((value = GetUnaryOption(
+                  arg, next_arg, "--experimental_cgroup_parent")) != nullptr) {
+#ifdef __linux__
+    cgroup_parent = value;
+    option_sources["cgroup_parent"] = rcfile;
+#endif
   } else {
     bool extra_argument_processed;
     blaze_exit_code::ExitCode process_extra_arg_exit_code = ProcessArgExtra(
@@ -408,8 +473,7 @@ blaze_exit_code::ExitCode StartupOptions::ProcessArg(
 }
 
 blaze_exit_code::ExitCode StartupOptions::ProcessArgs(
-    const std::vector<RcStartupFlag>& rcstartup_flags,
-    std::string *error) {
+    const std::vector<RcStartupFlag>& rcstartup_flags, std::string* error) {
   std::vector<RcStartupFlag>::size_type i = 0;
   while (i < rcstartup_flags.size()) {
     bool is_space_separated = false;
@@ -446,8 +510,8 @@ blaze_util::Path StartupOptions::GetSystemJavabase() const {
 }
 
 blaze_util::Path StartupOptions::GetEmbeddedJavabase() const {
-  blaze_util::Path bundled_jre_path = blaze_util::Path(
-      blaze_util::JoinPath(install_base, "embedded_tools/jdk"));
+  blaze_util::Path bundled_jre_path =
+      install_base.GetRelative("embedded_tools").GetRelative("jdk");
   if (blaze_util::CanExecuteFile(
           bundled_jre_path.GetRelative(GetJavaBinaryUnderJavabase()))) {
     return bundled_jre_path;
@@ -478,7 +542,7 @@ StartupOptions::GetServerJavabaseAndType() const {
       if (system_javabase.IsEmpty()) {
         BAZEL_DIE(blaze_exit_code::LOCAL_ENVIRONMENTAL_ERROR)
             << "Could not find system javabase. Ensure JAVA_HOME is set, or "
-               "javac is on your PATH.";
+               "java is on your PATH.";
       }
       default_server_javabase_ = std::pair<blaze_util::Path, JavabaseType>(
           system_javabase, JavabaseType::SYSTEM);
@@ -509,7 +573,7 @@ blaze_util::Path StartupOptions::GetJvm() const {
 // code for a server javabase which failed sanity checks.
 static blaze_exit_code::ExitCode BadServerJavabaseError(
     StartupOptions::JavabaseType javabase_type,
-    const std::map<string, string> &option_sources) {
+    const std::map<string, string>& option_sources) {
   switch (javabase_type) {
     case StartupOptions::JavabaseType::EXPLICIT: {
       auto source = option_sources.find("server_javabase");
@@ -536,7 +600,7 @@ static blaze_exit_code::ExitCode BadServerJavabaseError(
 }
 
 blaze_exit_code::ExitCode StartupOptions::SanityCheckJavabase(
-    const blaze_util::Path &javabase,
+    const blaze_util::Path& javabase,
     StartupOptions::JavabaseType javabase_type) const {
   blaze_util::Path java_program =
       javabase.GetRelative(GetJavaBinaryUnderJavabase());
@@ -545,9 +609,9 @@ blaze_exit_code::ExitCode StartupOptions::SanityCheckJavabase(
       BAZEL_LOG(ERROR) << "Couldn't find java at '"
                        << java_program.AsPrintablePath() << "'.";
     } else {
-      string err = blaze_util::GetLastErrorString();
       BAZEL_LOG(ERROR) << "Java at '" << java_program.AsPrintablePath()
-                       << "' exists but is not executable: " << err;
+                       << "' exists but is not executable: "
+                       << blaze_util::GetLastErrorString();
     }
     return BadServerJavabaseError(javabase_type, option_sources);
   }
@@ -566,24 +630,37 @@ blaze_exit_code::ExitCode StartupOptions::SanityCheckJavabase(
   return BadServerJavabaseError(javabase_type, option_sources);
 }
 
-blaze_util::Path StartupOptions::GetExe(const blaze_util::Path &jvm,
-                                        const string &jar_path) const {
+blaze_util::Path StartupOptions::GetExe(const blaze_util::Path& jvm,
+                                        const string& jar_path) const {
   return jvm;
 }
 
-void StartupOptions::AddJVMArgumentPrefix(const blaze_util::Path &javabase,
-                                          std::vector<string> *result) const {}
+void StartupOptions::AddJVMArgumentPrefix(const blaze_util::Path& javabase,
+                                          std::vector<string>* result) const {}
 
 void StartupOptions::AddJVMArgumentSuffix(
-    const blaze_util::Path &real_install_dir, const string &jar_path,
-    std::vector<string> *result) const {
-  result->push_back("-jar");
-  result->push_back(real_install_dir.GetRelative(jar_path).AsJvmArgument());
+    const blaze_util::Path& real_install_dir, const string& jar_path,
+    std::vector<string>* result) const {
+  if (extra_classpath.empty()) {
+    result->push_back("-jar");
+    result->push_back(real_install_dir.GetRelative(jar_path).AsJvmArgument());
+  } else {
+    string classpath = real_install_dir.GetRelative(jar_path).AsJvmArgument() +
+                       kListSeparator + extra_classpath;
+    // Since we're not executing the server jar directly, we must manually set
+    // module opening directives on the command line.
+    for (const auto& option : getJvmModuleOptions()) {
+      result->push_back(option);
+    }
+    result->push_back("-cp");
+    result->push_back(classpath);
+    result->push_back("com.google.devtools.build.lib.bazel.Bazel");
+  }
 }
 
 blaze_exit_code::ExitCode StartupOptions::AddJVMArguments(
-    const blaze_util::Path &server_javabase, std::vector<string> *result,
-    const vector<string> &user_options, string *error) const {
+    const blaze_util::Path& server_javabase, std::vector<string>* result,
+    const vector<string>& user_options, string* error) const {
   AddJVMLoggingArguments(result);
 
   // Disable the JVM's own unlimiting of file descriptors.  We do this
@@ -596,26 +673,55 @@ blaze_exit_code::ExitCode StartupOptions::AddJVMArguments(
   // ourselves to).
   result->push_back("-XX:-MaxFDLimit");
 
+  result->push_back(
+      "-XX:OnOutOfMemoryError=touch " +
+      GetOOMFilePath(blaze_util::Path(output_base)).AsJvmArgument());
+
+  bool use_compact_headers = use_compact_object_headers_;
+  if (use_compact_headers) {
+    // If it is true, but it was NOT explicitly set by the user (i.e. it's the
+    // default), only enable it if we are using the embedded JDK to avoid
+    // crashes on older system JDKs.
+    if (option_sources.find("experimental_use_compact_object_headers") ==
+        option_sources.end()) {
+      auto javabase_and_type = GetServerJavabaseAndType();
+      if (javabase_and_type.second != JavabaseType::EMBEDDED) {
+        use_compact_headers = false;
+      }
+    }
+  }
+
+  if (use_compact_headers) {
+    result->push_back("-XX:+UnlockExperimentalVMOptions");
+    result->push_back("-XX:+UseCompactObjectHeaders");
+  } else if (option_sources.find("experimental_use_compact_object_headers") !=
+             option_sources.end()) {
+    // JDK 27 enables compact object headers by default, so an explicit opt-out
+    // must also be passed to the JVM.
+    result->push_back("-XX:-UseCompactObjectHeaders");
+  }
+
   return AddJVMMemoryArguments(server_javabase, result, user_options, error);
 }
 
 static std::string GetSimpleLogHandlerProps(
-    const blaze_util::Path &java_log,
-    const std::string &java_logging_formatter) {
+    const blaze_util::Path& java_log,
+    const std::string& java_logging_formatter) {
   return "handlers=com.google.devtools.build.lib.util.SimpleLogHandler\n"
          ".level=INFO\n"
          "com.google.devtools.build.lib.util.SimpleLogHandler.level=INFO\n"
          "com.google.devtools.build.lib.util.SimpleLogHandler.prefix=" +
          java_log.AsJvmArgument() +
          "\n"
-         "com.google.devtools.build.lib.util.SimpleLogHandler.limit=1024000\n"
-         "com.google.devtools.build.lib.util.SimpleLogHandler.total_limit="
-         "20971520\n"  // 20 MB.
+         "com.google.devtools.build.lib.util."
+         "SimpleLogHandler.rotate_limit_bytes=5242880\n"
+         "com.google.devtools.build.lib.util."
+         "SimpleLogHandler.total_limit_bytes=20971520\n"
          "com.google.devtools.build.lib.util.SimpleLogHandler.formatter=" +
          java_logging_formatter + "\n";
 }
 
-void StartupOptions::AddJVMLoggingArguments(std::vector<string> *result) const {
+void StartupOptions::AddJVMLoggingArguments(std::vector<string>* result) const {
   // Configure logging
   const blaze_util::Path propFile =
       output_base.GetRelative("javalog.properties");
@@ -636,9 +742,51 @@ void StartupOptions::AddJVMLoggingArguments(std::vector<string> *result) const {
 }
 
 blaze_exit_code::ExitCode StartupOptions::AddJVMMemoryArguments(
-    const blaze_util::Path &, std::vector<string> *, const vector<string> &,
-    string *) const {
+    const blaze_util::Path&, std::vector<string>*, const vector<string>&,
+    string*) const {
   return blaze_exit_code::SUCCESS;
+}
+
+void StartupOptions::UpdateConfiguration(const string& install_md5,
+                                         const string& workspace,
+                                         const bool server_mode) {
+  if (output_user_root.IsEmpty()) {
+    // The default production output_user_root is
+    // <default_output_root>/_<product_name>_<username>.
+    // In a test, use a subdirectory of TEST_TMPDIR to be hermetic.
+    blaze_util::Path output_root =
+        blaze::IsRunningWithinTest()
+            ? blaze_util::Path(blaze::GetPathEnv("TEST_TMPDIR"))
+            : GetDefaultOutputRoot();
+
+    output_user_root = output_root.GetRelative("_" + GetLowercaseProductName() +
+                                               "_" + GetUserName());
+  }
+
+  if (install_base.IsEmpty()) {
+    // The default install_base is <output_user_root>/install/<md5(blaze)>.
+    // However, exec-server requires it to be explicitly set.
+    if (server_mode) {
+      BAZEL_DIE(blaze_exit_code::BAD_ARGV)
+          << "exec-server requires --install_base";
+    }
+    install_base =
+        output_user_root.GetRelative("install").GetRelative(install_md5);
+  }
+
+  if (output_base.IsEmpty()) {
+    // The default output_base is <output_user_root>/<md5(workspace)>.
+    // However, exec-server requires it to be explicitly set.
+    if (server_mode) {
+      BAZEL_DIE(blaze_exit_code::BAD_ARGV)
+          << "exec-server requires --output_base";
+    }
+    output_base = blaze::GetHashedBaseDir(output_user_root, workspace);
+  }
+
+  if (failure_detail_out.IsEmpty()) {
+    failure_detail_out = output_base.GetRelative("failure_detail.rawproto");
+  }
 }
 
 }  // namespace blaze

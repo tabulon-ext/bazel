@@ -19,7 +19,8 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.analysis.TransitiveInfoProvider;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.Immutable;
-import com.google.devtools.build.lib.skyframe.serialization.autocodec.AutoCodec.VisibleForSerialization;
+import com.google.devtools.build.lib.skyframe.serialization.VisibleForSerialization;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.util.Objects;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -60,6 +61,18 @@ public final class RequiredProviders {
   @Override
   public String toString() {
     return getDescription();
+  }
+
+  /**
+   * Returns the list of sets of acceptable Starlark providers for a restricted constraint, or an
+   * empty list for an "any" or "none" constraint.
+   *
+   * <p>This method is intended for documentation generation. Do not use it for evaluating whether
+   * provider constraints are satisfied: it does not distinguish between {@code acceptsAny} and
+   * {@code acceptsNone}, and it does not export built-in TransitiveInfoProvider constraints.
+   */
+  public ImmutableList<ImmutableSet<StarlarkProviderIdentifier>> getStarlarkProviders() {
+    return starlarkProviders;
   }
 
   /** Represents one of the constraints as desctibed in {@link RequiredProviders} */
@@ -266,9 +279,14 @@ public final class RequiredProviders {
     return builder.build();
   }
 
-  /** Returns true if this {@code RequiredProviders} instance accept any set of providers. */
+  /** Returns true if this {@code RequiredProviders} instance accepts any set of providers. */
   public boolean acceptsAny() {
     return constraint.equals(Constraint.ANY);
+  }
+
+  /** Returns true if this {@code RequiredProviders} instance never accepts a set of providers. */
+  public boolean acceptsNone() {
+    return constraint.equals(Constraint.NONE);
   }
 
   @VisibleForSerialization
@@ -361,6 +379,7 @@ public final class RequiredProviders {
      * <p>If all of these providers are present in the dependency, the dependency satisfies {@link
      * RequiredProviders}.
      */
+    @CanIgnoreReturnValue
     public Builder addStarlarkSet(ImmutableSet<StarlarkProviderIdentifier> starlarkProviderSet) {
       constraint = Constraint.RESTRICTED;
       Preconditions.checkState(!starlarkProviderSet.isEmpty());
@@ -374,6 +393,7 @@ public final class RequiredProviders {
      * <p>If all of these providers are present in the dependency, the dependency satisfies {@link
      * RequiredProviders}.
      */
+    @CanIgnoreReturnValue
     public Builder addBuiltinSet(
         ImmutableSet<Class<? extends TransitiveInfoProvider>> builtinProviderSet) {
       constraint = Constraint.RESTRICTED;

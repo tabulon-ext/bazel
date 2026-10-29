@@ -14,11 +14,14 @@
 
 package com.google.devtools.build.lib.bazel.repository;
 
+import static com.google.common.base.StandardSystemProperty.USER_HOME;
 import static com.google.common.truth.Truth.assertThat;
 
+import com.google.devtools.build.lib.bazel.repository.RepositoryOptions.ModuleInjectionConverter;
+import com.google.devtools.build.lib.bazel.repository.RepositoryOptions.ModuleNameAndPath;
+import com.google.devtools.build.lib.bazel.repository.RepositoryOptions.ModuleOverrideConverter;
 import com.google.devtools.build.lib.bazel.repository.RepositoryOptions.RepositoryOverride;
 import com.google.devtools.build.lib.bazel.repository.RepositoryOptions.RepositoryOverrideConverter;
-import com.google.devtools.build.lib.cmdline.RepositoryName;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.common.options.OptionsParsingException;
 import org.junit.Rule;
@@ -41,17 +44,40 @@ public class RepositoryOptionsTest {
   @Test
   public void testOverrideConverter() throws Exception {
     RepositoryOverride actual = converter.convert("foo=/bar");
-    assertThat(actual.repositoryName())
-        .isEqualTo(RepositoryName.createFromValidStrippedName("foo"));
-    assertThat(actual.path()).isEqualTo(PathFragment.create("/bar"));
+    assertThat(actual.repositoryName()).isEqualTo("foo");
+    assertThat(PathFragment.create(actual.path())).isEqualTo(PathFragment.create("/bar"));
   }
 
   @Test
   public void testOverridePathWithEqualsSign() throws Exception {
     RepositoryOverride actual = converter.convert("foo=/bar=/baz");
-    assertThat(actual.repositoryName())
-        .isEqualTo(RepositoryName.createFromValidStrippedName("foo"));
-    assertThat(actual.path()).isEqualTo(PathFragment.create("/bar=/baz"));
+    assertThat(actual.repositoryName()).isEqualTo("foo");
+    assertThat(PathFragment.create(actual.path())).isEqualTo(PathFragment.create("/bar=/baz"));
+  }
+
+  @Test
+  public void testOverridePathWithTilde() throws Exception {
+    RepositoryOverride actual = converter.convert("foo=~/bar");
+    assertThat(actual.repositoryName()).isEqualTo("foo");
+    assertThat(PathFragment.create(actual.path()))
+        .isEqualTo(PathFragment.create(USER_HOME.value() + "/bar"));
+  }
+
+  @Test
+  public void testModuleOverridePathWithTilde() throws Exception {
+    var converter = new ModuleOverrideConverter();
+    ModuleNameAndPath actual = converter.convert("foo=~/bar");
+    assertThat(PathFragment.create(actual.path()))
+        .isEqualTo(PathFragment.create(USER_HOME.value() + "/bar"));
+  }
+
+  @Test
+  public void testModuleOverrideRelativePath() throws Exception {
+    var converter = new ModuleOverrideConverter();
+    ModuleNameAndPath actual = converter.convert("foo=%workspace%/bar");
+    assertThat(actual.path()).isEqualTo("%workspace%/bar");
+    actual = converter.convert("foo=../../bar");
+    assertThat(actual.path()).isEqualTo("../../bar");
   }
 
   @Test
@@ -70,9 +96,25 @@ public class RepositoryOptionsTest {
   }
 
   @Test
-  public void testInvalidPathOverride() throws Exception {
-    expectedException.expect(OptionsParsingException.class);
-    expectedException.expectMessage("Repository override directory must be an absolute path");
-    converter.convert("foo=bar");
+  public void testModuleInjectionConverter() throws Exception {
+    var converter = new ModuleInjectionConverter();
+    ModuleNameAndPath actual = converter.convert("foo=%workspace%/bar");
+    assertThat(actual.moduleName()).isEqualTo("foo");
+    assertThat(actual.path()).isEqualTo("%workspace%/bar");
   }
+
+  @Test
+  public void testInvalidModuleInjection() throws Exception {
+    expectedException.expect(OptionsParsingException.class);
+    expectedException.expectMessage("Module injections must be of the form 'module-name=path'");
+    new ModuleInjectionConverter().convert("foo");
+  }
+
+  @Test
+  public void testInvalidModuleOverride() throws Exception {
+    expectedException.expect(OptionsParsingException.class);
+    expectedException.expectMessage("Module overrides must be of the form 'module-name=path'");
+    new ModuleOverrideConverter().convert("foo");
+  }
+
 }

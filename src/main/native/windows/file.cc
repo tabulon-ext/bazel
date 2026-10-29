@@ -18,11 +18,13 @@
 
 #include "src/main/native/windows/file.h"
 
-#include <WinIoCtl.h>
 #include <stdint.h>  // uint8_t
 #include <versionhelpers.h>
+#include <winbase.h>
 #include <windows.h>
+#include <winioctl.h>
 
+#include <cstddef>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -32,6 +34,10 @@
 
 #ifndef IO_REPARSE_TAG_PROJFS
 #define IO_REPARSE_TAG_PROJFS 0x9000001C
+#endif
+
+#ifndef IO_REPARSE_TAG_LX_SYMLINK
+#define IO_REPARSE_TAG_LX_SYMLINK 0xA000001D
 #endif
 
 namespace bazel {
@@ -117,6 +123,61 @@ int IsSymlinkOrJunction(const WCHAR* path, bool* result, wstring* error) {
     *result = (attrs & FILE_ATTRIBUTE_REPARSE_POINT);
     return IsSymlinkOrJunctionResult::kSuccess;
   }
+}
+
+static int64_t WindowsFileTimeToUnixNanos(LARGE_INTEGER filetime) {
+  // Convert from Windows file time (100ns units since January 1, 1601) to
+  // Unix nanos (1ns units since January 1, 1970). For the magic constant, see:
+  // https://learn.microsoft.com/en-us/windows/win32/sysinfo/converting-a-time-t-value-to-a-file-time
+  return (filetime.QuadPart - 116444736000000000LL) * 100LL;
+}
+
+int GetChangeTime(const WCHAR* path, bool follow_reparse_points,
+                  int64_t* result, wstring* error) {
+  if (!IsAbsoluteNormalizedWindowsPath(path)) {
+    if (error) {
+      *error = MakeErrorMessage(WSTR(__FILE__), __LINE__, L"GetChangeTime",
+                                path, L"expected an absolute Windows path");
+    }
+    return GetChangeTimeResult::kError;
+  }
+
+  AutoHandle handle;
+  DWORD flags = FILE_FLAG_BACKUP_SEMANTICS;
+  if (!follow_reparse_points) {
+    flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+  }
+  handle = CreateFileW(path, 0,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       nullptr, OPEN_EXISTING, flags, nullptr);
+
+  if (!handle.IsValid()) {
+    DWORD err = GetLastError();
+    if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+      return GetChangeTimeResult::kDoesNotExist;
+    } else if (err == ERROR_ACCESS_DENIED) {
+      return GetChangeTimeResult::kAccessDenied;
+    }
+    if (error) {
+      *error =
+          MakeErrorMessage(WSTR(__FILE__), __LINE__, L"CreateFileW", path, err);
+    }
+    return GetChangeTimeResult::kError;
+  }
+
+  FILE_BASIC_INFO info;
+  if (!GetFileInformationByHandleEx(handle, FileBasicInfo, (LPVOID)&info,
+                                    sizeof(FILE_BASIC_INFO))) {
+    DWORD err = GetLastError();
+    if (error) {
+      *error = MakeErrorMessage(WSTR(__FILE__), __LINE__,
+                                L"GetFileInformationByHandleEx", path, err);
+    }
+    return GetChangeTimeResult::kError;
+  }
+
+  *result = WindowsFileTimeToUnixNanos(info.ChangeTime);
+  return GetChangeTimeResult::kSuccess;
 }
 
 wstring GetLongPath(const WCHAR* path, unique_ptr<WCHAR[]>* result) {
@@ -396,6 +457,11 @@ int CreateJunction(const wstring& junction_name, const wstring& junction_target,
       if (err == ERROR_DIR_NOT_EMPTY) {
         return CreateJunctionResult::kAlreadyExistsButNotJunction;
       }
+      // ERROR_INVALID_FUNCTION indicates the filesystem doesn't support
+      // junction/reparse point operations (e.g., virtiofs).
+      if (err == ERROR_INVALID_FUNCTION) {
+        return CreateJunctionResult::kNotSupported;
+      }
       // Some unknown error occurred.
       if (error) {
         *error = MakeErrorMessage(WSTR(__FILE__), __LINE__, L"DeviceIoControl",
@@ -456,7 +522,8 @@ int CreateSymlink(const wstring& symlink_name, const wstring& symlink_target,
   const wstring target = AddUncPrefixMaybe(symlink_target);
 
   DWORD attrs = GetFileAttributesW(target.c_str());
-  if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+  if ((attrs != INVALID_FILE_ATTRIBUTES) &&
+      (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
     // Instead of creating a symlink to a directory use a Junction.
     return CreateSymlinkResult::kTargetIsDirectory;
   }
@@ -473,9 +540,9 @@ int CreateSymlink(const wstring& symlink_name, const wstring& symlink_target,
     *error = MakeErrorMessage(
         WSTR(__FILE__), __LINE__, L"CreateSymlink", symlink_target,
         GetLastError() == ERROR_PRIVILEGE_NOT_HELD
-            ? L"createSymbolicLinkW failed (permission denied). Either "
+            ? L"CreateSymbolicLinkW failed (permission denied). Either "
               "Windows developer mode or admin privileges are required."
-            : L"createSymbolicLinkW failed");
+            : L"CreateSymbolicLinkW failed");
     return CreateSymlinkResult::kError;
   }
   return CreateSymlinkResult::kSuccess;
@@ -526,6 +593,11 @@ int ReadSymlinkOrJunction(const wstring& path, wstring* result,
     if (err == ERROR_NOT_A_REPARSE_POINT) {
       return ReadSymlinkOrJunctionResult::kNotALink;
     }
+    // ERROR_INVALID_FUNCTION indicates the filesystem doesn't support
+    // reparse point operations (e.g., virtiofs). Treat as not a link.
+    if (err == ERROR_INVALID_FUNCTION) {
+      return ReadSymlinkOrJunctionResult::kNotALink;
+    }
 
     // Some unknown error occurred.
     if (error) {
@@ -535,8 +607,16 @@ int ReadSymlinkOrJunction(const wstring& path, wstring* result,
     return ReadSymlinkOrJunctionResult::kError;
   }
 
+  // TODO(tjgq): Make IsSymlinkOrJunction and ReadSymlinkOrJunction consistent.
+  // Currently, the former returns true for any reparse point type, but we don't
+  // handle all of them here (and it might be impossible to do so).
   switch (buf->ReparseTag) {
-    case IO_REPARSE_TAG_SYMLINK: {
+    // IO_REPARSE_TAG_SYMLINK is an NTFS symlink.
+    // IO_REPARSE_TAG_LX_SYMLINK is a WSL symlink.
+    // Although Bazel only creates the former, other tools may create the latter
+    // (notably, `ln -s` under MSYS2 in `winsymlinks:native` mode).
+    case IO_REPARSE_TAG_SYMLINK:
+    case IO_REPARSE_TAG_LX_SYMLINK: {
       wchar_t* p =
           (wchar_t*)(((uint8_t*)buf->SymbolicLinkReparseBuffer.PathBuffer) +
                      buf->SymbolicLinkReparseBuffer.SubstituteNameOffset);
@@ -544,6 +624,7 @@ int ReadSymlinkOrJunction(const wstring& path, wstring* result,
                                sizeof(WCHAR));
       return ReadSymlinkOrJunctionResult::kSuccess;
     }
+    // IO_REPARSE_TAG_MOUNT_POINT is a junction or volume mount point.
     case IO_REPARSE_TAG_MOUNT_POINT: {
       wchar_t* p =
           (wchar_t*)(((uint8_t*)buf->MountPointReparseBuffer.PathBuffer) +
@@ -557,7 +638,10 @@ int ReadSymlinkOrJunction(const wstring& path, wstring* result,
       return ReadSymlinkOrJunctionResult::kNotALink;
     }
     default:
-      return ReadSymlinkOrJunctionResult::kUnknownLinkType;
+      *error =
+          MakeErrorMessage(WSTR(__FILE__), __LINE__, L"ReadSymlinkOrJunction",
+                           path, L"unsupported link type");
+      return ReadSymlinkOrJunctionResult::kError;
   }
 }
 

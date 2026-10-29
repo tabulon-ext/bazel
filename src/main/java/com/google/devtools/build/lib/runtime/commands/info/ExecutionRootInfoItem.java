@@ -31,10 +31,14 @@ public final class ExecutionRootInfoItem extends InfoItem {
   }
 
   @Override
+  public boolean requiresWorkspace() {
+    return true;
+  }
+
+  @Override
   public byte[] get(
       Supplier<BuildConfigurationValue> configurationSupplier, CommandEnvironment env) {
     checkNotNull(env);
-    return print(
-        env.getDirectories().getExecRoot(configurationSupplier.get().getMainRepositoryName()));
+    return print(env.getDirectories().getExecRoot(env.getWorkspaceName()));
   }
 }

@@ -23,14 +23,17 @@ import com.google.devtools.build.lib.packages.RuleClass;
 import com.google.devtools.build.lib.packages.RuleFunction;
 import com.google.devtools.build.lib.profiler.memory.AllocationTracker.RuleBytes;
 import com.google.perftools.profiles.ProfileProto.Function;
+import com.google.perftools.profiles.ProfileProto.Location;
 import com.google.perftools.profiles.ProfileProto.Profile;
 import com.google.perftools.profiles.ProfileProto.Sample;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import net.starlark.java.eval.Debug;
+import net.starlark.java.eval.Dict;
 import net.starlark.java.eval.EvalException;
 import net.starlark.java.eval.HasBinary;
 import net.starlark.java.eval.Module;
@@ -40,6 +43,7 @@ import net.starlark.java.eval.StarlarkCallable;
 import net.starlark.java.eval.StarlarkInt;
 import net.starlark.java.eval.StarlarkSemantics;
 import net.starlark.java.eval.StarlarkThread;
+import net.starlark.java.eval.Tuple;
 import net.starlark.java.syntax.FileOptions;
 import net.starlark.java.syntax.ParserInput;
 import net.starlark.java.syntax.SyntaxError;
@@ -65,8 +69,8 @@ public final class AllocationTrackerTest {
   private class SamplerValue implements HasBinary {
     @Override
     public Object binaryOp(TokenKind op, Object that, boolean thisLeft) throws EvalException {
-      if (op == TokenKind.PLUS && thisLeft && that instanceof StarlarkInt) {
-        int size = ((StarlarkInt) that).toIntUnchecked(); // test values are small
+      if (op == TokenKind.PLUS && thisLeft && that instanceof StarlarkInt starlarkInt) {
+        int size = starlarkInt.toIntUnchecked(); // test values are small
         Object obj = new Object();
         live.add(obj); // ensure that obj outlives the test assertions
         tracker.sampleAllocation(1, "", obj, size);
@@ -133,8 +137,7 @@ public final class AllocationTrackerTest {
   private static String sampleToCallstack(Profile profile, Sample sample) {
     StringBuilder buf = new StringBuilder();
     for (long locationId : sample.getLocationIdList()) {
-      com.google.perftools.profiles.ProfileProto.Location location =
-          profile.getLocation((int) locationId - 1);
+      Location location = profile.getLocation((int) locationId - 1);
       assertThat(location.getLineList()).hasSize(1);
       long functionId = location.getLine(0).getFunctionId();
       long line = location.getLine(0).getLine();
@@ -189,6 +192,123 @@ public final class AllocationTrackerTest {
     assertThat(rules).containsExactly("myrule", new RuleBytes("myrule").addBytes(128L));
   }
 
+  @Test
+  public void testValueTypesDontCrash() {
+    tracker = new AllocationTracker(100, 0);
+    Debug.setThreadHook(tracker);
+    CurrentRuleTracker.beginConfiguredTarget(myRuleClass());
+
+    // Sub-threshold value class allocation (40 < 100): accumulated via fast path.
+    tracker.sampleAllocation(1, "", Optional.empty(), 40);
+    // Threshold-crossing value class allocation (40 + 70 = 110 >= 100): deferred.
+    tracker.sampleAllocation(1, "", Integer.valueOf(42), 70);
+    // Identity object allocation (110 + 20 = 130 >= 100): sample recorded with all 130 bytes.
+    Object ruleAllocation = new Object();
+    live.add(ruleAllocation);
+    tracker.sampleAllocation(1, "", ruleAllocation, 20);
+    // Subsequent sub-threshold allocation (30 < 100): not sampled, verifying counter reset.
+    Object unsampled = new Object();
+    live.add(unsampled);
+    tracker.sampleAllocation(1, "", unsampled, 30);
+
+    CurrentRuleTracker.endConfiguredTarget();
+
+    Map<String, RuleBytes> rules = new HashMap<>();
+    Map<String, RuleBytes> aspects = new HashMap<>();
+    tracker.getRuleMemoryConsumption(rules, aspects);
+    assertThat(rules).containsExactly("myrule", new RuleBytes("myrule").addBytes(130L));
+  }
+
+  @Test
+  public void testDeferredValueTypeDoesNotLeakAcrossRules() {
+    tracker = new AllocationTracker(100, 0);
+    Debug.setThreadHook(tracker);
+
+    RuleClass ruleA = mock(RuleClass.class);
+    when(ruleA.getName()).thenReturn("ruleA");
+    when(ruleA.getKey()).thenReturn("ruleA");
+
+    RuleClass ruleB = mock(RuleClass.class);
+    when(ruleB.getName()).thenReturn("ruleB");
+    when(ruleB.getKey()).thenReturn("ruleB");
+
+    // ruleA crosses the threshold (110 >= 100) on a value class and ends without allocating an
+    // identity object.
+    CurrentRuleTracker.beginConfiguredTarget(ruleA);
+    tracker.sampleAllocation(1, "", Optional.empty(), 110);
+    CurrentRuleTracker.endConfiguredTarget();
+
+    // ruleB allocates an identity object (120 >= 100). It should not inherit ruleA's deferred 110
+    // bytes.
+    CurrentRuleTracker.beginConfiguredTarget(ruleB);
+    Object ruleBAllocation = new Object();
+    live.add(ruleBAllocation);
+    tracker.sampleAllocation(1, "", ruleBAllocation, 120);
+    CurrentRuleTracker.endConfiguredTarget();
+
+    // Next, ruleA defers a value class sample (110 >= 100), followed by a non-rule allocation gap,
+    // followed by another target of ruleA. The non-rule gap must clear the deferred sample.
+    CurrentRuleTracker.beginConfiguredTarget(ruleA);
+    tracker.sampleAllocation(1, "", Optional.empty(), 110);
+    CurrentRuleTracker.endConfiguredTarget();
+
+    tracker.sampleAllocation(1, "", new Object(), 50); // non-rule gap resets deferred state
+
+    CurrentRuleTracker.beginConfiguredTarget(ruleA);
+    Object ruleAAllocation = new Object();
+    live.add(ruleAAllocation);
+    tracker.sampleAllocation(1, "", ruleAAllocation, 130);
+    CurrentRuleTracker.endConfiguredTarget();
+
+    Map<String, RuleBytes> rules = new HashMap<>();
+    Map<String, RuleBytes> aspects = new HashMap<>();
+    tracker.getRuleMemoryConsumption(rules, aspects);
+    assertThat(rules)
+        .containsExactly(
+            "ruleA", new RuleBytes("ruleA").addBytes(130L),
+            "ruleB", new RuleBytes("ruleB").addBytes(120L));
+  }
+
+  @Test
+  public void testDeferredValueTypeDoesNotLeakAcrossStarlarkThreads() throws Exception {
+    tracker = new AllocationTracker(100, 0);
+    Debug.setThreadHook(tracker);
+
+    try (Mutability mu1 = Mutability.create("test1");
+        Mutability mu2 = Mutability.create("test2")) {
+      StarlarkThread thread1 = StarlarkThread.createTransient(mu1, StarlarkSemantics.DEFAULT);
+      StarlarkThread thread2 = StarlarkThread.createTransient(mu2, StarlarkSemantics.DEFAULT);
+
+      // Simulate thread1 crossing threshold on a value class.
+      tracker.onPushFirst(thread1);
+      tracker.sampleAllocation(1, "", Optional.empty(), 110);
+
+      // Reentrant transition to thread2: must not throw UnsupportedOperationException when
+      // comparing StarlarkThread instances, and must reset thread1's deferred sample.
+      tracker.onPushFirst(thread2);
+      tracker.sampleAllocation(1, "", Optional.empty(), 120);
+
+      // Popping thread1 while thread2 is deferred must not throw UnsupportedOperationException.
+      tracker.onPopLast(thread1);
+      // Popping thread2 resets its deferred state.
+      tracker.onPopLast(thread2);
+    }
+
+    // A subsequent sub-threshold allocation (50 < 100) within a rule must not inherit any
+    // deferred bytes from thread1 or thread2.
+    CurrentRuleTracker.beginConfiguredTarget(myRuleClass());
+    Object obj = new Object();
+    live.add(obj);
+    tracker.sampleAllocation(1, "", obj, 50);
+    CurrentRuleTracker.endConfiguredTarget();
+
+    Map<String, RuleBytes> rules = new HashMap<>();
+    Map<String, RuleBytes> aspects = new HashMap<>();
+    tracker.getRuleMemoryConsumption(rules, aspects);
+    assertThat(rules).isEmpty();
+    assertThat(tracker.buildMemoryProfile().getSampleList()).isEmpty();
+  }
+
   private void exec(String... lines)
       throws SyntaxError.Exception, EvalException, InterruptedException {
     ParserInput input = ParserInput.fromString(Joiner.on("\n").join(lines), "a.star");
@@ -199,7 +319,7 @@ public final class AllocationTrackerTest {
                 "sample", new SamplerValue(),
                 "myrule", new MyRuleFunction()));
     try (Mutability mu = Mutability.create("test")) {
-      StarlarkThread thread = new StarlarkThread(mu, StarlarkSemantics.DEFAULT);
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
       Starlark.execFile(input, FileOptions.DEFAULT, module, thread);
     }
   }
@@ -207,7 +327,7 @@ public final class AllocationTrackerTest {
   // A fake Bazel rule. The allocation tracker reports retained memory broken down by rule class.
   private class MyRuleFunction implements RuleFunction, StarlarkCallable {
     @Override
-    public Object fastcall(StarlarkThread thread, Object[] parameters, Object[] named) {
+    public Object call(StarlarkThread thread, Tuple args, Dict<String, Object> kwargs) {
       Object obj = new Object();
       live.add(obj); // ensure that obj outlives the test assertions
       tracker.sampleAllocation(1, "", obj, 128);

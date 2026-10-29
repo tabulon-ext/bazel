@@ -16,6 +16,9 @@ package net.starlark.java.eval;
 
 import java.math.BigInteger;
 import net.starlark.java.annot.StarlarkBuiltin;
+import net.starlark.java.syntax.StarlarkType;
+import net.starlark.java.syntax.TypeConstructor;
+import net.starlark.java.syntax.Types;
 
 /** The Starlark int data type. */
 @StarlarkBuiltin(
@@ -32,7 +35,15 @@ import net.starlark.java.annot.StarlarkBuiltin;
             + "100 % -7  # -5 (unlike in some other languages)\n"
             + "int(\"18\")\n"
             + "</pre>")
-public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkInt> {
+public abstract sealed class StarlarkInt implements StarlarkValue, Comparable<StarlarkInt> {
+  public static TypeConstructor getAssociatedTypeConstructor() {
+    return Types.INT_CONSTRUCTOR;
+  }
+
+  @Override
+  public StarlarkType getStarlarkType(StarlarkSemantics semantics) {
+    return Types.INT;
+  }
 
   // A cache of small integers >= LEAST_SMALLINT.
   private static final int LEAST_SMALLINT = -128;
@@ -133,7 +144,8 @@ public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkI
       // Don't infer base when input starts with '0' due to octal/decimal ambiguity.
       if (s.length() > 1 && s.charAt(0) == '0') {
         throw new NumberFormatException(
-            "cannot infer base when string begins with a 0: " + Starlark.repr(stringForErrors));
+            "cannot infer base when string begins with a 0: "
+                + Starlark.repr(stringForErrors, StarlarkSemantics.DEFAULT));
       }
       base = 10;
     }
@@ -145,7 +157,9 @@ public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkI
     // Do not allow Long.parseLong and new BigInteger to accept another +/- sign.
     if (digits.startsWith("+") || digits.startsWith("-")) {
       throw new NumberFormatException(
-          String.format("invalid base-%d literal: %s", base, Starlark.repr(stringForErrors)));
+          String.format(
+              "invalid base-%d literal: %s",
+              base, Starlark.repr(stringForErrors, StarlarkSemantics.DEFAULT)));
     }
 
     StarlarkInt result;
@@ -156,7 +170,9 @@ public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkI
         result = StarlarkInt.of(new BigInteger(digits, base));
       } catch (NumberFormatException unused2) {
         throw new NumberFormatException(
-            String.format("invalid base-%d literal: %s", base, Starlark.repr(stringForErrors)));
+            String.format(
+                "invalid base-%d literal: %s",
+                base, Starlark.repr(stringForErrors, StarlarkSemantics.DEFAULT)));
       }
     }
     return isNegative ? StarlarkInt.uminus(result) : result;
@@ -177,17 +193,32 @@ public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkI
 
     @Override
     public long toLong(String what) {
-      return (long) v;
+      return v;
     }
 
     @Override
     protected long toLongFast() {
-      return (long) v;
+      return v;
+    }
+
+    @Override
+    public double toDouble() {
+      return v;
     }
 
     @Override
     public BigInteger toBigInteger() {
       return BigInteger.valueOf(v);
+    }
+
+    @Override
+    public int toIntUnchecked() {
+      return v;
+    }
+
+    @Override
+    public int truncateToInt() {
+      return v;
     }
 
     @Override
@@ -201,7 +232,7 @@ public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkI
     }
 
     @Override
-    public void repr(Printer printer) {
+    public void repr(Printer printer, StarlarkSemantics semantics) {
       printer.append(v);
     }
 
@@ -212,8 +243,13 @@ public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkI
 
     @Override
     public boolean equals(Object that) {
-      return (that instanceof Int32 && this.v == ((Int32) that).v)
-          || (that instanceof StarlarkFloat && intEqualsFloat(this, (StarlarkFloat) that));
+      return (that instanceof Int32 int32 && this.v == int32.v)
+          || (that instanceof StarlarkFloat starlarkFloat && intEqualsFloat(this, starlarkFloat));
+    }
+
+    @Override
+    public String toString() {
+      return Integer.toString(v);
     }
   }
 
@@ -236,8 +272,18 @@ public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkI
     }
 
     @Override
+    public double toDouble() {
+      return v;
+    }
+
+    @Override
     public BigInteger toBigInteger() {
       return BigInteger.valueOf(v);
+    }
+
+    @Override
+    public int truncateToInt() {
+      return (int) v;
     }
 
     @Override
@@ -251,7 +297,7 @@ public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkI
     }
 
     @Override
-    public void repr(Printer printer) {
+    public void repr(Printer printer, StarlarkSemantics semantics) {
       printer.append(v);
     }
 
@@ -262,8 +308,13 @@ public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkI
 
     @Override
     public boolean equals(Object that) {
-      return (that instanceof Int64 && this.v == ((Int64) that).v)
-          || (that instanceof StarlarkFloat && intEqualsFloat(this, (StarlarkFloat) that));
+      return (that instanceof Int64 int64 && this.v == int64.v)
+          || (that instanceof StarlarkFloat starlarkFloat && intEqualsFloat(this, starlarkFloat));
+    }
+
+    @Override
+    public String toString() {
+      return Long.toString(v);
     }
   }
 
@@ -276,8 +327,18 @@ public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkI
     }
 
     @Override
+    public double toDouble() {
+      return v.doubleValue(); // may be ±Inf
+    }
+
+    @Override
     public BigInteger toBigInteger() {
       return v;
+    }
+
+    @Override
+    public int truncateToInt() {
+      return v.intValue();
     }
 
     @Override
@@ -291,7 +352,7 @@ public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkI
     }
 
     @Override
-    public void repr(Printer printer) {
+    public void repr(Printer printer, StarlarkSemantics semantics) {
       printer.append(v.toString());
     }
 
@@ -302,8 +363,13 @@ public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkI
 
     @Override
     public boolean equals(Object that) {
-      return (that instanceof Big && this.v.equals(((Big) that).v))
-          || (that instanceof StarlarkFloat && intEqualsFloat(this, (StarlarkFloat) that));
+      return (that instanceof Big big && this.v.equals(big.v))
+          || (that instanceof StarlarkFloat starlarkFloat && intEqualsFloat(this, starlarkFloat));
+    }
+
+    @Override
+    public String toString() {
+      return v.toString();
     }
   }
 
@@ -315,18 +381,10 @@ public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkI
 
   /** Returns this StarlarkInt as a string of decimal digits. */
   @Override
-  public String toString() {
-    if (this instanceof Int32) {
-      return Integer.toString(((Int32) this).v);
-    } else if (this instanceof Int64) {
-      return Long.toString(((Int64) this).v);
-    } else {
-      return toBigInteger().toString();
-    }
-  }
+  public abstract String toString();
 
   @Override
-  public abstract void repr(Printer printer);
+  public abstract void repr(Printer printer, StarlarkSemantics semantics);
 
   /** Returns the signed int32 value of this StarlarkInt, or fails if not exactly representable. */
   public int toInt(String what) throws EvalException {
@@ -352,22 +410,14 @@ public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkI
   }
 
   /** Returns the nearest IEEE-754 double-precision value closest to this int, which may be ±Inf. */
-  public double toDouble() {
-    if (this instanceof Int32) {
-      return ((Int32) this).v;
-    } else if (this instanceof Int64) {
-      return ((Int64) this).v;
-    } else {
-      return toBigInteger().doubleValue(); // may be ±Inf
-    }
-  }
+  public abstract double toDouble();
 
   /**
    * Returns the nearest IEEE-754 double-precision value closest to this int.
    *
    * @throws EvalException is the int is to large to represent as a finite float value.
    */
-  public double toFiniteDouble() throws EvalException {
+  public final double toFiniteDouble() throws EvalException {
     double d = toDouble();
     if (!Double.isFinite(d)) {
       throw Starlark.errorf("int too large to convert to float");
@@ -383,32 +433,22 @@ public abstract class StarlarkInt implements StarlarkValue, Comparable<StarlarkI
    *
    * @throws IllegalArgumentException if this int is not in that value range.
    */
-  public final int toIntUnchecked() throws IllegalArgumentException {
-    if (this instanceof Int32) {
-      return ((Int32) this).v;
-    }
-    // Use a constant exception to avoid allocation.
+  public int toIntUnchecked() throws IllegalArgumentException {
     // This operator is provided for fast access and case discrimination.
     // Use toInt(String) for user-visible errors.
-    throw NOT_INT32;
+    throw new IllegalArgumentException("not a signed 32-bit value");
   }
-
-  private static final IllegalArgumentException NOT_INT32 =
-      new IllegalArgumentException("not a signed 32-bit value");
 
   /** Returns the result of truncating this value into the signed 32-bit range. */
-  public int truncateToInt() {
-    if (this instanceof Int32) {
-      return ((Int32) this).v;
-    } else if (this instanceof Int64) {
-      return (int) ((Int64) this).v;
-    } else {
-      return toBigInteger().intValue();
-    }
-  }
+  public abstract int truncateToInt();
 
   @Override
   public boolean isImmutable() {
+    return true;
+  }
+
+  @Override
+  public boolean isAcyclic() {
     return true;
   }
 

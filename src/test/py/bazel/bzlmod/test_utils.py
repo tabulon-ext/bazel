@@ -16,19 +16,22 @@
 """Test utils for Bzlmod."""
 
 import base64
+import functools
 import hashlib
+import http.server
 import json
 import os
 import pathlib
 import shutil
+import threading
 import urllib.request
 import zipfile
 
 
 def download(url):
   """Download a file and return its content in bytes."""
-  response = urllib.request.urlopen(url)
-  return response.read()
+  with urllib.request.urlopen(url) as response:
+    return response.read()
 
 
 def read(path):
@@ -45,6 +48,7 @@ def integrity(data):
 
 def scratchFile(path, lines=None):
   """Creates a file at the given path with the given content."""
+  os.makedirs(str(path.parent), exist_ok=True)
   with open(str(path), 'w') as f:
     if lines:
       for l in lines:
@@ -62,7 +66,9 @@ class Module:
     self.strip_prefix = ''
     self.module_dot_bazel = None
     self.patches = []
+    self.overlay = {}
     self.patch_strip = 0
+    self.archive_type = None
 
   def set_source(self, archive_url, strip_prefix=None):
     self.archive_url = archive_url
@@ -78,6 +84,14 @@ class Module:
     self.patch_strip = patch_strip
     return self
 
+  def set_overlay(self, overlay):
+    self.overlay = overlay
+    return self
+
+  def set_archive_type(self, archive_type):
+    self.archive_type = archive_type
+    return self
+
 
 class BazelRegistry:
   """A class to help create a Bazel module project from scatch and add it into the registry."""
@@ -89,15 +103,44 @@ class BazelRegistry:
     self.archives = self.root.joinpath('archives')
     self.archives.mkdir(parents=True, exist_ok=True)
     self.registry_suffix = registry_suffix
+    self.http_server = StaticHTTPServer(self.root)
+
+  def setModuleBasePath(self, module_base_path):
+    bazel_registry = {
+        'module_base_path': (
+            self.root.joinpath(module_base_path).resolve().as_posix()
+        ),
+    }
+    with self.root.joinpath('bazel_registry.json').open('w') as f:
+      json.dump(bazel_registry, f, indent=4, sort_keys=True)
+
+  def start(self):
+    """Start an HTTP server serving the registry."""
+    self.http_server.__enter__()
+
+  def stop(self):
+    """Stop the HTTP server."""
+    self.http_server.__exit__(None, None, None)
 
   def getURL(self):
     """Return the URL of this registry."""
-    return self.root.resolve().as_uri()
+    return self.http_server.getURL()
 
-  def generateCcSource(self, name, version, deps=None, repo_names=None):
-    """Generate a cc project with given dependency information.
+  def getLocalURL(self):
+    """Return the local file:// URL of this registry."""
+    return self.root.as_uri()
 
-    1. The cc projects implements a hello_<lib_name> function.
+  def generateShSource(
+      self,
+      name,
+      version,
+      deps=None,
+      repo_names=None,
+      extra_module_file_contents=None,
+  ):
+    """Generate a sh project with given dependency information.
+
+    1. The sh library implements a hello_<lib_name> function.
     2. The hello_<lib_name> function calls the same function of its
     dependencies.
     3. The hello_<lib_name> function prints "<caller name> =>
@@ -109,6 +152,8 @@ class BazelRegistry:
       version: The module version.
       deps: The dependencies of this module.
       repo_names: The desired repository name for some dependencies.
+      extra_module_file_contents: Extra lines to append to the MODULE.bazel
+        file.
 
     Returns:
       The generated source directory.
@@ -123,71 +168,112 @@ class BazelRegistry:
     for dep in deps:
       if dep not in repo_names:
         repo_names[dep] = dep
+    if not extra_module_file_contents:
+      extra_module_file_contents = []
 
     def calc_repo_name_str(dep):
       if dep == repo_names[dep]:
         return ''
       return ', repo_name = "%s"' % repo_names[dep]
 
-    scratchFile(src_dir.joinpath('WORKSPACE'))
     scratchFile(
-        src_dir.joinpath('MODULE.bazel'), [
+        src_dir.joinpath('MODULE.bazel'),
+        [
             'module(',
             '  name = "%s",' % name,
             '  version = "%s",' % version,
-            '  compatibility_level = 1,',
             ')',
-        ] + [
-            'bazel_dep(name = "%s", version = "%s"%s)' %
-            (dep, version, calc_repo_name_str(dep))
+        ]
+        + [
+            'bazel_dep(name = "%s", version = "%s"%s)'
+            % (dep, version, calc_repo_name_str(dep))
             for dep, version in deps.items()
-        ])
+        ]
+        + extra_module_file_contents,
+    )
 
     scratchFile(
-        src_dir.joinpath(name.lower() + '.h'), [
-            '#ifndef %s_H' % name.upper(),
-            '#define %s_H' % name.upper(),
-            '#include <string>',
-            'void hello_%s(const std::string& caller);' % name.lower(),
-            '#endif',
-        ])
-    scratchFile(
-        src_dir.joinpath(name.lower() + '.cc'), [
-            '#include <stdio.h>',
-            '#include "%s.h"' % name.lower(),
-        ] + ['#include "%s.h"' % dep.lower() for dep in deps] + [
-            'void hello_%s(const std::string& caller) {' % name.lower(),
-            '    std::string lib_name = "%s@%s%s";' %
-            (name, version, self.registry_suffix),
-            '    printf("%s => %s\\n", caller.c_str(), lib_name.c_str());',
-        ] + ['    hello_%s(lib_name);' % dep.lower() for dep in deps] + [
+        src_dir.joinpath(name.lower() + '.sh'),
+        [
+            'source $(rlocation %s+/%s.sh)' % (dep.lower(), dep.lower())
+            for dep in deps
+        ]
+        + [
+            'function hello_%s {' % name.lower(),
+            '    caller_name="${1}"',
+            '    lib_name="%s@%s%s"' % (name, version, self.registry_suffix),
+            '    echo "${caller_name} => ${lib_name}"',
+        ]
+        + ['    hello_%s ${lib_name}' % dep.lower() for dep in deps]
+        + [
             '}',
-        ])
+        ],
+    )
     scratchFile(
-        src_dir.joinpath('BUILD'), [
+        src_dir.joinpath('sh_library.bzl'),
+        [
+            'def _impl(ctx):',
+            '  f = ctx.actions.declare_file(ctx.label.name + ".dummy")',
+            '  ctx.actions.write(f, "dummy out")',  # dummy action for aquery
+            '  files = depset(',
+            '     ctx.files.srcs,',
+            '     transitive = [d[DefaultInfo].files for d in ctx.attr.deps]',
+            '  )',
+            '  runfiles = ctx.runfiles(transitive_files = files)',
+            '  return DefaultInfo(files = files, runfiles = runfiles)',
+            'sh_library = rule(_impl, attrs = {',
+            (
+                '  "srcs": attr.label_list(allow_files = True),'
+                '  "deps": attr.label_list(allow_rules = ["sh_library"]),'
+                '})'
+            ),
+        ],
+    )
+    scratchFile(
+        src_dir.joinpath('BUILD'),
+        [
+            'load(":sh_library.bzl", "sh_library")',
             'package(default_visibility = ["//visibility:public"])',
-            'cc_library(',
+            'sh_library(',
             '  name = "lib_%s",' % name.lower(),
-            '  srcs = ["%s.cc"],' % name.lower(),
-            '  hdrs = ["%s.h"],' % name.lower(),
-        ] + ([
-            '  deps = ["%s"],' % ('", "'.join([
-                '@%s//:lib_%s' % (repo_names[dep], dep.lower()) for dep in deps
-            ])),
-        ] if deps else []) + [
+            '  srcs = ["%s.sh"],' % name.lower(),
+        ]
+        + (
+            [
+                '  deps = ["%s"],'
+                % (
+                    '", "'.join([
+                        '@%s//:lib_%s' % (repo_names[dep], dep.lower())
+                        for dep in deps
+                    ])
+                ),
+            ]
+            if deps
+            else []
+        )
+        + [
             ')',
-        ])
+        ],
+    )
     return src_dir
 
-  def createArchive(self, name, version, src_dir):
+  def createArchive(self, name, version, src_dir, filename_pattern='%s.%s.zip'):
     """Create an archive with a given source directory."""
-    zip_path = self.archives.joinpath('%s.%s.zip' % (name, version))
+    zip_path = self.archives.joinpath(filename_pattern % (name, version))
     zip_obj = zipfile.ZipFile(str(zip_path), 'w')
     for foldername, _, filenames in os.walk(str(src_dir)):
       for filename in filenames:
         filepath = os.path.join(foldername, filename)
-        zip_obj.write(filepath,
-                      str(pathlib.Path(filepath).relative_to(src_dir)))
+        arcname = str(pathlib.Path(filepath).relative_to(src_dir))
+        if filename == 'MODULE.bazel':
+          # Verify that MODULE.bazel doesn't have to be included in the archive
+          # by writing an effectively empty one.
+          zip_obj.writestr(
+              arcname,
+              '# FAKE\nmodule(name = "%s", version = "%s")\n' % (name, version),
+          )
+        else:
+          zip_obj.write(filepath, arcname)
     zip_obj.close()
     return zip_path
 
@@ -218,23 +304,207 @@ class BazelRegistry:
         source['patches'][patch.name] = integrity(read(patch))
         shutil.copy(str(patch), str(patch_dir))
 
+    if module.overlay:
+      overlay_dir = module_dir.joinpath('overlay')
+      overlay_dir.mkdir()
+      source['overlay'] = {}
+      for overlay_rel_path, overlay_file in module.overlay.items():
+        file = pathlib.Path(overlay_file)
+        source['overlay'][overlay_rel_path] = integrity(read(file))
+        shutil.copy(str(file), str(overlay_dir.joinpath(overlay_rel_path)))
+
+    if module.archive_type:
+      source['archive_type'] = module.archive_type
+
     with module_dir.joinpath('source.json').open('w') as f:
       json.dump(source, f, indent=4, sort_keys=True)
 
-  def createCcModule(self,
-                     name,
-                     version,
-                     deps=None,
-                     repo_names=None,
-                     patches=None,
-                     patch_strip=0):
+  def createShModule(
+      self,
+      name,
+      version,
+      deps=None,
+      repo_names=None,
+      patches=None,
+      patch_strip=0,
+      overlay=None,
+      archive_pattern=None,
+      archive_type=None,
+      extra_module_file_contents=None,
+  ):
     """Generate a cc project and add it as a module into the registry."""
-    src_dir = self.generateCcSource(name, version, deps, repo_names)
-    archive = self.createArchive(name, version, src_dir)
+    src_dir = self.generateShSource(
+        name, version, deps, repo_names, extra_module_file_contents
+    )
+    if archive_pattern:
+      archive = self.createArchive(
+          name, version, src_dir, filename_pattern=archive_pattern
+      )
+    else:
+      archive = self.createArchive(name, version, src_dir)
     module = Module(name, version)
     module.set_source(archive.resolve().as_uri())
     module.set_module_dot_bazel(src_dir.joinpath('MODULE.bazel'))
     if patches:
       module.set_patches(patches, patch_strip)
+    if overlay:
+      module.set_overlay(overlay)
+    if archive_type:
+      module.set_archive_type(archive_type)
+
     self.addModule(module)
     return self
+
+  def addMetadata(self,
+                  name,
+                  homepage=None,
+                  maintainers=None,
+                  versions=None,
+                  yanked_versions=None):
+    """Generate a module metadata file and add it to the registry."""
+    if maintainers is None:
+      maintainers = []
+    if versions is None:
+      versions = []
+    if yanked_versions is None:
+      yanked_versions = {}
+
+    module_dir = self.root.joinpath('modules', name)
+    module_dir.mkdir(parents=True, exist_ok=True)
+
+    metadata = {
+        'homepage': homepage,
+        'maintainers': maintainers,
+        'versions': versions,
+        'yanked_versions': yanked_versions
+    }
+
+    with module_dir.joinpath('metadata.json').open('w') as f:
+      json.dump(metadata, f, indent=4, sort_keys=True)
+
+    return self
+
+  def createLocalPathModule(self, name, version, path, deps=None):
+    """Add a local module into the registry."""
+    module_dir = self.root.joinpath('modules', name, version)
+    module_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create source.json & copy patch files to the registry
+    source = {
+        'type': 'local_path',
+        'path': path,
+    }
+
+    self._createModuleAndSourceJson(
+        module_dir, name, version, path, deps, source
+    )
+
+  def createGitRepoModule(self, name, version, path, deps=None, **kwargs):
+    """Add a git repo module into the registry."""
+    module_dir = self.root.joinpath('modules', name, version)
+    module_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create source.json & copy patch files to the registry
+    source = {
+        'type': 'git_repository',
+        'remote': f'file://{path}',
+    }
+    source.update(**kwargs)
+
+    self._createModuleAndSourceJson(
+        module_dir, name, version, path, deps, source
+    )
+
+  def _createModuleAndSourceJson(
+      self, module_dir, name, version, path, deps, source
+  ):
+    """Create the MODULE.bazel and source.json files for a module."""
+    if deps is None:
+      deps = {}
+
+    module_file_lines = [
+        'module(',
+        '  name = "%s",' % name,
+        '  version = "%s",' % version,
+        ')',
+    ] + ['bazel_dep(name="%s",version="%s")' % p for p in deps.items()]
+    scratchFile(module_dir.joinpath('MODULE.bazel'), module_file_lines)
+    self.projects.joinpath(path).mkdir(exist_ok=True)
+    scratchFile(self.projects.joinpath(path, 'MODULE.bazel'), module_file_lines)
+
+    with module_dir.joinpath('source.json').open('w') as f:
+      json.dump(source, f, indent=4, sort_keys=True)
+
+
+class StaticHTTPServer:
+  """An HTTP server serving static files, optionally with authentication."""
+
+  def __init__(self, root_directory, expected_auth=None):
+    self.root_directory = root_directory
+    self.expected_auth = expected_auth
+
+  def __enter__(self):
+    address = ('localhost', 0)  # assign random port
+    handler = functools.partial(
+        _Handler, self.root_directory, self.expected_auth
+    )
+    self.httpd = http.server.HTTPServer(address, handler)
+    self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+    self.thread.start()
+    return self
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    try:
+      self.httpd.shutdown()
+    finally:
+      self.httpd.server_close()
+    self.thread.join(timeout=10)
+    if self.thread.is_alive():
+      raise RuntimeError('StaticHTTPServer thread did not terminate within 10s')
+
+  def getURL(self):
+    return 'http://{}:{}'.format(*self.httpd.server_address)
+
+
+class _Handler(http.server.SimpleHTTPRequestHandler):
+  """A SimpleHTTPRequestHandler with authentication."""
+
+  # HTTPServer handles requests synchronously on a single thread and defaults to
+  # an infinite socket timeout (None). Set a 5s socket timeout so a stalled
+  # client connection cannot block serve_forever() and hang httpd.shutdown().
+  timeout = 5
+
+  # Note: until Python 3.6, SimpleHTTPRequestHandler was only able to serve
+  # files from the working directory. A 'directory' parameter was added in
+  # Python 3.7, but sadly our CI builds are stuck with Python 3.6. Instead,
+  # we monkey-patch translate_path() to rewrite the path.
+
+  def __init__(self, root_directory, expected_auth, *args, **kwargs):
+    self.root_directory = root_directory
+    self.expected_auth = expected_auth
+    super().__init__(*args, **kwargs)
+
+  def translate_path(self, path):
+    abs_path = super().translate_path(path)
+    rel_path = os.path.relpath(abs_path, os.getcwd())
+    return os.path.join(self.root_directory, rel_path)
+
+  def check_auth(self):
+    auth_header = self.headers.get('Authorization', None)
+    if auth_header != self.expected_auth:
+      self.send_error(http.HTTPStatus.UNAUTHORIZED)
+      return False
+    return True
+
+  def do_HEAD(self):
+    if self.check_auth():
+      return super().do_HEAD()
+
+  def do_GET(self):
+    if self.check_auth():
+      return super().do_GET()
+
+  def log_message(self, *args, **kwargs):
+    # Suppress logging to prevent dumping hundreds of 404s to stderr
+    # when Bazel queries fallback registries.
+    pass

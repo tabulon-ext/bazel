@@ -1,16 +1,17 @@
 load("@rules_java//java:defs.bzl", "java_library", "java_test")
 
 package(
-    default_visibility = ["//src:__subpackages__"],
+    default_applicable_licenses = ["//:license"],
+    default_visibility = ["//src/test/java/com/google/devtools/common:__subpackages__"],
 )
 
 filegroup(
     name = "srcs",
     srcs = glob(["**"]) + [
-        "//src/test/java/com/google/devtools/common/options/testing:srcs",
         "//src/test/java/com/google/devtools/common/options/processor:srcs",
+        "//src/test/java/com/google/devtools/common/options/testing:srcs",
     ],
-    visibility = ["//src:__subpackages__"],
+    visibility = ["//src:__pkg__"],
 )
 
 java_library(
@@ -20,13 +21,17 @@ java_library(
         "InvocationPolicyEnforcerTestBase.java",
         "TestOptions.java",
     ],
+    visibility = [
+        "//src/test/java:__subpackages__",
+    ],
     deps = [
-        "//src/main/java/com/google/devtools/build/lib:runtime",
+        "//src/main/java/com/google/devtools/build/lib/runtime:blaze_server_startup_options",
         "//src/main/java/com/google/devtools/common/options",
         "//src/main/java/com/google/devtools/common/options:invocation_policy",
         "//src/main/protobuf:invocation_policy_java_proto",
-        "//third_party:guava",
-        "//third_party:junit4",
+        "//third_party/java/guava:collect",
+        "//third_party/java/guava:io",
+        "//third_party/java/junit",
     ],
 )
 
@@ -42,19 +47,23 @@ java_test(
     deps = [
         ":testutils",
         "//src/main/java/com/google/devtools/build/lib/util:classpath",
+        "//src/main/java/com/google/devtools/build/lib/util:string_encoding",
         "//src/main/java/com/google/devtools/common/options",
+        "//src/main/java/com/google/devtools/common/options:html_utils",
         "//src/main/java/com/google/devtools/common/options:invocation_policy",
         "//src/main/java/com/google/devtools/common/options/testing",
         "//src/main/protobuf:invocation_policy_java_proto",
         "//src/main/protobuf:option_filters_java_proto",
         "//src/test/java/com/google/devtools/build/lib/testutil:TestSuite",
-        "//third_party:flogger",
-        "//third_party:guava",
-        "//third_party:guava-testlib",
-        "//third_party:jimfs",
-        "//third_party:junit4",
-        "//third_party:mockito",
-        "//third_party:truth",
-        "@com_google_testparameterinjector//:testparameterinjector",
+        "//third_party/java/flogger",
+        "//third_party/java/guava:collect",
+        "//third_party/java/guava:escape",
+        "//third_party/java/guava:htmlescapers",
+        "//third_party/java/guava:reflect",
+        "//third_party/java/guava:testing",
+        "//third_party/java/jsr305_annotations",
+        "//third_party/java/junit",
+        "//third_party/java/testparameterinjector",
+        "//third_party/java/truth",
     ],
 )

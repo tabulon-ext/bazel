@@ -18,10 +18,16 @@ import static org.junit.Assert.assertThrows;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
+import com.google.common.testing.EqualsTester;
+import com.google.common.testing.GcFinalization;
+import com.google.errorprone.annotations.FormatMethod;
+import com.google.errorprone.annotations.FormatString;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Array;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.IntStream;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -32,11 +38,109 @@ import org.junit.runners.JUnit4;
 @RunWith(JUnit4.class)
 public final class StarlarkListTest {
 
+  private static final class CountingStarlarkValue implements StarlarkValue {
+    private final int id;
+    private final int hash;
+    private int hashCalls;
+
+    CountingStarlarkValue(int id, int hash) {
+      this.id = id;
+      this.hash = hash;
+    }
+
+    int hashCalls() {
+      return hashCalls;
+    }
+
+    @Override
+    public int hashCode() {
+      hashCalls++;
+      return hash;
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      return obj instanceof CountingStarlarkValue other && this.id == other.id;
+    }
+  }
+
   @Test
   public void listAfterRemoveHasExpectedEqualsAndHashCode() throws Exception {
     StarlarkList<String> l = StarlarkList.of(Mutability.create(), "1", "2", "3");
     l.removeElement("3");
     assertThat(l.hashCode()).isEqualTo(StarlarkList.immutableOf("1", "2").hashCode());
+  }
+
+  @Test
+  public void hashCodeMemoizedOnImmutableLists() {
+    CountingStarlarkValue elem1 = new CountingStarlarkValue(1, 42);
+    StarlarkList<Object> immutableSingleton = StarlarkList.immutableOf(elem1);
+    StarlarkList<Object> mutableSingleton = StarlarkList.of(Mutability.create("test"), elem1);
+    int expectedSingletonHash = mutableSingleton.hashCode();
+    assertThat(elem1.hashCalls()).isEqualTo(1);
+
+    assertThat(immutableSingleton.hashCode()).isEqualTo(expectedSingletonHash);
+    assertThat(elem1.hashCalls()).isEqualTo(2);
+    assertThat(immutableSingleton.hashCode()).isEqualTo(expectedSingletonHash);
+    assertThat(elem1.hashCalls()).isEqualTo(2); // Memoized on second call.
+
+    CountingStarlarkValue elem2 = new CountingStarlarkValue(2, 99);
+    StarlarkList<Object> immutableRegular = StarlarkList.immutableOf(elem1, elem2);
+    StarlarkList<Object> mutableRegular = StarlarkList.of(Mutability.create("test"), elem1, elem2);
+    int expectedRegularHash = mutableRegular.hashCode();
+    int callsBeforeRegular = elem2.hashCalls();
+
+    assertThat(immutableRegular.hashCode()).isEqualTo(expectedRegularHash);
+    assertThat(elem2.hashCalls()).isEqualTo(callsBeforeRegular + 1);
+    assertThat(immutableRegular.hashCode()).isEqualTo(expectedRegularHash);
+    assertThat(elem2.hashCalls()).isEqualTo(callsBeforeRegular + 1); // Memoized.
+
+    CountingStarlarkValue elem3 = new CountingStarlarkValue(3, 123);
+    StarlarkList<Object> lazy = StarlarkList.lazyImmutable(() -> ImmutableList.of(elem3));
+    assertThat(lazy.hashCode()).isEqualTo(6047 + 4673 * (31 + 123));
+    assertThat(elem3.hashCalls()).isEqualTo(1);
+    assertThat(lazy.hashCode()).isEqualTo(6047 + 4673 * (31 + 123));
+    assertThat(elem3.hashCalls()).isEqualTo(1); // Memoized.
+  }
+
+  @Test
+  public void zeroRawHashCodeRemappedConsistentlyAcrossAllListTypes() {
+    // Element whose raw hash produces 0 via 6047 + 4673 * (31 + hash) == 0 (mod 2^32).
+    CountingStarlarkValue elem = new CountingStarlarkValue(1, 1132334594);
+    StarlarkList<Object> immutableSingleton = StarlarkList.immutableOf(elem);
+    StarlarkList<Object> lazySingleton = StarlarkList.lazyImmutable(() -> ImmutableList.of(elem));
+    StarlarkList<Object> mutableSingleton = StarlarkList.of(Mutability.create("test"), elem);
+
+    // Raw hash 0 is remapped to non-zero sentinel 1 and cached.
+    assertThat(immutableSingleton.hashCode()).isEqualTo(1);
+    assertThat(immutableSingleton.hashCode()).isEqualTo(1); // Cached
+    assertThat(elem.hashCalls()).isEqualTo(1);
+    assertThat(lazySingleton.hashCode()).isEqualTo(1);
+    assertThat(mutableSingleton.hashCode()).isEqualTo(1);
+    assertThat(immutableSingleton.equals(mutableSingleton)).isTrue();
+
+    // Multi-element list where 6047 + 4673 * (31 * (31 + 0) + 1132333664) == 0 (mod 2^32).
+    CountingStarlarkValue pairElem0 = new CountingStarlarkValue(10, 0);
+    CountingStarlarkValue pairElem1 = new CountingStarlarkValue(11, 1132333664);
+    StarlarkList<Object> immutableRegular = StarlarkList.immutableOf(pairElem0, pairElem1);
+    assertThat(immutableRegular.hashCode()).isEqualTo(1);
+  }
+
+  @Test
+  public void singletonListContainsKey() throws Exception {
+    StarlarkList<String> singleton = StarlarkList.immutableOf("a");
+    assertThat(singleton.containsKey(StarlarkSemantics.DEFAULT, "a")).isTrue();
+    assertThat(singleton.containsKey(StarlarkSemantics.DEFAULT, "b")).isFalse();
+  }
+
+  @Test
+  public void mutableListContainsKeyRespectsSizeNotCapacity() throws Exception {
+    Mutability mu = Mutability.create("test");
+    StarlarkList<String> list = StarlarkList.of(mu, "a", "b", "c");
+    list.removeElement("c"); // elems.length (3) > size (2), elems[2] == null
+    assertThat(list.containsKey(StarlarkSemantics.DEFAULT, "a")).isTrue();
+    assertThat(list.containsKey(StarlarkSemantics.DEFAULT, "c")).isFalse();
+    assertThat(list.containsKey(StarlarkSemantics.DEFAULT, null)).isFalse();
   }
 
   @Test
@@ -58,32 +162,17 @@ public final class StarlarkListTest {
   }
 
   @Test
-  public void testMutatorsCheckMutability() throws Exception {
+  public void testMutatorsCheckMutability() {
     Mutability mutability = Mutability.create("test");
     StarlarkList<Object> list =
         StarlarkList.copyOf(
             mutability, ImmutableList.of(StarlarkInt.of(1), StarlarkInt.of(2), StarlarkInt.of(3)));
     mutability.freeze();
-
-    EvalException e = assertThrows(EvalException.class, () -> list.addElement(StarlarkInt.of(4)));
-    assertThat(e).hasMessageThat().isEqualTo("trying to mutate a frozen list value");
-    e = assertThrows(EvalException.class, () -> list.addElementAt(0, StarlarkInt.of(4)));
-    assertThat(e).hasMessageThat().isEqualTo("trying to mutate a frozen list value");
-    e =
-        assertThrows(
-            EvalException.class,
-            () ->
-                list.addElements(
-                    ImmutableList.of(StarlarkInt.of(4), StarlarkInt.of(5), StarlarkInt.of(6))));
-    assertThat(e).hasMessageThat().isEqualTo("trying to mutate a frozen list value");
-    e = assertThrows(EvalException.class, () -> list.removeElementAt(0));
-    assertThat(e).hasMessageThat().isEqualTo("trying to mutate a frozen list value");
-    e = assertThrows(EvalException.class, () -> list.setElementAt(0, StarlarkInt.of(10)));
-    assertThat(e).hasMessageThat().isEqualTo("trying to mutate a frozen list value");
+    checkImmutable(list);
   }
 
   @Test
-  public void testCannotMutateAfterShallowFreeze() throws Exception {
+  public void testCannotMutateAfterShallowFreeze() {
     Mutability mutability = Mutability.createAllowingShallowFreeze("test");
     StarlarkList<Object> list =
         StarlarkList.copyOf(
@@ -107,7 +196,7 @@ public final class StarlarkListTest {
   }
 
   @Test
-  public void testWrapTakesOwnershipOfArray() throws EvalException {
+  public void testWrapTakesOwnershipOfArray() {
     Object[] wrapped = {"hello"};
     Mutability mutability = Mutability.create("test");
     StarlarkList<Object> mutableList = StarlarkList.wrap(mutability, wrapped);
@@ -123,6 +212,55 @@ public final class StarlarkListTest {
     StarlarkList<Object> list = StarlarkList.of(mu, "a", "b");
     list.addElement(StarlarkInt.of(1)); // no ArrayStoreException
     assertThat(list.toString()).isEqualTo("[\"a\", \"b\", 1]");
+  }
+
+  @Test
+  public void immutableSingleton() throws Exception {
+    StarlarkList<Object> list = StarlarkList.immutableOf("a");
+    checkImmutable(list);
+    assertThat((List<?>) list).containsExactly("a");
+    assertThat(list.containsKey(StarlarkSemantics.DEFAULT, "a")).isTrue();
+    assertThat(list.containsKey(StarlarkSemantics.DEFAULT, "b")).isFalse();
+    new EqualsTester()
+        .addEqualityGroup(
+            list, StarlarkList.of(Mutability.create("test"), "a"), StarlarkList.immutableOf("a"))
+        .addEqualityGroup(StarlarkList.immutableOf("b"))
+        .testEquals();
+  }
+
+  @Test
+  public void immutableMultiElement() {
+    StarlarkList<Object> list = StarlarkList.immutableOf("a", "b", "c");
+    checkImmutable(list);
+    assertThat((List<?>) list).containsExactly("a", "b", "c").inOrder();
+    new EqualsTester()
+        .addEqualityGroup(
+            list,
+            StarlarkList.of(Mutability.create("test"), "a", "b", "c"),
+            StarlarkList.immutableOf("a", "b", "c"))
+        .addEqualityGroup(StarlarkList.immutableOf("a", "b", "d"))
+        .testEquals();
+  }
+
+  @Test
+  public void lazyImmutable() {
+    AtomicBoolean called = new AtomicBoolean(false);
+    StarlarkList.SerializableListSupplier<Object> supplier =
+        () -> {
+          assertThat(called.getAndSet(true)).isFalse();
+          return ImmutableList.of("a", "b", "c");
+        };
+    StarlarkList<Object> list = StarlarkList.lazyImmutable(supplier);
+    assertThat(called.get()).isFalse();
+    assertThat((List<?>) list).containsExactly("a", "b", "c").inOrder();
+    assertThat(list.get(0)).isEqualTo("a"); // Supplier not called twice.
+
+    // Supplier is discarded.
+    var ref = new WeakReference<>(supplier);
+    supplier = null;
+    GcFinalization.awaitClear(ref);
+
+    checkImmutable(list);
   }
 
   @Test
@@ -148,7 +286,7 @@ public final class StarlarkListTest {
   }
 
   @Test
-  public void testTupleToArray() throws Exception {
+  public void testTupleToArray() {
     Tuple tuple = Tuple.of(IntStream.range(0, 10).mapToObj(Integer::toString).toArray());
     for (int len : new int[] {0, tuple.size() / 2, tuple.size(), tuple.size() * 2}) {
       for (Class<?> elemType : new Class<?>[] {Object.class, String.class}) {
@@ -162,14 +300,47 @@ public final class StarlarkListTest {
     }
   }
 
-  private static void fail(String format, Object... args) {
+  @Test
+  public void concat_failsCleanlyOnOverflow() throws Exception {
+    System.gc();
+    Mutability mu = Mutability.create("test");
+    // veryBigArray is large enough that veryBigArray.size * 2 > StarlarkList.MAX_ALLOC
+    Object[] veryBigArray = new Object[(1 << 29) + 1]; // This will OOM if jvm max heap is too low.
+    StarlarkList<Object> veryBigList = StarlarkList.wrap(mu, veryBigArray);
+    EvalException e =
+        assertThrows(EvalException.class, () -> StarlarkList.concat(veryBigList, veryBigList, mu));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo("excessive capacity requested (536870913 + 536870913 elements)");
+  }
+
+  @FormatMethod
+  private static void fail(@FormatString String format, Object... args) {
     throw new AssertionError(String.format(format, args));
+  }
+
+  private static void checkImmutable(StarlarkList<Object> list) {
+    EvalException e = assertThrows(EvalException.class, () -> list.addElement(StarlarkInt.of(4)));
+    assertThat(e).hasMessageThat().isEqualTo("trying to mutate a frozen list value");
+    e = assertThrows(EvalException.class, () -> list.addElementAt(0, StarlarkInt.of(4)));
+    assertThat(e).hasMessageThat().isEqualTo("trying to mutate a frozen list value");
+    e =
+        assertThrows(
+            EvalException.class,
+            () ->
+                list.addElements(
+                    ImmutableList.of(StarlarkInt.of(4), StarlarkInt.of(5), StarlarkInt.of(6))));
+    assertThat(e).hasMessageThat().isEqualTo("trying to mutate a frozen list value");
+    e = assertThrows(EvalException.class, () -> list.removeElementAt(0));
+    assertThat(e).hasMessageThat().isEqualTo("trying to mutate a frozen list value");
+    e = assertThrows(EvalException.class, () -> list.setElementAt(0, StarlarkInt.of(10)));
+    assertThat(e).hasMessageThat().isEqualTo("trying to mutate a frozen list value");
   }
 
   // Asserts that seq.toArray(input) returns an array of class input.getClass(),
   // regardless of seq's element type, and contains the correct elements,
   // including trailing null padding if size < len.
-  private void checkToArray(Object[] input, Sequence<?> seq) throws AssertionError {
+  private static void checkToArray(Object[] input, Sequence<?> seq) {
     Arrays.fill(input, "x");
 
     Object[] output = seq.toArray(input);
@@ -180,13 +351,13 @@ public final class StarlarkListTest {
       // assert input is unchanged
       for (int i = 0; i < input.length; i++) {
         if (!input[i].equals("x")) {
-          fail("input[%d] = %s, want \"x\"", i, Starlark.repr(input[i]));
+          fail("input[%d] = %s, want \"x\"", i, Starlark.repr(input[i], StarlarkSemantics.DEFAULT));
         }
       }
 
       Object[] expected = IntStream.range(0, seq.size()).mapToObj(Integer::toString).toArray();
       if (!Arrays.equals(output, expected)) {
-        fail("output array = %s, want %s", output, expected);
+        fail("output array = %s, want %s", Arrays.toString(output), Arrays.toString(expected));
       }
     } else if (output != input) {
       for (int j = 0; j < output.length; ++j) {

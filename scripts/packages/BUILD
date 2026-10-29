@@ -1,13 +1,27 @@
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load(":self_extract_binary.bzl", "self_extract_binary")
 
 package(default_visibility = ["//scripts/packages:__subpackages__"])
+
+sh_test(
+    name = "template_bin_test",
+    size = "small",
+    srcs = ["template_bin_test.sh"],
+    data = [
+        "template_bin.sh",
+        "//src/test/shell:bashunit",
+        "@bazel_tools//tools/bash/runfiles",
+    ],
+    tags = ["no_windows"],  # The self-extracting installer is for Unix systems.
+)
 
 filegroup(
     name = "srcs",
     srcs = glob(["**"]) + [
         "//scripts/packages/debian:srcs",
-        "//scripts/packages/fedora:srcs",
         "//scripts/packages/dmg:srcs",
+        "//scripts/packages/fedora:srcs",
     ],
     visibility = [
         "//scripts:__pkg__",
@@ -25,14 +39,14 @@ filegroup(
         "//src/conditions:freebsd": [],
         "//src/conditions:openbsd": [],
         "//src/conditions:darwin": [
+            ":generate-package-info",
             ":with-jdk/install.sh",
             ":without-jdk/install.sh",
-            ":generate-package-info",
         ],
         "//conditions:default": [
+            ":generate-package-info",
             ":with-jdk/install.sh",
             ":without-jdk/install.sh",
-            ":generate-package-info",
             "//:bazel-distfile",
             "//scripts/packages/debian:bazel-debian",
             "//scripts/packages/debian:bazel-debian-src",
@@ -87,7 +101,25 @@ genrule(
     cmd = """
         release_info="$$(cat $(location :README.md))"
         template="$$(cat $(location template_bin.sh))"
-        echo "$${template//%release_info%/$${release_info}}" >$@
+        target_os=""" + select({
+        "//src/conditions:darwin": "\"darwin\"",
+        "//src/conditions:freebsd": "\"freebsd\"",
+        "//src/conditions:openbsd": "\"openbsd\"",
+        "//conditions:default": "\"linux\"",
+    }) + """
+        target_arch=""" + select({
+        "//src/conditions:linux_x86_64": "\"x86_64\"",
+        "//src/conditions:linux_aarch64": "\"aarch64\"",
+        "//src/conditions:darwin_x86_64": "\"x86_64\"",
+        "//src/conditions:darwin_arm64": "\"arm64\"",
+        "//src/conditions:linux_arm": "\"arm\"",
+        "//src/conditions:linux_ppc": "\"ppc\"",
+        "//src/conditions:linux_s390x": "\"s390x\"",
+        "//conditions:default": "\"x86_64\"",  # Fallback
+    }) + """
+        template="$${template//%release_info%/$$release_info}"
+        template="$${template//%target_os%/$$target_os}"
+        echo "$${template//%target_arch%/$$target_arch}" >$@
         """,
 )
 
@@ -142,4 +174,9 @@ genrule(
         " | grep EMBED_LABEL | cut -d ' ' -f 2-" +
         " > $@\n",
     stamp = 1,
+)
+
+exports_files(
+    ["bazel.bazelrc"],
+    visibility = ["//scripts/packages:__subpackages__"],
 )

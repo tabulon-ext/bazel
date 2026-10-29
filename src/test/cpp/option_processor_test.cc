@@ -14,12 +14,15 @@
 
 #include "src/main/cpp/option_processor.h"
 
+#include <cstddef>
 #include <memory>
+#include <vector>
 
 #include "src/main/cpp/bazel_startup_options.h"
 #include "src/main/cpp/blaze_util.h"
 #include "src/main/cpp/blaze_util_platform.h"
 #include "src/main/cpp/option_processor-internal.h"
+#include "src/main/cpp/util/exit_code.h"
 #include "src/main/cpp/util/file.h"
 #include "src/main/cpp/util/file_platform.h"
 #include "src/main/cpp/util/path.h"
@@ -41,25 +44,16 @@ class OptionProcessorTest : public ::testing::Test {
   void SetUp() override {
     ASSERT_TRUE(blaze_util::MakeDirectories(workspace_, 0755));
     option_processor_.reset(new OptionProcessor(
-        workspace_layout_.get(),
-        std::unique_ptr<StartupOptions>(
-            new BazelStartupOptions(workspace_layout_.get()))));
+        workspace_layout_.get(), std::make_unique<BazelStartupOptions>()));
   }
 
   void TearDown() override {
-    // TODO(bazel-team): The code below deletes all the files in the workspace
-    // but it intentionally skips directories. As a consequence, there may be
-    // empty directories from test to test. Remove this once
-    // blaze_util::DeleteDirectories(path) exists.
-    std::vector<std::string> files_in_workspace;
-    blaze_util::GetAllFilesUnder(workspace_, &files_in_workspace);
-    for (const std::string& file : files_in_workspace) {
-      blaze_util::UnlinkPath(file);
-    }
+    blaze::UnsetEnv("BLAZE_DEFAULT_TOOL_TAG");
+    blaze_util::RemoveRecursively(blaze_util::Path(workspace_));
   }
 
-  void FailedSplitStartupOptionsTest(const std::vector<std::string>& args,
-                                     const std::string& expected_error) const {
+  void FailedSplitCommandLineTest(const std::vector<std::string>& args,
+                                  const std::string& expected_error) const {
     std::string error;
     const std::unique_ptr<CommandLine> result =
         option_processor_->SplitCommandLine(args, &error);
@@ -67,8 +61,8 @@ class OptionProcessorTest : public ::testing::Test {
     ASSERT_EQ(nullptr, result);
   }
 
-  void SuccessfulSplitStartupOptionsTest(const std::vector<std::string>& args,
-                                         const CommandLine& expected) const {
+  void SuccessfulSplitCommandLineTest(const std::vector<std::string>& args,
+                                      const CommandLine& expected) const {
     std::string error;
     const std::unique_ptr<CommandLine> result =
         option_processor_->SplitCommandLine(args, &error);
@@ -100,9 +94,13 @@ class OptionProcessorTest : public ::testing::Test {
 };
 
 TEST_F(OptionProcessorTest, CanParseOptions) {
-  const std::vector<std::string> args = {"bazel",     "--host_jvm_args=MyParam",
-                                         "--nobatch", "command",
-                                         "--flag",    "//my:target",
+  const std::vector<std::string> args = {"bazel",
+                                         "--ignore_all_rc_files",
+                                         "--host_jvm_args=MyParam",
+                                         "--nobatch",
+                                         "command",
+                                         "--flag",
+                                         "//my:target",
                                          "--flag2=42"};
   std::string error;
   ASSERT_EQ(blaze_exit_code::SUCCESS,
@@ -135,9 +133,13 @@ TEST_F(OptionProcessorTest, CanParseOptions) {
 }
 
 TEST_F(OptionProcessorTest, CanParseHelpCommandSurroundedByOtherArgs) {
-  const std::vector<std::string> args = {"bazel",     "--host_jvm_args=MyParam",
-                                         "--nobatch", "help",
-                                         "--flag",    "//my:target",
+  const std::vector<std::string> args = {"bazel",
+                                         "--ignore_all_rc_files",
+                                         "--host_jvm_args=MyParam",
+                                         "--nobatch",
+                                         "help",
+                                         "--flag",
+                                         "//my:target",
                                          "--flag2=42"};
   std::string error;
   ASSERT_EQ(blaze_exit_code::SUCCESS,
@@ -196,9 +198,12 @@ TEST_F(OptionProcessorTest, CanParseEmptyArgs) {
 }
 
 TEST_F(OptionProcessorTest, CanParseDifferentStartupArgs) {
-  const std::vector<std::string> args =
-      {"bazel",
-       "--nobatch", "--host_jvm_args=MyParam", "--host_jvm_args", "42"};
+  const std::vector<std::string> args = {"bazel",
+                                         "--nobatch",
+                                         "--ignore_all_rc_files",
+                                         "--host_jvm_args=MyParam",
+                                         "--host_jvm_args",
+                                         "42"};
   std::string error;
   ASSERT_EQ(blaze_exit_code::SUCCESS,
             option_processor_->ParseOptions(args, workspace_, cwd_, &error))
@@ -233,112 +238,99 @@ TEST_F(OptionProcessorTest, CanParseDifferentStartupArgs) {
 }
 
 TEST_F(OptionProcessorTest, SplitCommandLineWithEmptyArgs) {
-  FailedSplitStartupOptionsTest(
-      {},
-      "Unable to split command line, args is empty");
+  FailedSplitCommandLineTest({}, "Unable to split command line, args is empty");
 }
 
 TEST_F(OptionProcessorTest, SplitCommandLineWithAllParams) {
-  SuccessfulSplitStartupOptionsTest(
-      {"bazel", "--nomaster_bazelrc", "build", "--bar", ":mytarget"},
-      CommandLine("bazel",
-                  {"--nomaster_bazelrc"},
-                  "build",
+  SuccessfulSplitCommandLineTest(
+      {"bazel", "--ignore_all_rc_files", "build", "--bar", ":mytarget"},
+      CommandLine("bazel", {"--ignore_all_rc_files"}, "build",
                   {"--bar", ":mytarget"}));
 }
 
 TEST_F(OptionProcessorTest, SplitCommandLineWithAbsolutePathToBinary) {
-  SuccessfulSplitStartupOptionsTest(
+  SuccessfulSplitCommandLineTest(
       {"mybazel", "build", ":mytarget"},
       CommandLine("mybazel", {}, "build", {":mytarget"}));
 }
 
 TEST_F(OptionProcessorTest, SplitCommandLineWithUnaryStartupWithEquals) {
-  SuccessfulSplitStartupOptionsTest(
+  SuccessfulSplitCommandLineTest(
       {"bazel", "--bazelrc=foo", "build", ":mytarget"},
       CommandLine("bazel", {"--bazelrc=foo"}, "build", {":mytarget"}));
 }
 
 TEST_F(OptionProcessorTest,
        SplitCommandLineWithUnaryStartupWithoutEquals) {
-  SuccessfulSplitStartupOptionsTest(
+  SuccessfulSplitCommandLineTest(
       {"bazel", "--bazelrc", "foo", "build", ":mytarget"},
       CommandLine("bazel", {"--bazelrc=foo"}, "build", {":mytarget"}));
 }
 
 TEST_F(OptionProcessorTest, SplitCommandLineWithIncompleteUnaryOption) {
-  FailedSplitStartupOptionsTest(
+  FailedSplitCommandLineTest(
       {"bazel", "--bazelrc"},
       "Startup option '--bazelrc' expects a value.\n"
-          "Usage: '--bazelrc=somevalue' or '--bazelrc somevalue'.\n"
-          "  For more info, run 'bazel help startup_options'.");
+      "Usage: '--bazelrc=somevalue' or '--bazelrc somevalue'.\n"
+      "  For more info, run 'bazel help startup_options'.");
 }
 
 TEST_F(OptionProcessorTest, SplitCommandLineWithMultipleStartup) {
-  SuccessfulSplitStartupOptionsTest(
-      {"bazel", "--bazelrc", "foo", "--nomaster_bazelrc", "build", ":mytarget"},
-      CommandLine("bazel",
-                  {"--bazelrc=foo", "--nomaster_bazelrc"},
-                  "build",
+  SuccessfulSplitCommandLineTest(
+      {"bazel", "--bazelrc", "foo", "--ignore_all_rc_files", "build",
+       ":mytarget"},
+      CommandLine("bazel", {"--bazelrc=foo", "--ignore_all_rc_files"}, "build",
                   {":mytarget"}));
 }
 
 TEST_F(OptionProcessorTest, SplitCommandLineWithNoStartupArgs) {
-  SuccessfulSplitStartupOptionsTest(
+  SuccessfulSplitCommandLineTest(
       {"bazel", "build", ":mytarget"},
       CommandLine("bazel", {}, "build", {":mytarget"}));
 }
 
 TEST_F(OptionProcessorTest, SplitCommandLineWithNoCommandArgs) {
-  SuccessfulSplitStartupOptionsTest(
-      {"bazel", "build"},
-      CommandLine("bazel", {}, "build", {}));
+  SuccessfulSplitCommandLineTest({"bazel", "build"},
+                                 CommandLine("bazel", {}, "build", {}));
 }
 
 TEST_F(OptionProcessorTest, SplitCommandLineWithBlazeHelp) {
-  SuccessfulSplitStartupOptionsTest(
-      {"bazel", "help"},
-      CommandLine("bazel", {}, "help", {}));
+  SuccessfulSplitCommandLineTest({"bazel", "help"},
+                                 CommandLine("bazel", {}, "help", {}));
 
-  SuccessfulSplitStartupOptionsTest(
-      {"bazel", "-h"},
-      CommandLine("bazel", {}, "-h", {}));
+  SuccessfulSplitCommandLineTest({"bazel", "-h"},
+                                 CommandLine("bazel", {}, "-h", {}));
 
-  SuccessfulSplitStartupOptionsTest(
-      {"bazel", "-help"},
-      CommandLine("bazel", {}, "-help", {}));
+  SuccessfulSplitCommandLineTest({"bazel", "-help"},
+                                 CommandLine("bazel", {}, "-help", {}));
 
-  SuccessfulSplitStartupOptionsTest(
-      {"bazel", "--help"},
-      CommandLine("bazel", {}, "--help", {}));
+  SuccessfulSplitCommandLineTest({"bazel", "--help"},
+                                 CommandLine("bazel", {}, "--help", {}));
 }
 
 TEST_F(OptionProcessorTest, SplitCommandLineWithBlazeVersion) {
-  SuccessfulSplitStartupOptionsTest(
-      {"bazel", "version"},
-      CommandLine("bazel", {}, "version", {}));
+  SuccessfulSplitCommandLineTest({"bazel", "version"},
+                                 CommandLine("bazel", {}, "version", {}));
 }
 
 TEST_F(OptionProcessorTest, SplitCommandLineWithMultipleCommandArgs) {
-  SuccessfulSplitStartupOptionsTest(
+  SuccessfulSplitCommandLineTest(
       {"bazel", "build", "--foo", "-s", ":mytarget"},
       CommandLine("bazel", {}, "build", {"--foo", "-s", ":mytarget"}));
 }
 
 TEST_F(OptionProcessorTest,
        SplitCommandLineFailsWithDashDashInStartupArgs) {
-  FailedSplitStartupOptionsTest(
+  FailedSplitCommandLineTest(
       {"bazel", "--"},
       "Unknown startup option: '--'.\n"
-          "  For more info, run 'bazel help startup_options'.");
+      "  For more info, run 'bazel help startup_options'.");
 }
 
 TEST_F(OptionProcessorTest, SplitCommandLineWithDashDash) {
-  SuccessfulSplitStartupOptionsTest(
-      {"bazel", "--nomaster_bazelrc", "build", "--b", "--", ":mytarget"},
-      CommandLine("bazel",
-                  {"--nomaster_bazelrc"},
-                  "build",
+  SuccessfulSplitCommandLineTest(
+      {"bazel", "--ignore_all_rc_files", "build", "--b", "--", ":mytarget"},
+      CommandLine("bazel", {"--ignore_all_rc_files"}, "build",
                   {"--b", "--", ":mytarget"}));
 }
 
@@ -403,6 +395,106 @@ TEST_F(OptionProcessorTest, TestDedupePathsWithSymbolicLink) {
   std::vector<std::string> expected = {foo_path};
   ASSERT_EQ(expected, internal::DedupeBlazercPaths(input));
 }
+
+
+TEST_F(OptionProcessorTest,
+       SplitCommandLineFailsWithDeprecatedOptionInStartupArgs) {
+  FailedSplitCommandLineTest(
+      {"bazel", "--nomaster_bazelrc"},
+      "Unknown startup option: '--nomaster_bazelrc'.\n"
+      "  For more info, run 'bazel help startup_options'.");
+}
 #endif  // !defined(_WIN32) && !defined(__CYGWIN__)
+
+TEST_F(OptionProcessorTest, QuietSuppressesEmacsTerminalOption) {
+  blaze::SetEnv("EMACS", "t");
+
+  // In normal mode, --emacs is added when running in Emacs.
+  {
+    std::string error;
+    std::unique_ptr<OptionProcessor> processor =
+        std::make_unique<OptionProcessor>(
+            workspace_layout_.get(), std::make_unique<BazelStartupOptions>());
+    ASSERT_EQ(
+        blaze_exit_code::SUCCESS,
+        processor->ParseOptions({"bazel", "--ignore_all_rc_files", "build"},
+                                workspace_, cwd_, &error))
+        << error;
+    bool has_emacs = false;
+    for (const auto& opt : processor->GetParsedBlazercOptions()) {
+      if (opt.option == "--emacs") {
+        has_emacs = true;
+      }
+    }
+    EXPECT_TRUE(has_emacs);
+  }
+
+  // In quiet mode, --emacs is suppressed.
+  {
+    std::string error;
+    std::unique_ptr<OptionProcessor> processor =
+        std::make_unique<OptionProcessor>(
+            workspace_layout_.get(), std::make_unique<BazelStartupOptions>());
+    ASSERT_EQ(blaze_exit_code::SUCCESS,
+              processor->ParseOptions(
+                  {"bazel", "--quiet", "--ignore_all_rc_files", "build"},
+                  workspace_, cwd_, &error))
+        << error;
+    bool has_emacs = false;
+    for (const auto& opt : processor->GetParsedBlazercOptions()) {
+      if (opt.option == "--emacs") {
+        has_emacs = true;
+      }
+    }
+    EXPECT_FALSE(has_emacs);
+  }
+
+  blaze::UnsetEnv("EMACS");
+}
+
+TEST_F(OptionProcessorTest, DefaultToolTagEnvOption) {
+  blaze::SetEnv("BLAZE_DEFAULT_TOOL_TAG", "test_default_tool_tag");
+
+  {
+    std::string error;
+    std::unique_ptr<OptionProcessor> processor =
+        std::make_unique<OptionProcessor>(
+            workspace_layout_.get(), std::make_unique<BazelStartupOptions>());
+    ASSERT_EQ(
+        blaze_exit_code::SUCCESS,
+        processor->ParseOptions({"bazel", "--ignore_all_rc_files", "build"},
+                                workspace_, cwd_, &error))
+        << error;
+    bool has_default_tool_tag = false;
+    for (const auto& opt : processor->GetParsedBlazercOptions()) {
+      if (opt.source_path == "client" && opt.command == "common" &&
+          opt.option == "--tool_tag=test_default_tool_tag") {
+        has_default_tool_tag = true;
+      }
+    }
+    EXPECT_TRUE(has_default_tool_tag);
+  }
+
+  blaze::UnsetEnv("BLAZE_DEFAULT_TOOL_TAG");
+
+  {
+    std::string error;
+    std::unique_ptr<OptionProcessor> processor =
+        std::make_unique<OptionProcessor>(
+            workspace_layout_.get(), std::make_unique<BazelStartupOptions>());
+    ASSERT_EQ(
+        blaze_exit_code::SUCCESS,
+        processor->ParseOptions({"bazel", "--ignore_all_rc_files", "build"},
+                                workspace_, cwd_, &error))
+        << error;
+    bool has_tool_tag = false;
+    for (const auto& opt : processor->GetParsedBlazercOptions()) {
+      if (opt.option.find("--tool_tag=") == 0) {
+        has_tool_tag = true;
+      }
+    }
+    EXPECT_FALSE(has_tool_tag);
+  }
+}
 
 }  // namespace blaze

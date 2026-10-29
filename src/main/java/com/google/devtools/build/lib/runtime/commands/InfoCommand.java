@@ -13,6 +13,9 @@
 // limitations under the License.
 package com.google.devtools.build.lib.runtime.commands;
 
+import static com.google.devtools.build.lib.runtime.Command.BuildPhase.NONE;
+
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Supplier;
 import com.google.common.base.Suppliers;
 import com.google.common.collect.ImmutableList;
@@ -20,6 +23,7 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.analysis.NoBuildEvent;
 import com.google.devtools.build.lib.analysis.config.BuildConfigurationValue;
+import com.google.devtools.build.lib.analysis.config.BuildOptions;
 import com.google.devtools.build.lib.analysis.config.InvalidConfigurationException;
 import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.profiler.Profiler;
@@ -30,7 +34,6 @@ import com.google.devtools.build.lib.runtime.BlazeRuntime;
 import com.google.devtools.build.lib.runtime.Command;
 import com.google.devtools.build.lib.runtime.CommandEnvironment;
 import com.google.devtools.build.lib.runtime.InfoItem;
-import com.google.devtools.build.lib.runtime.StarlarkOptionsParser;
 import com.google.devtools.build.lib.runtime.commands.info.BlazeBinInfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.BlazeGenfilesInfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.BlazeTestlogsInfoItem;
@@ -39,14 +42,20 @@ import com.google.devtools.build.lib.runtime.commands.info.CharacterEncodingInfo
 import com.google.devtools.build.lib.runtime.commands.info.ClientEnv;
 import com.google.devtools.build.lib.runtime.commands.info.CommittedHeapSizeInfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.DefaultPackagePathInfoItem;
-import com.google.devtools.build.lib.runtime.commands.info.DefaultsPackageInfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.ExecutionRootInfoItem;
+import com.google.devtools.build.lib.runtime.commands.info.ExternalDirectoryInfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.GcCountInfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.GcTimeInfoItem;
+import com.google.devtools.build.lib.runtime.commands.info.InfoItemHandler;
+import com.google.devtools.build.lib.runtime.commands.info.InfoItemHandler.InfoItemHandlerFactory;
+import com.google.devtools.build.lib.runtime.commands.info.InfoItemHandler.InfoItemHandlerFactoryImpl;
+import com.google.devtools.build.lib.runtime.commands.info.InfoItemHandler.InfoItemOutputType;
 import com.google.devtools.build.lib.runtime.commands.info.InstallBaseInfoItem;
+import com.google.devtools.build.lib.runtime.commands.info.InstallMd5InfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.JavaHomeInfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.JavaRuntimeInfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.JavaVirtualMachineInfoItem;
+import com.google.devtools.build.lib.runtime.commands.info.LocalResourcesInfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.MakeInfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.MaxHeapSizeInfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.OutputBaseInfoItem;
@@ -58,6 +67,7 @@ import com.google.devtools.build.lib.runtime.commands.info.ServerPidInfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.StarlarkSemanticsInfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.UsedHeapSizeAfterGcInfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.UsedHeapSizeInfoItem;
+import com.google.devtools.build.lib.runtime.commands.info.WorkerMetricsInfoItem;
 import com.google.devtools.build.lib.runtime.commands.info.WorkspaceInfoItem;
 import com.google.devtools.build.lib.server.FailureDetails;
 import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
@@ -65,63 +75,70 @@ import com.google.devtools.build.lib.util.AbruptExitException;
 import com.google.devtools.build.lib.util.DetailedExitCode;
 import com.google.devtools.build.lib.util.ExitCode;
 import com.google.devtools.build.lib.util.InterruptedFailureDetails;
-import com.google.devtools.build.lib.util.Pair;
-import com.google.devtools.build.lib.util.io.OutErr;
+import com.google.devtools.common.options.EnumConverter;
 import com.google.devtools.common.options.Option;
 import com.google.devtools.common.options.OptionDocumentationCategory;
 import com.google.devtools.common.options.OptionEffectTag;
-import com.google.devtools.common.options.OptionMetadataTag;
 import com.google.devtools.common.options.OptionsBase;
+import com.google.devtools.common.options.OptionsClass;
 import com.google.devtools.common.options.OptionsParsingResult;
+import com.google.devtools.common.options.OptionsProvider;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
+import net.starlark.java.spelling.SpellChecker;
 
-/**
- * Implementation of 'blaze info'.
- */
-@Command(name = "info",
-         // TODO(bazel-team): this is not really a build command, but needs access to the
-         // configuration options to do its job
-         builds = true,
-         allowResidue = true,
-         binaryStdOut = true,
-         help = "resource:info.txt",
-         shortDescription = "Displays runtime info about the %{product} server.",
-         options = { InfoCommand.Options.class },
-         completion = "info-key",
-         // We have InfoCommand inherit from {@link BuildCommand} because we want all
-         // configuration defaults specified in ~/.blazerc for {@code build} to apply to
-         // {@code info} too, even though it doesn't actually do a build.
-         //
-         // (Ideally there would be a way to make {@code info} inherit just the bare
-         // minimum of relevant options from {@code build}, i.e. those that affect the
-         // values it prints.  But there's no such mechanism.)
-         inherits = { BuildCommand.class })
+/** Implementation of 'blaze info'. */
+@Command(
+    name = "info",
+    buildPhase = NONE,
+    allowResidue = true,
+    binaryStdOut = true,
+    help = "resource:info.txt",
+    shortDescription = "Displays runtime info about the %{product} server.",
+    options = {InfoCommand.Options.class},
+    completion = "info-key",
+    mustRunInWorkspace = false,
+    // We have InfoCommand inherit from {@link BuildCommand} because we want all
+    // configuration defaults specified in ~/.blazerc for {@code build} to apply to
+    // {@code info} too, even though it doesn't actually do a build.
+    //
+    // (Ideally there would be a way to make {@code info} inherit just the bare
+    // minimum of relevant options from {@code build}, i.e. those that affect the
+    // values it prints.  But there's no such mechanism.)
+    inheritsOptionsFrom = {BuildCommand.class})
 public class InfoCommand implements BlazeCommand {
 
   /** Options for the info command. */
-  public static class Options extends OptionsBase {
+  @OptionsClass
+  public abstract static class Options extends OptionsBase {
     @Option(
-      name = "show_make_env",
-      defaultValue = "false",
-      documentationCategory = OptionDocumentationCategory.LOGGING,
-      effectTags = {OptionEffectTag.AFFECTS_OUTPUTS, OptionEffectTag.TERMINAL_OUTPUT},
-      help = "Include the \"Make\" environment in the output."
-    )
-    public boolean showMakeEnvironment;
+        name = "show_make_env",
+        defaultValue = "false",
+        documentationCategory = OptionDocumentationCategory.LOGGING,
+        effectTags = {OptionEffectTag.AFFECTS_OUTPUTS, OptionEffectTag.TERMINAL_OUTPUT},
+        help = "Include the \"Make\" environment in the output.")
+    public abstract boolean getShowMakeEnvironment();
 
     @Option(
-        name = "experimental_supports_info_crosstool_configuration",
-        defaultValue = "true",
-        documentationCategory = OptionDocumentationCategory.UNDOCUMENTED,
-        effectTags = {OptionEffectTag.UNKNOWN},
-        metadataTags = {OptionMetadataTag.HIDDEN},
-        help = "Noop.")
-    public boolean experimentalSupportsInfoCrosstoolConfiguration;
+        name = "info_output_type",
+        defaultValue = "stdout",
+        documentationCategory = OptionDocumentationCategory.OUTPUT_PARAMETERS,
+        effectTags = {OptionEffectTag.AFFECTS_OUTPUTS, OptionEffectTag.TERMINAL_OUTPUT},
+        converter = InfoItemOutputTypeConverter.class,
+        help =
+            "If stdout, results are directly printed to the console. If response_proto, the info"
+                + " command results are packed in response extensions.")
+    public abstract InfoItemOutputType getInfoOutputType();
+  }
+
+  private static class InfoItemOutputTypeConverter extends EnumConverter<InfoItemOutputType> {
+    protected InfoItemOutputTypeConverter() {
+      super(InfoItemOutputType.class, "InfoItem output type");
+    }
   }
 
   /**
@@ -141,112 +158,53 @@ public class InfoCommand implements BlazeCommand {
     }
   }
 
+  private final InfoItemHandlerFactory infoItemHandlerFactory;
+
+  @VisibleForTesting
+  public InfoCommand(InfoItemHandlerFactory infoItemHandlerFactory) {
+    this.infoItemHandlerFactory = infoItemHandlerFactory;
+  }
+
+  public InfoCommand() {
+    this.infoItemHandlerFactory = new InfoItemHandlerFactoryImpl();
+  }
+
   @Override
   public BlazeCommandResult exec(
       final CommandEnvironment env, final OptionsParsingResult optionsParsingResult) {
-    final BlazeRuntime runtime = env.getRuntime();
     env.getReporter().switchToAnsiAllowingHandler();
     Options infoOptions = optionsParsingResult.getOptions(Options.class);
-    OutErr outErr = env.getReporter().getOutErr();
-    // Creating a BuildConfigurationValue is expensive and often unnecessary. Delay the creation
-    // until
-    // it is needed. We memoize so that it's cached intra-command (it's still created freshly on
-    // every command since the configuration can change across commands).
     Supplier<BuildConfigurationValue> configurationSupplier =
-        Suppliers.memoize(
-            () -> {
-              try (SilentCloseable c =
-                  Profiler.instance().profile("Creating BuildConfigurationValue")) {
-                // In order to be able to answer configuration-specific queries, we need to set up
-                // the package path. Since info inherits all the build options, all the necessary
-                // information is available here.
-                env.syncPackageLoading(optionsParsingResult);
-                // TODO(bazel-team): What if there are multiple configurations? [multi-config]
-                return env.getSkyframeExecutor()
-                    .getConfiguration(
-                        env.getReporter(),
-                        runtime.createBuildOptions(optionsParsingResult),
-                        /*keepGoing=*/ true);
-              } catch (InvalidConfigurationException e) {
-                env.getReporter().handle(Event.error(e.getMessage()));
-                throw new AbruptExitRuntimeException(e.getDetailedExitCode());
-              } catch (AbruptExitException e) {
-                throw new AbruptExitRuntimeException(e.getDetailedExitCode());
-              } catch (InterruptedException e) {
-                env.getReporter().handle(Event.error("interrupted"));
-                throw new AbruptExitRuntimeException(
-                    InterruptedFailureDetails.detailedExitCode(
-                        "command interrupted while syncing package loading"));
-              }
-            });
+        createConfigurationSupplier(env, optionsParsingResult);
 
+    boolean inWorkspace = env.getDirectories().inWorkspace();
     Map<String, InfoItem> items = getInfoItemMap(env, optionsParsingResult);
+    List<String> residue = optionsParsingResult.getResidue();
 
-    try {
-      if (infoOptions.showMakeEnvironment) {
-        Map<String, String> makeEnv = configurationSupplier.get().getMakeEnvironment();
-        for (Map.Entry<String, String> entry : makeEnv.entrySet()) {
-          InfoItem item = new MakeInfoItem(entry.getKey(), entry.getValue());
-          items.put(item.getName(), item);
+    try (InfoItemHandler infoItemHandler =
+        infoItemHandlerFactory.create(
+            env, infoOptions.getInfoOutputType(), /* printKeys= */ residue.size() != 1)) {
+      if (infoOptions.getShowMakeEnvironment()) {
+        Optional<BlazeCommandResult> failure =
+            populateMakeEnvironment(env, inWorkspace, configurationSupplier, items);
+        if (failure.isPresent()) {
+          return failure.get();
         }
-      }
-
-      Pair<ImmutableList<String>, ImmutableList<String>> starlarkOptionsAndResidue =
-          StarlarkOptionsParser.removeStarlarkOptions(optionsParsingResult.getResidue());
-      ImmutableList<String> removedStarlarkOptions = starlarkOptionsAndResidue.getFirst();
-      ImmutableList<String> residue = starlarkOptionsAndResidue.getSecond();
-      if (!removedStarlarkOptions.isEmpty()) {
-        env.getReporter()
-            .handle(
-                Event.warn(
-                    "info command does not support starlark options. Ignoring options: "
-                        + removedStarlarkOptions));
       }
 
       env.getEventBus().post(new NoBuildEvent());
       if (!residue.isEmpty()) {
-        ImmutableSet.Builder<String> unknownKeysBuilder = ImmutableSet.builder();
-        for (String key : residue) {
-          byte[] value;
-          if (items.containsKey(key)) {
-            try (SilentCloseable c = Profiler.instance().profile(key + ".infoItem")) {
-              value = items.get(key).get(configurationSupplier, env);
-              if (residue.size() > 1) {
-                outErr.getOutputStream().write((key + ": ").getBytes(StandardCharsets.UTF_8));
-              }
-              outErr.getOutputStream().write(value);
-            }
-          } else {
-            unknownKeysBuilder.add(key);
-          }
-        }
-        ImmutableSet<String> unknownKeys = unknownKeysBuilder.build();
-        if (!unknownKeys.isEmpty()) {
-          String message =
-              "unknown key(s): "
-                  + unknownKeys.stream()
-                      .map(key -> "'" + key + "'")
-                      .collect(Collectors.joining(", "));
-          env.getReporter().handle(Event.error(message));
-          return createFailureResult(
-              message,
-              ExitCode.COMMAND_LINE_ERROR,
-              FailureDetails.InfoCommand.Code.KEY_NOT_RECOGNIZED);
-        }
-      } else { // print them all
-        configurationSupplier.get();  // We'll need this later anyway
-        for (InfoItem infoItem : items.values()) {
-          if (infoItem.isHidden()) {
-            continue;
-          }
-          outErr.getOutputStream().write(
-              (infoItem.getName() + ": ").getBytes(StandardCharsets.UTF_8));
-          try (SilentCloseable c = Profiler.instance().profile(infoItem.getName() + ".infoItem")) {
-            outErr.getOutputStream().write(infoItem.get(configurationSupplier, env));
-          }
-        }
+        return printSpecifiedKeys(
+            env,
+            optionsParsingResult,
+            items,
+            residue,
+            configurationSupplier,
+            infoItemHandler,
+            inWorkspace);
       }
-      outErr.getOutputStream().flush();
+      return printAllKeys(
+          env, optionsParsingResult, items, configurationSupplier, infoItemHandler, inWorkspace);
     } catch (AbruptExitException e) {
       return BlazeCommandResult.detailedExitCode(e.getDetailedExitCode());
     } catch (AbruptExitRuntimeException e) {
@@ -260,7 +218,158 @@ public class InfoCommand implements BlazeCommand {
       return BlazeCommandResult.detailedExitCode(
           InterruptedFailureDetails.detailedExitCode("info interrupted"));
     }
+  }
+
+  private static Supplier<BuildConfigurationValue> createConfigurationSupplier(
+      CommandEnvironment env, OptionsParsingResult optionsParsingResult) {
+    final BlazeRuntime runtime = env.getRuntime();
+    // Creating a BuildConfigurationValue is expensive and often unnecessary. Delay the creation
+    // until it is needed. We memoize so that it's cached intra-command (it's still created freshly
+    // on every command since the configuration can change across commands).
+    return Suppliers.memoize(
+        () -> {
+          try (SilentCloseable c =
+              Profiler.instance().profile("Creating BuildConfigurationValue")) {
+            // In order to be able to answer configuration-specific queries, we need to set up
+            // the package path. Since info inherits all the build options, all the necessary
+            // information is available here.
+            ensureSyncPackageLoading(env, optionsParsingResult);
+            // TODO(bazel-team): What if there are multiple configurations? [multi-config]
+            BuildOptions buildOptions = runtime.createBuildOptions(optionsParsingResult);
+            env.getSkyframeExecutor().setBaselineConfiguration(buildOptions, env.getReporter());
+            return env.getSkyframeExecutor()
+                .getConfiguration(env.getReporter(), buildOptions, /* keepGoing= */ true);
+          } catch (InvalidConfigurationException e) {
+            env.getReporter().handle(Event.error(e.getMessage()));
+            throw new AbruptExitRuntimeException(e.getDetailedExitCode());
+          } catch (AbruptExitException e) {
+            throw new AbruptExitRuntimeException(e.getDetailedExitCode());
+          } catch (InterruptedException e) {
+            env.getReporter().handle(Event.error("interrupted"));
+            throw new AbruptExitRuntimeException(
+                InterruptedFailureDetails.detailedExitCode(
+                    "command interrupted while syncing package loading"));
+          }
+        });
+  }
+
+  private static Optional<BlazeCommandResult> populateMakeEnvironment(
+      CommandEnvironment env,
+      boolean inWorkspace,
+      Supplier<BuildConfigurationValue> configurationSupplier,
+      Map<String, InfoItem> items) {
+    if (!inWorkspace) {
+      String message =
+          "option '--show_make_env' is only supported from within a workspace (below a"
+              + " directory having a MODULE.bazel file).\n"
+              + "See documentation at https://bazel.build/concepts/build-ref#workspace";
+      env.getReporter().handle(Event.error(message));
+      return Optional.of(
+          createFailureResult(
+              message,
+              ExitCode.COMMAND_LINE_ERROR,
+              FailureDetails.InfoCommand.Code.KEY_NOT_SUPPORTED_OUTSIDE_WORKSPACE));
+    }
+    ImmutableMap<String, String> makeEnv = configurationSupplier.get().getMakeEnvironment();
+    for (Map.Entry<String, String> entry : makeEnv.entrySet()) {
+      InfoItem item = new MakeInfoItem(entry.getKey(), entry.getValue());
+      items.put(item.getName(), item);
+    }
+    return Optional.empty();
+  }
+
+  private static BlazeCommandResult printSpecifiedKeys(
+      CommandEnvironment env,
+      OptionsParsingResult optionsParsingResult,
+      Map<String, InfoItem> items,
+      List<String> keys,
+      Supplier<BuildConfigurationValue> configurationSupplier,
+      InfoItemHandler infoItemHandler,
+      boolean inWorkspace)
+      throws IOException, InterruptedException, AbruptExitException {
+    ImmutableSet.Builder<String> unknownKeysBuilder = ImmutableSet.builder();
+    ImmutableSet.Builder<String> unsupportedKeysBuilder = ImmutableSet.builder();
+    for (String key : keys) {
+      if (items.containsKey(key)) {
+        InfoItem infoItem = items.get(key);
+        if (!inWorkspace && infoItem.requiresWorkspace()) {
+          unsupportedKeysBuilder.add(key);
+          continue;
+        }
+        try (SilentCloseable c = Profiler.instance().profile(key + ".infoItem")) {
+          if (infoItem.needsSyncPackageLoading()) {
+            ensureSyncPackageLoading(env, optionsParsingResult);
+          }
+          byte[] value = infoItem.get(configurationSupplier, env);
+          infoItemHandler.addInfoItem(key, value);
+        }
+      } else {
+        unknownKeysBuilder.add(key);
+      }
+    }
+    ImmutableSet<String> unknownKeys = unknownKeysBuilder.build();
+    if (!unknownKeys.isEmpty()) {
+      String message =
+          "unknown key(s): "
+              + unknownKeys.stream()
+                  .map(key -> "'%s'%s".formatted(key, SpellChecker.didYouMean(key, items.keySet())))
+                  .collect(Collectors.joining(", "));
+      env.getReporter().handle(Event.error(message));
+      return createFailureResult(
+          message, ExitCode.COMMAND_LINE_ERROR, FailureDetails.InfoCommand.Code.KEY_NOT_RECOGNIZED);
+    }
+    ImmutableSet<String> unsupportedKeys = unsupportedKeysBuilder.build();
+    if (!unsupportedKeys.isEmpty()) {
+      String message =
+          String.format(
+              "key(s) only supported from within a workspace (below a directory having a"
+                  + " MODULE.bazel file): %s\n"
+                  + "See documentation at https://bazel.build/concepts/build-ref#workspace",
+              unsupportedKeys.stream()
+                  .map(key -> "'%s'".formatted(key))
+                  .collect(Collectors.joining(", ")));
+      env.getReporter().handle(Event.error(message));
+      return createFailureResult(
+          message,
+          ExitCode.COMMAND_LINE_ERROR,
+          FailureDetails.InfoCommand.Code.KEY_NOT_SUPPORTED_OUTSIDE_WORKSPACE);
+    }
     return BlazeCommandResult.success();
+  }
+
+  private static BlazeCommandResult printAllKeys(
+      CommandEnvironment env,
+      OptionsParsingResult optionsParsingResult,
+      Map<String, InfoItem> items,
+      Supplier<BuildConfigurationValue> configurationSupplier,
+      InfoItemHandler infoItemHandler,
+      boolean inWorkspace)
+      throws IOException, InterruptedException, AbruptExitException {
+    if (inWorkspace) {
+      var unused = configurationSupplier.get(); // We'll need this later anyway
+    }
+    for (InfoItem infoItem : items.values()) {
+      if (infoItem.isHidden()) {
+        continue;
+      }
+      if (!inWorkspace && infoItem.requiresWorkspace()) {
+        continue;
+      }
+      if (infoItem.needsSyncPackageLoading()) {
+        ensureSyncPackageLoading(env, optionsParsingResult);
+      }
+      try (SilentCloseable c = Profiler.instance().profile(infoItem.getName() + ".infoItem")) {
+        infoItemHandler.addInfoItem(infoItem.getName(), infoItem.get(configurationSupplier, env));
+      }
+    }
+    return BlazeCommandResult.success();
+  }
+
+  private static void ensureSyncPackageLoading(CommandEnvironment env, OptionsProvider options)
+      throws InterruptedException, AbruptExitException {
+    if (!env.hasSyncedPackageLoading()) {
+      env.syncPackageLoading(options);
+    }
   }
 
   private static BlazeCommandResult createFailureResult(
@@ -280,8 +389,10 @@ public class InfoCommand implements BlazeCommand {
         ImmutableList.<InfoItem>of(
             new WorkspaceInfoItem(),
             new InstallBaseInfoItem(),
+            new InstallMd5InfoItem(),
             new OutputBaseInfoItem(productName),
             new ExecutionRootInfoItem(),
+            new ExternalDirectoryInfoItem(),
             new OutputPathInfoItem(),
             new ClientEnv(),
             new BlazeBinInfoItem(productName),
@@ -301,10 +412,11 @@ public class InfoCommand implements BlazeCommand {
             new JavaVirtualMachineInfoItem(),
             new JavaHomeInfoItem(),
             new CharacterEncodingInfoItem(),
-            new DefaultsPackageInfoItem(),
             new BuildLanguageInfoItem(),
             new DefaultPackagePathInfoItem(commandOptions),
-            new StarlarkSemanticsInfoItem(commandOptions));
+            new StarlarkSemanticsInfoItem(commandOptions),
+            new WorkerMetricsInfoItem(),
+            new LocalResourcesInfoItem());
     ImmutableMap.Builder<String, InfoItem> result = new ImmutableMap.Builder<>();
     for (InfoItem item : hardwiredInfoItems) {
       result.put(item.getName(), item);

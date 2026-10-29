@@ -14,48 +14,91 @@
 
 package com.google.devtools.build.lib.cmdline;
 
-import com.google.auto.value.AutoValue;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
-import java.util.HashMap;
+import com.google.common.collect.Maps;
 import java.util.Map;
-import javax.annotation.Nullable;
+import java.util.Map.Entry;
+import java.util.Objects;
+import java.util.Optional;
+import net.starlark.java.spelling.SpellChecker;
 
 /**
- * A class to distinguish repository mappings for repos from WORKSPACE and Bzlmod.
+ * Stores the mapping from apparent repo name to canonical repo name, from the viewpoint of a
+ * context repo.
  *
- * <p>For repositories from the WORKSPACE file, if the requested repo doesn't exist in the mapping,
- * we fallback to the requested name. For repositories from Bzlmod, we return null to let the caller
- * decide what to do. This class won't be needed if one day we don't define external repositories in
- * the WORKSPACE file since {@code fallback} would always be false.
+ * <p>This class must not implement {@link net.starlark.java.eval.StarlarkValue} since instances of
+ * this class are used as markers by {@link
+ * com.google.devtools.build.lib.analysis.starlark.StarlarkCustomCommandLine}.
  */
-@AutoValue
-public abstract class RepositoryMapping {
+public class RepositoryMapping {
+  /* An empty repo mapping with the main repo as the context repo. */
+  public static final RepositoryMapping EMPTY =
+      create(ImmutableMap.of("", RepositoryName.MAIN), RepositoryName.MAIN);
 
-  // Always fallback to the requested name
-  public static final RepositoryMapping ALWAYS_FALLBACK = createAllowingFallback(ImmutableMap.of());
+  private final ImmutableMap<String, RepositoryName> entries;
+  private final RepositoryName contextRepo;
+  // entries has an expensive hashCode() method that isn't cached.
+  private final int hashCode;
 
-  abstract ImmutableMap<RepositoryName, RepositoryName> repositoryMapping();
-
-  /**
-   * The owner repo of this repository mapping. It is for providing useful debug information when
-   * repository mapping fails due to enforcing strict dependency, therefore it's only recorded when
-   * we don't fallback to the requested repo name.
-   */
-  @Nullable
-  abstract String ownerRepo();
-
-  public static RepositoryMapping create(
-      Map<RepositoryName, RepositoryName> repositoryMapping, String ownerRepo) {
-    return new AutoValue_RepositoryMapping(
-        ImmutableMap.copyOf(Preconditions.checkNotNull(repositoryMapping)),
-        Preconditions.checkNotNull(ownerRepo));
+  private RepositoryMapping(
+      Map<String, RepositoryName> entries, int entriesHashCode, RepositoryName contextRepo) {
+    this.entries = ImmutableMap.copyOf(entries);
+    this.contextRepo = contextRepo;
+    this.hashCode = 31 * entriesHashCode + contextRepo.hashCode();
   }
 
-  public static RepositoryMapping createAllowingFallback(
-      Map<RepositoryName, RepositoryName> repositoryMapping) {
-    return new AutoValue_RepositoryMapping(
-        ImmutableMap.copyOf(Preconditions.checkNotNull(repositoryMapping)), null);
+  /** Returns all the entries in this repo mapping. */
+  public final ImmutableMap<String, RepositoryName> entries() {
+    return entries;
+  }
+
+  /**
+   * The context repo of this repository mapping. It is for providing useful debug information when
+   * repository mapping fails due to enforcing strict dependency.
+   */
+  public final RepositoryName contextRepo() {
+    return contextRepo;
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    return this == o
+        || (o instanceof RepositoryMapping that
+            && Objects.equals(entries, that.entries)
+            && Objects.equals(contextRepo, that.contextRepo));
+  }
+
+  @Override
+  public int hashCode() {
+    return hashCode;
+  }
+
+  @Override
+  public String toString() {
+    return String.format("RepositoryMapping{entries=%s, contextRepo=%s}", entries, contextRepo);
+  }
+
+  public static RepositoryMapping create(
+      ImmutableMap<String, RepositoryName> entries, RepositoryName contextRepo) {
+    return createWithKnownEntriesHashCode(
+        entries, entries.hashCode(), Preconditions.checkNotNull(contextRepo));
+  }
+
+  /**
+   * Use this over {@link #create} if the {@link ImmutableMap#hashCode()} of the entries map is
+   * already known.
+   *
+   * <p>Avoids repeated recomputation for RepositoryMapping instances with identical entries maps.
+   */
+  public static RepositoryMapping createWithKnownEntriesHashCode(
+      ImmutableMap<String, RepositoryName> entries,
+      int entriesHashCode,
+      RepositoryName contextRepo) {
+    return new RepositoryMapping(
+        Preconditions.checkNotNull(entries),
+        entriesHashCode,
+        Preconditions.checkNotNull(contextRepo));
   }
 
   /**
@@ -63,10 +106,14 @@ public abstract class RepositoryMapping {
    * additional mappings. If there are conflicts, existing mappings will take precedence.
    */
   public RepositoryMapping withAdditionalMappings(
-      Map<RepositoryName, RepositoryName> additionalMappings) {
-    HashMap<RepositoryName, RepositoryName> allMappings = new HashMap<>(additionalMappings);
-    allMappings.putAll(repositoryMapping());
-    return new AutoValue_RepositoryMapping(ImmutableMap.copyOf(allMappings), ownerRepo());
+      ImmutableMap<String, RepositoryName> additionalMappings) {
+    return create(
+        ImmutableMap.<String, RepositoryName>builderWithExpectedSize(
+                entries().size() + additionalMappings.size())
+            .putAll(additionalMappings)
+            .putAll(entries())
+            .buildKeepingLast(),
+        contextRepo());
   }
 
   /**
@@ -75,22 +122,50 @@ public abstract class RepositoryMapping {
    * repo of the given additional mappings is ignored.
    */
   public RepositoryMapping withAdditionalMappings(RepositoryMapping additionalMappings) {
-    return withAdditionalMappings(additionalMappings.repositoryMapping());
+    return withAdditionalMappings(
+        (additionalMappings == null) ? ImmutableMap.of() : additionalMappings.entries());
   }
 
-  public RepositoryName get(RepositoryName repositoryName) {
-    // 1. @bazel_tools is a special repo that should be visible to all repositories.
-    // 2. @local_config_platform is a special repo that should be visible to all repositories.
-    if (repositoryName.equals(RepositoryName.BAZEL_TOOLS)
-        || repositoryName.equals(RepositoryName.LOCAL_CONFIG_PLATFORM)) {
-      return repositoryName;
+  /**
+   * Returns the canonical repository name associated with the given apparent repo name. The
+   * provided apparent repo name is assumed to be valid.
+   */
+  public RepositoryName get(String preMappingName) {
+    RepositoryName canonicalRepoName = entries().get(preMappingName);
+    if (canonicalRepoName != null) {
+      return canonicalRepoName;
     }
-    // If the owner repo is not present, that means we should fallback to the requested repo name.
-    if (ownerRepo() == null) {
-      return repositoryMapping().getOrDefault(repositoryName, repositoryName);
-    } else {
-      return repositoryMapping()
-          .getOrDefault(repositoryName, repositoryName.toNonVisible(ownerRepo()));
+    return RepositoryName.createUnvalidated(preMappingName)
+        .toNonVisible(contextRepo(), SpellChecker.didYouMean(preMappingName, entries().keySet()));
+  }
+
+  /**
+   * Returns the first apparent name in this mapping that maps to the given canonical name, if any.
+   */
+  public Optional<String> getInverse(RepositoryName postMappingName) {
+    return entries().entrySet().stream()
+        .filter(e -> e.getValue().equals(postMappingName))
+        .map(Entry::getKey)
+        .findFirst();
+  }
+
+  /**
+   * Returns a new {@link RepositoryMapping} instance with identical contents, except that the
+   * inverse mapping is cached, causing {@link #getInverse} to be much more efficient. This is
+   * particularly important for the main repo mapping, as it's often used to generate display-form
+   * labels ({@link Label#getDisplayForm}).
+   */
+  public RepositoryMapping withCachedInverseMap() {
+    var inverse = Maps.<RepositoryName, String>newHashMapWithExpectedSize(entries.size());
+    for (Map.Entry<String, RepositoryName> entry : entries.entrySet()) {
+      inverse.putIfAbsent(entry.getValue(), entry.getKey());
     }
+    var inverseCopy = ImmutableMap.copyOf(inverse);
+    return new RepositoryMapping(entries, entries.hashCode(), contextRepo) {
+      @Override
+      public Optional<String> getInverse(RepositoryName postMappingName) {
+        return Optional.ofNullable(inverseCopy.get(postMappingName));
+      }
+    };
   }
 }

@@ -18,15 +18,17 @@ import com.google.devtools.build.lib.actions.ActionKeyContext;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
 import com.google.devtools.build.lib.analysis.WorkspaceStatusAction.Factory;
 import com.google.devtools.build.lib.bugreport.BugReporter;
+import com.google.devtools.build.lib.compress.CompressionService;
 import com.google.devtools.build.lib.packages.PackageFactory;
 import com.google.devtools.build.lib.util.AbruptExitException;
 import com.google.devtools.build.lib.vfs.FileSystem;
+import com.google.devtools.build.lib.vfs.Path;
+import com.google.devtools.build.lib.vfs.SyscallCache;
 import com.google.devtools.build.skyframe.SkyFunction;
 import com.google.devtools.build.skyframe.SkyFunctionName;
+import java.util.function.Supplier;
 
-/**
-* A factory that creates instances of SkyframeExecutor.
-*/
+/** A factory that creates instances of SkyframeExecutor. */
 public interface SkyframeExecutorFactory {
 
   /**
@@ -49,8 +51,11 @@ public interface SkyframeExecutorFactory {
       Factory workspaceStatusActionFactory,
       Iterable<? extends DiffAwareness.Factory> diffAwarenessFactories,
       ImmutableMap<SkyFunctionName, SkyFunction> extraSkyFunctions,
-      SkyframeExecutorRepositoryHelpersHolder repositoryHelpersHolder,
+      SyscallCache syscallCache,
+      boolean allowExternalRepositories,
+      Supplier<Path> repoContentsCachePathSupplier,
       SkyframeExecutor.SkyKeyStateReceiver skyKeyStateReceiver,
+      CompressionService compressionService,
       BugReporter bugReporter)
       throws AbruptExitException;
 }

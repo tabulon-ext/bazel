@@ -17,6 +17,7 @@ import static com.google.common.base.Preconditions.checkState;
 
 import com.google.devtools.build.lib.buildeventstream.BuildEventArtifactUploader;
 import com.google.devtools.build.lib.events.ExtendedEventHandler;
+import com.google.devtools.build.lib.remote.options.RemoteBuildEventUploadMode;
 import com.google.devtools.build.lib.runtime.BuildEventArtifactUploaderFactory;
 import com.google.devtools.build.lib.runtime.CommandEnvironment;
 import java.util.concurrent.Executor;
@@ -28,10 +29,13 @@ class ByteStreamBuildEventArtifactUploaderFactory implements BuildEventArtifactU
   private final Executor executor;
   private final ExtendedEventHandler reporter;
   private final boolean verboseFailures;
-  private final RemoteCache remoteCache;
-  private final String remoteServerInstanceName;
+  private final CombinedCache combinedCache;
+  private final String remoteInstanceName;
+  private final String remoteBytestreamUriPrefix;
   private final String buildRequestId;
   private final String commandId;
+  private final RemoteBuildEventUploadMode remoteBuildEventUploadMode;
+  private final int maximumOpenFiles;
 
   @Nullable private ByteStreamBuildEventArtifactUploader uploader;
 
@@ -39,17 +43,23 @@ class ByteStreamBuildEventArtifactUploaderFactory implements BuildEventArtifactU
       Executor executor,
       ExtendedEventHandler reporter,
       boolean verboseFailures,
-      RemoteCache remoteCache,
-      String remoteServerInstanceName,
+      CombinedCache combinedCache,
+      String remoteInstanceName,
+      String remoteBytestreamUriPrefix,
       String buildRequestId,
-      String commandId) {
+      String commandId,
+      RemoteBuildEventUploadMode remoteBuildEventUploadMode,
+      int maximumOpenFiles) {
     this.executor = executor;
     this.reporter = reporter;
     this.verboseFailures = verboseFailures;
-    this.remoteCache = remoteCache;
-    this.remoteServerInstanceName = remoteServerInstanceName;
+    this.combinedCache = combinedCache;
+    this.remoteInstanceName = remoteInstanceName;
+    this.remoteBytestreamUriPrefix = remoteBytestreamUriPrefix;
     this.buildRequestId = buildRequestId;
     this.commandId = commandId;
+    this.remoteBuildEventUploadMode = remoteBuildEventUploadMode;
+    this.maximumOpenFiles = maximumOpenFiles;
   }
 
   @Override
@@ -60,11 +70,15 @@ class ByteStreamBuildEventArtifactUploaderFactory implements BuildEventArtifactU
             executor,
             reporter,
             verboseFailures,
-            remoteCache.retain(),
-            remoteServerInstanceName,
+            combinedCache.retain(),
+            remoteInstanceName,
+            remoteBytestreamUriPrefix,
             buildRequestId,
             commandId,
-            env.getSyscallCache());
+            env.getXattrProvider(),
+            remoteBuildEventUploadMode,
+            maximumOpenFiles);
+    env.getEventBus().register(uploader);
     return uploader;
   }
 

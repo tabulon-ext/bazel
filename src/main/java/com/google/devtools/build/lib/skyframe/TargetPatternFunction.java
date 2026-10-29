@@ -25,7 +25,6 @@ import com.google.devtools.build.lib.concurrent.MultisetSemaphore;
 import com.google.devtools.build.lib.io.InconsistentFilesystemException;
 import com.google.devtools.build.lib.io.ProcessPackageDirectoryException;
 import com.google.devtools.build.lib.packages.NoSuchPackageException;
-import com.google.devtools.build.lib.packages.OutputFile;
 import com.google.devtools.build.lib.packages.Target;
 import com.google.devtools.build.lib.pkgcache.AbstractRecursivePackageProvider.MissingDepException;
 import com.google.devtools.build.lib.pkgcache.ParsingFailedEvent;
@@ -35,6 +34,8 @@ import com.google.devtools.build.skyframe.SkyFunction;
 import com.google.devtools.build.skyframe.SkyFunctionException;
 import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.SkyValue;
+import java.util.Optional;
+import javax.annotation.Nullable;
 
 /**
  * TargetPatternFunction translates a target pattern (eg, "foo/...") into a set of resolved Targets.
@@ -44,19 +45,19 @@ public class TargetPatternFunction implements SkyFunction {
   public TargetPatternFunction() {}
 
   @Override
+  @Nullable
   public SkyValue compute(SkyKey key, Environment env)
       throws TargetPatternFunctionException, InterruptedException {
     TargetPatternValue.TargetPatternKey patternKey =
         ((TargetPatternValue.TargetPatternKey) key.argument());
     TargetPattern parsedPattern = patternKey.getParsedPattern();
 
-    IgnoredPackagePrefixesValue ignoredPackagePrefixes =
-        (IgnoredPackagePrefixesValue)
-            env.getValue(IgnoredPackagePrefixesValue.key(parsedPattern.getRepository()));
-    if (ignoredPackagePrefixes == null) {
+    IgnoredSubdirectoriesValue ignoredSubdirectories =
+        (IgnoredSubdirectoriesValue)
+            env.getValue(IgnoredSubdirectoriesValue.key(parsedPattern.getRepository()));
+    if (ignoredSubdirectories == null) {
       return null;
     }
-    ImmutableSet<PathFragment> ignoredPatterns = ignoredPackagePrefixes.getPatterns();
 
     ResolvedTargets<Target> resolvedTargets;
     EnvironmentBackedRecursivePackageProvider provider =
@@ -68,31 +69,20 @@ public class TargetPatternFunction implements SkyFunction {
               env.getListener(),
               patternKey.getPolicy(),
               MultisetSemaphore.unbounded(),
+              /* maxConcurrentGetTargetsTasks= */ Optional.empty(),
               SimplePackageIdentifierBatchingCallback::new);
       ImmutableSet<PathFragment> excludedSubdirectories = patternKey.getExcludedSubdirectories();
       ResolvedTargets.Builder<Target> resolvedTargetsBuilder = ResolvedTargets.builder();
       SafeBatchCallback<Target> callback =
           partialResult -> {
             for (Target target : partialResult) {
-              // TODO(b/156899726): This will go away as soon as we remove implicit outputs from
-              //  cc_library completely. The only downside to doing this is that implicit outputs
-              //  won't be listed when doing somepackage:* for the handful of cases still on the
-              //  allowlist. This is only a Google-internal problem and the scale of it is
-              //  acceptable in the short term while cleaning up the allowlist.
-              if (target instanceof OutputFile
-                  && ((OutputFile) target)
-                      .getGeneratingRule()
-                      .getRuleClass()
-                      .equals("cc_library")) {
-                continue;
-              }
               resolvedTargetsBuilder.add(target);
             }
           };
       try {
         parsedPattern.eval(
             resolver,
-            () -> ignoredPatterns,
+            () -> ignoredSubdirectories.asIgnoredSubdirectories(),
             excludedSubdirectories,
             callback,
             QueryExceptionMarkerInterface.MarkerRuntimeException.class);
@@ -118,8 +108,13 @@ public class TargetPatternFunction implements SkyFunction {
       // on EnvironmentBackedRecursivePackageProvider all belong to an interface shared with other
       // implementations that are unconcerned with MissingDepExceptions.
       return null;
+    } catch (InterruptedException e) {
+      if (env.inErrorBubbling()) {
+        maybeThrowEncounteredException(parsedPattern, provider);
+      }
+      throw e;
     }
-    if (env.inErrorBubblingForSkyFunctionsThatCanFullyRecoverFromErrors()) {
+    if (env.inErrorBubbling()) {
       maybeThrowEncounteredException(parsedPattern, provider);
     }
     Preconditions.checkNotNull(resolvedTargets, key);

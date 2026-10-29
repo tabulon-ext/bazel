@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright 2017 The Bazel Authors. All rights reserved.
 #
@@ -43,20 +43,6 @@ fi
 source "$(rlocation "io_bazel/src/test/shell/integration_test_setup.sh")" \
   || { echo "integration_test_setup.sh not found!" >&2; exit 1; }
 
-case "$(uname -s | tr [:upper:] [:lower:])" in
-msys*|mingw*|cygwin*)
-  declare -r is_windows=true
-  ;;
-*)
-  declare -r is_windows=false
-  ;;
-esac
-
-if "$is_windows"; then
-  export MSYS_NO_PATHCONV=1
-  export MSYS2_ARG_CONV_EXCL="*"
-fi
-
 #### HELPER FUNCTIONS ##################################################
 
 if ! type try_with_timeout >&/dev/null; then
@@ -67,6 +53,8 @@ fi
 
 function set_up() {
   cd ${WORKSPACE_DIR}
+  add_rules_java MODULE.bazel
+
   mkdir -p "foo"
   cat > foo/foocc.py <<'EOF'
 import sys
@@ -114,7 +102,7 @@ foo_binary = rule(
         "srcs": attr.label_list(allow_files=True),
         "deps": attr.label_list(),
         "_foocc": attr.label(default=Label("//foo:foocc"),
-                             allow_files=True, executable=True, cfg="host")
+                             allow_files=True, executable=True, cfg="exec")
     },
     outputs = {"out": "%{name}.out"},
 )
@@ -125,9 +113,12 @@ EOF
 #### TESTS #############################################################
 
 function test_dirty_file() {
+  add_rules_python MODULE.bazel
   export DONT_SANITY_CHECK_SERIALIZATION=1
   cat > foo/BUILD <<EOF
 load(":foo.bzl", "foo_library", "foo_binary")
+load("@rules_python//python:py_binary.bzl", "py_binary")
+
 py_binary(
     name = "foocc",
     srcs = ["foocc.py"],
@@ -192,6 +183,7 @@ EOF
 function test_incremental_err_reporting() {
   export DONT_SANITY_CHECK_SERIALIZATION=1
   cat > foo/BUILD <<EOF
+load("@rules_java//java:java_library.bzl", "java_library")
 genrule(
     name = "foo",
     outs = ["file.o"],

@@ -14,23 +14,52 @@
 
 package com.google.devtools.build.lib.packages;
 
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.collect.ImmutableMap.toImmutableMap;
+import static com.google.devtools.build.lib.bugreport.BugReport.sendNonFatalBugReport;
+import static com.google.devtools.build.lib.skyframe.BzlLoadValue.keyForBuild;
+import static com.google.devtools.build.lib.skyframe.BzlLoadValue.keyForBuiltins;
+import static com.google.devtools.build.lib.skyframe.StarlarkBuiltinsValue.isBuiltinsRepo;
+import static com.google.devtools.build.lib.util.HashCodes.hashObjects;
+import static com.google.devtools.build.lib.util.TestType.isInTest;
+
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.cmdline.Label;
+import com.google.devtools.build.lib.collect.nestedset.Depset;
+import com.google.devtools.build.lib.collect.nestedset.NestedSet;
 import com.google.devtools.build.lib.events.EventHandler;
+import com.google.devtools.build.lib.skyframe.BzlLoadThreadOwner;
+import com.google.devtools.build.lib.skyframe.BzlLoadValue;
+import com.google.devtools.build.lib.skyframe.serialization.AbstractExportedStarlarkSymbolCodec;
+import com.google.devtools.build.lib.skyframe.serialization.ObjectCodec.MemoizationEquality;
 import com.google.devtools.build.lib.util.Fingerprint;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import com.google.errorprone.annotations.Keep;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import javax.annotation.Nullable;
+import net.starlark.java.eval.CallUtils;
 import net.starlark.java.eval.Dict;
 import net.starlark.java.eval.EvalException;
 import net.starlark.java.eval.Printer;
 import net.starlark.java.eval.Starlark;
 import net.starlark.java.eval.StarlarkCallable;
+import net.starlark.java.eval.StarlarkSemantics;
 import net.starlark.java.eval.StarlarkThread;
+import net.starlark.java.eval.SymbolGenerator;
 import net.starlark.java.syntax.Location;
+import net.starlark.java.syntax.StarlarkType;
+import net.starlark.java.syntax.TypeConstructor;
+import net.starlark.java.syntax.TypeContext;
+import net.starlark.java.syntax.Types;
 
 /**
  * A provider defined in Starlark rather than in native code.
@@ -52,22 +81,69 @@ import net.starlark.java.syntax.Location;
  * pre-exported provider directly. Exported providers use only their key for {@link #equals} and
  * {@link #hashCode}.
  */
-public final class StarlarkProvider implements StarlarkCallable, StarlarkExportable, Provider {
+public final class StarlarkProvider extends StarlarkType
+    implements StarlarkCallable, StarlarkExportable, Provider, TypeConstructor {
 
   private final Location location;
 
-  // For schemaful providers, the sorted list of allowed field names.
-  // The requirement for sortedness comes from StarlarkInfo.createFromNamedArgs,
-  // as it lets us verify table ⊆ schema in O(n) time without temporaries.
-  @Nullable private final ImmutableList<String> schema;
+  @Nullable private final String documentation;
+
+  // For schemaful providers, a map of field names to their index (position in the schema). Sorted
+  // by field name.
+  @Nullable private final ImmutableMap<String, Integer> fields;
+
+  // For schemaful providers, an optional map from field names to documentation strings (if any). In
+  // accordance with the provider() Starlark API, either all schema fields have documentation
+  // strings (possibly empty strings), or none do. The iteration order is the order of fields in the
+  // provider() invocation in Starlark - thus, *not* the order of the `fields` list above.
+  @Nullable private final ImmutableMap<String, Optional<String>> schema;
 
   // Optional custom initializer callback. If present, it is invoked with the same positional and
   // keyword arguments as were passed to the provider constructor. The return value must be a
   // Starlark dict mapping field names (string keys) to their values.
   @Nullable private final StarlarkCallable init;
 
-  /** Null iff this provider has not yet been exported. Mutated by {@link export}. */
-  @Nullable private Key key;
+  /**
+   * An identifier for this provider.
+   *
+   * <p>This is a {@link Key} if exported and a {@link SymbolGenerator.Symbol} otherwise.
+   *
+   * <p>Mutated by {@link #export}.
+   */
+  private Object keyOrIdentityToken;
+
+  /**
+   * For schemaful providers, an array of metadata concerning depset optimization.
+   *
+   * <p>Each index in the array holds an optional (nullable) depset element type. The value at that
+   * index is initialized to be the element type of the first non-empty Depset to ever be stored in
+   * the corresponding field from {@link #schema} on any instance of this provider, globally. If no
+   * depsets (or only empty depsets) are ever stored in a field, the value at its index in this
+   * array will remain null.
+   *
+   * <p>Whenever a field is stored in an instance of this provider type, if the value is a depset
+   * whose element type matches the one stored in this array, it is optimized by unwrapping it down
+   * to its {@code NestedSet}. Upon retrieval, the depset wrapper is reconstructed using this saved
+   * element type.
+   *
+   * <p>The optimization may (harmlessly) fail to apply for provider fields that are not strongly
+   * typed across all instances.
+   *
+   * <p>For large builds, this optimization has been observed to save half a percent in retained
+   * heap.
+   *
+   * <p>In the future, the ad hoc heuristic of examining the first stored non-empty depset might be
+   * replaced by stronger type information in the provider's Starlark declaration. However, this
+   * optimization would remain relevant for provider declarations that do not supply such type info.
+   */
+  @Nullable private AtomicReferenceArray<Class<?>> depsetTypePredictor;
+
+  // The Starlark supertype of the Info objects produced by this provider. This is a total struct
+  // for schemaful providers, and {@link Types.ANY_STRUCT} for schemaless providers.
+  private final Types.StructType structType;
+
+  // The Starlark type of the provider symbol itself.
+  private final StarlarkProviderType providerSymbolType;
 
   /**
    * Returns a new empty builder.
@@ -81,35 +157,77 @@ public final class StarlarkProvider implements StarlarkCallable, StarlarkExporta
    * @param location the location of the Starlark definition for this provider (tests may use {@link
    *     Location#BUILTIN})
    */
+  public static Builder builder(
+      Location location, StarlarkSemantics starlarkSemantics, TypeContext typeContext) {
+    return new Builder(location, starlarkSemantics, typeContext);
+  }
+
+  @VisibleForTesting
   public static Builder builder(Location location) {
-    return new Builder(location);
+    return new Builder(
+        location,
+        StarlarkSemantics.DEFAULT,
+        CallUtils.getBuiltinManager(StarlarkSemantics.DEFAULT));
   }
 
   /** A builder which may be used to construct a StarlarkProvider. */
   public static final class Builder {
     private final Location location;
 
-    @Nullable private ImmutableList<String> schema;
+    private final StarlarkSemantics starlarkSemantics;
+
+    private final TypeContext typeContext;
+
+    @Nullable private String documentation;
+
+    @Nullable private ImmutableMap<String, Optional<String>> schema;
 
     @Nullable private StarlarkCallable init;
 
-    @Nullable private Key key;
-
-    private Builder(Location location) {
+    private Builder(
+        Location location, StarlarkSemantics starlarkSemantics, TypeContext typeContext) {
       this.location = location;
+      this.starlarkSemantics = starlarkSemantics;
+      this.typeContext = typeContext;
     }
 
     /**
-     * Sets the schema (the list of allowed field names) for instances of the provider built by this
-     * builder.
+     * Sets the list of allowed fields for the provider built by this builder, and marks the fields'
+     * documentation as empty.
      */
-    public Builder setSchema(Collection<String> schema) {
-      this.schema = ImmutableList.sortedCopyOf(schema);
+    @CanIgnoreReturnValue
+    public Builder setSchema(Collection<String> fields) {
+      ImmutableMap.Builder<String, Optional<String>> builder = ImmutableMap.builder();
+      for (String field : fields) {
+        builder.put(field, Optional.empty());
+      }
+      this.schema = builder.buildOrThrow();
       return this;
     }
 
     /**
-     * Sets the custom initializer callback for instances of the provider built by this builder.
+     * Sets the list of allowed field names and their corresponding documentation strings for the
+     * provider built by this builder.
+     */
+    @CanIgnoreReturnValue
+    public Builder setSchema(Map<String, String> schemaWithDocumentation) {
+      ImmutableMap.Builder<String, Optional<String>> builder = ImmutableMap.builder();
+      for (Map.Entry<String, String> entry : schemaWithDocumentation.entrySet()) {
+        builder.put(entry.getKey(), Optional.of(entry.getValue()));
+      }
+      this.schema = builder.buildOrThrow();
+      return this;
+    }
+
+    /** Sets the documentation string for the provider built by this builder. */
+    @CanIgnoreReturnValue
+    public Builder setDocumentation(String documentation) {
+      this.documentation = documentation;
+      return this;
+    }
+
+    /**
+     * Sets the custom initializer callback for the provider built by this builder.
      *
      * <p>The initializer callback will be automatically invoked when the provider is called. To
      * bypass the custom initializer callback, use the callable returned by {@link
@@ -121,20 +239,22 @@ public final class StarlarkProvider implements StarlarkCallable, StarlarkExporta
      *     particular, for a schemaful provider, the dict may not contain keys not listed in the
      *     schema.
      */
+    @CanIgnoreReturnValue
     public Builder setInit(StarlarkCallable init) {
       this.init = init;
       return this;
     }
 
-    /** Sets the provider built by this builder to be exported with the given key. */
-    public Builder setExported(Key key) {
-      this.key = key;
-      return this;
+    /** Builds an exported StarlarkProvider. */
+    public StarlarkProvider buildExported(Key key) {
+      return new StarlarkProvider(
+          location, documentation, schema, init, key, starlarkSemantics, typeContext);
     }
 
-    /** Builds a StarlarkProvider. */
-    public StarlarkProvider build() {
-      return new StarlarkProvider(location, schema, init, key);
+    /** Builds a unexported StarlarkProvider. */
+    public StarlarkProvider buildWithIdentityToken(SymbolGenerator.Symbol<?> identityToken) {
+      return new StarlarkProvider(
+          location, documentation, schema, init, identityToken, starlarkSemantics, typeContext);
     }
   }
 
@@ -147,48 +267,151 @@ public final class StarlarkProvider implements StarlarkCallable, StarlarkExporta
    */
   private StarlarkProvider(
       Location location,
-      @Nullable ImmutableList<String> schema,
+      @Nullable String documentation,
+      @Nullable ImmutableMap<String, Optional<String>> schema,
       @Nullable StarlarkCallable init,
-      @Nullable Key key) {
+      Object keyOrIdentityToken,
+      StarlarkSemantics starlarkSemantics,
+      TypeContext typeContext) {
     this.location = location;
+    this.documentation = documentation;
+    if (schema != null) {
+      ImmutableList<String> sortedFields = ImmutableList.sortedCopyOf(schema.keySet());
+      ImmutableMap.Builder<String, Integer> fieldsBuilder = ImmutableMap.builder();
+      for (int i = 0; i < sortedFields.size(); i++) {
+        fieldsBuilder.put(sortedFields.get(i), i);
+      }
+      this.fields = fieldsBuilder.buildOrThrow();
+      // TODO: #27370 - Allow specifying field types in Starlark.
+      this.structType =
+          Types.struct(
+              this.fields.keySet().stream()
+                  .collect(toImmutableMap(name -> name, name -> Types.ANY)));
+    } else {
+      this.fields = null;
+      this.structType = Types.ANY_STRUCT;
+    }
     this.schema = schema;
     this.init = init;
-    this.key = key;
-  }
-
-  private static Object[] toNamedArgs(Object value, String descriptionForError)
-      throws EvalException {
-    Dict<String, Object> kwargs = Dict.cast(value, String.class, Object.class, descriptionForError);
-    Object[] named = new Object[2 * kwargs.size()];
-    int i = 0;
-    for (Map.Entry<String, Object> e : kwargs.entrySet()) {
-      named[i++] = e.getKey();
-      named[i++] = e.getValue();
+    this.keyOrIdentityToken = keyOrIdentityToken;
+    if (schema != null) {
+      depsetTypePredictor = new AtomicReferenceArray<>(schema.size());
     }
-    return named;
+    this.providerSymbolType = new StarlarkProviderType(this, starlarkSemantics, typeContext);
   }
 
   @Override
-  public Object fastcall(StarlarkThread thread, Object[] positional, Object[] named)
-      throws InterruptedException, EvalException {
-    if (init == null) {
-      return fastcallRawConstructor(thread, positional, named);
+  public StarlarkCallable.ArgumentProcessor requestArgumentProcessor(StarlarkThread thread)
+      throws EvalException {
+    StarlarkInfoFactory factory = newStarlarkInfoFactory(thread);
+    if (init != null) {
+      StarlarkCallable.ArgumentProcessor initArgumentProcessor =
+          Starlark.requestArgumentProcessor(thread, init);
+      return new ArgumentProcessorWithInit(this, factory, initArgumentProcessor, thread);
+    } else {
+      return new RawArgumentProcessor(this, factory, thread);
     }
-
-    Object initResult = Starlark.fastcall(thread, init, positional, named);
-    return StarlarkInfo.createFromNamedArgs(
-        this,
-        toNamedArgs(initResult, "return value of provider init()"),
-        schema,
-        thread.getCallerLocation());
   }
 
-  private Object fastcallRawConstructor(StarlarkThread thread, Object[] positional, Object[] named)
-      throws EvalException {
-    if (positional.length > 0) {
-      throw Starlark.errorf("%s: unexpected positional arguments", getName());
+  private StarlarkInfoFactory newStarlarkInfoFactory(StarlarkThread thread) {
+    return schema != null
+        ? StarlarkInfoWithSchema.newStarlarkInfoFactory(this, thread)
+        : StarlarkInfoNoSchema.newStarlarkInfoFactory(this, thread);
+  }
+
+  static final class ArgumentProcessorWithInit extends StarlarkCallable.ArgumentProcessor {
+    private final StarlarkProvider owner;
+    private final StarlarkProvider.StarlarkInfoFactory factory;
+    private final StarlarkCallable.ArgumentProcessor initArgumentProcessor;
+
+    ArgumentProcessorWithInit(
+        StarlarkProvider owner,
+        StarlarkProvider.StarlarkInfoFactory factory,
+        StarlarkCallable.ArgumentProcessor initArgumentProcessor,
+        StarlarkThread thread) {
+      super(thread);
+      this.owner = owner;
+      this.factory = factory;
+      this.initArgumentProcessor = initArgumentProcessor;
     }
-    return StarlarkInfo.createFromNamedArgs(this, named, schema, thread.getCallerLocation());
+
+    @Override
+    public void addPositionalArg(Object value) throws EvalException {
+      initArgumentProcessor.addPositionalArg(value);
+    }
+
+    @Override
+    public void addNamedArg(String name, Object value) throws EvalException {
+      initArgumentProcessor.addNamedArg(name, value);
+    }
+
+    @Override
+    public StarlarkCallable getCallable() {
+      return owner;
+    }
+
+    @Override
+    public Object call(StarlarkThread thread) throws EvalException, InterruptedException {
+      Object initResult =
+          Starlark.callViaArgumentProcessor(thread, owner.init, initArgumentProcessor);
+      Dict<String, Object> kwargs =
+          Dict.cast(initResult, String.class, Object.class, "return value of provider init()");
+      return factory.createFromMap(kwargs);
+    }
+  }
+
+  /**
+   * A {@link RawArgumentProcessor} is used for calling two different types of StarlarkCallable:
+   * StarlarkProvider in case it doesn't have an init function, and RawConstructor.
+   */
+  static class RawArgumentProcessor extends StarlarkCallable.ArgumentProcessor {
+    private final StarlarkCallable owner; // either StarlarkProvider or RawConstructor
+    private final StarlarkProvider.StarlarkInfoFactory factory;
+
+    RawArgumentProcessor(
+        StarlarkCallable owner,
+        StarlarkProvider.StarlarkInfoFactory factory,
+        StarlarkThread thread) {
+      super(thread);
+      this.owner = owner;
+      this.factory = factory;
+    }
+
+    @Override
+    public void addPositionalArg(Object value) throws EvalException {
+      pushCallableAndThrow(Starlark.errorf("%s: unexpected positional arguments", owner.getName()));
+    }
+
+    @Override
+    public void addNamedArg(String name, Object value) throws EvalException {
+      factory.addNamedArg(name, value);
+    }
+
+    @Override
+    public StarlarkCallable getCallable() {
+      return owner;
+    }
+
+    @Override
+    public Object call(StarlarkThread thread) throws EvalException, InterruptedException {
+      return factory.createFromArgs();
+    }
+  }
+
+  abstract static class StarlarkInfoFactory {
+    protected final StarlarkProvider provider;
+    protected final StarlarkThread thread;
+
+    StarlarkInfoFactory(StarlarkProvider provider, StarlarkThread thread) {
+      this.provider = provider;
+      this.thread = thread;
+    }
+
+    abstract StarlarkInfo createFromArgs() throws EvalException;
+
+    abstract StarlarkInfo createFromMap(Map<String, Object> map) throws EvalException;
+
+    abstract void addNamedArg(String name, Object value) throws EvalException;
   }
 
   private static final class RawConstructor implements StarlarkCallable {
@@ -199,9 +422,8 @@ public final class StarlarkProvider implements StarlarkCallable, StarlarkExporta
     }
 
     @Override
-    public Object fastcall(StarlarkThread thread, Object[] positional, Object[] named)
-        throws EvalException {
-      return provider.fastcallRawConstructor(thread, positional, named);
+    public StarlarkCallable.ArgumentProcessor requestArgumentProcessor(StarlarkThread thread) {
+      return new RawArgumentProcessor(this, provider.newStarlarkInfoFactory(thread), thread);
     }
 
     @Override
@@ -224,8 +446,10 @@ public final class StarlarkProvider implements StarlarkCallable, StarlarkExporta
     return new RawConstructor(this);
   }
 
+  /**
+   * Returns the provider's custom initializer callback, or null if the provider doesn't have one.
+   */
   @Nullable
-  @VisibleForTesting
   public StarlarkCallable getInit() {
     return init;
   }
@@ -235,20 +459,36 @@ public final class StarlarkProvider implements StarlarkCallable, StarlarkExporta
     return location;
   }
 
+  /**
+   * Returns the value of the doc parameter passed to {@code provider()} in Starlark, or an empty
+   * Optional if a doc parameter was not provided.
+   */
+  public Optional<String> getDocumentation() {
+    return Optional.ofNullable(documentation);
+  }
+
   @Override
   public boolean isExported() {
-    return key != null;
+    return keyOrIdentityToken instanceof Key;
   }
 
   @Override
   public Key getKey() {
-    Preconditions.checkState(isExported());
-    return key;
+    Preconditions.checkState(
+        isExported(),
+        "Calling getKey() is disallowed on an unexported provider. location: %s, identity token:"
+            + " %s",
+        location,
+        keyOrIdentityToken);
+    return (Key) keyOrIdentityToken;
   }
 
   @Override
   public String getName() {
-    return key != null ? key.getExportedName() : "<no name>";
+    if (keyOrIdentityToken instanceof Key key) {
+      return key.getExportedName();
+    }
+    return "<no name>";
   }
 
   @Override
@@ -256,46 +496,81 @@ public final class StarlarkProvider implements StarlarkCallable, StarlarkExporta
     return getName();
   }
 
-  /** Returns the list of fields allowed by this provider, or null if the provider is schemaless. */
+  /**
+   * Returns the sorted list of fields allowed by this provider, or null if the provider is
+   * schemaless.
+   */
   @Nullable
-  // TODO(adonovan): rename getSchema.
-  public ImmutableList<String> getFields() {
+  public ImmutableMap<String, Integer> getFields() {
+    return fields;
+  }
+
+  /**
+   * Returns the map of fields allowed by this provider mapping to their corresponding documentation
+   * strings (if any), or null if this provider is schemaless.
+   *
+   * <p>The returned map's iteration order matches the order of fields in the {@code provider()}
+   * invocation in Starlark - thus, different from the order of fields in {@link #getFields}.
+   */
+  @Nullable
+  public ImmutableMap<String, Optional<String>> getSchema() {
     return schema;
   }
 
   @Override
   public String getErrorMessageForUnknownField(String name) {
     return String.format(
-        "'%s' value has no field or method '%s'",
-        isExported() ? key.getExportedName() : "struct", name);
+        "'%s' value has no field or method '%s'", isExported() ? getName() : "struct", name);
   }
 
+  // TODO(bazel-team): use exportedLocation as the callable symbol's location.
   @Override
-  public void export(EventHandler handler, Label extensionLabel, String exportedName) {
+  public void export(
+      EventHandler handler, Label extensionLabel, String exportedName, Location exportedLocation) {
     Preconditions.checkState(!isExported());
-    this.key = new Key(extensionLabel, exportedName);
+    SymbolGenerator.Symbol<?> identifier = (SymbolGenerator.Symbol<?>) keyOrIdentityToken;
+    if (identifier.getOwner() instanceof BzlLoadThreadOwner bzlLoadOwner) {
+      // In production code, StarlarkProviders are created only when loading .bzl files so the owner
+      // of the Symbol should be a BzlLoadValue.Key.
+      checkArgument(
+          extensionLabel.equals(bzlLoadOwner.key().getLabel()),
+          "export extensionLabel=%s, but owner=%s",
+          extensionLabel,
+          bzlLoadOwner.key());
+      this.keyOrIdentityToken = new Key(bzlLoadOwner.key(), exportedName);
+    } else {
+      // In tests, the symbol may be arbitrary.
+      if (!isInTest()) {
+        sendNonFatalBugReport(
+            new IllegalStateException(
+                String.format(
+                    "exporting StarlarkProvider defined at %s as %s:%s but thread owner=%s was not"
+                        + " a BzlLoadValue.Key",
+                    location, extensionLabel, exportedName, identifier.getOwner())));
+      }
+      this.keyOrIdentityToken =
+          new Key(
+              isBuiltinsRepo(extensionLabel.getRepository())
+                  ? keyForBuiltins(extensionLabel)
+                  : keyForBuild(extensionLabel),
+              exportedName);
+    }
   }
 
   @Override
   public int hashCode() {
-    if (isExported()) {
-      return getKey().hashCode();
-    }
-    return System.identityHashCode(this);
+    return keyOrIdentityToken instanceof Key k ? k.hashCode() : keyOrIdentityToken.hashCode();
   }
 
   @Override
   public boolean equals(@Nullable Object otherObject) {
-    if (!(otherObject instanceof StarlarkProvider)) {
-      return false;
+    if (this == otherObject) {
+      return true;
     }
-    StarlarkProvider other = (StarlarkProvider) otherObject;
-
-    if (this.isExported() && other.isExported()) {
-      return this.getKey().equals(other.getKey());
-    } else {
-      return this == other;
+    if (otherObject instanceof StarlarkProvider that) {
+      return this.keyOrIdentityToken.equals(that.keyOrIdentityToken);
     }
+    return false;
   }
 
   @Override
@@ -305,52 +580,105 @@ public final class StarlarkProvider implements StarlarkCallable, StarlarkExporta
   }
 
   @Override
-  public void repr(Printer printer) {
+  public void repr(Printer printer, StarlarkSemantics semantics) {
     printer.append("<provider>");
   }
 
   @Override
   public String toString() {
-    return Starlark.repr(this);
+    return Starlark.repr(this, StarlarkSemantics.DEFAULT);
+  }
+
+  /**
+   * For schemaful providers, if the value is a {@link Depset}, tries to unwrap it to its underlying
+   * {@link NestedSet} to save memory.
+   *
+   * <p>The unwrapped {@link NestedSet} must be wrapped back into a {@link Depset} by {@link
+   * #rewrapDepset} upon retrieval.
+   */
+  Object maybeUnwrapDepset(int index, Depset depset) {
+    Preconditions.checkArgument(depsetTypePredictor != null);
+    if (depset.isEmpty()) {
+      // Most empty depsets have the empty (null) type. We can't store this type because it
+      // would clash with whatever the actual element type is for non-empty depsets in that
+      // field. So instead just store the optimized (unwrapped) NestedSet without any type
+      // information, and assume it's the empty type upon retrieval.
+      //
+      // This only loses information in the relatively rare case of a native-constructed empty
+      // depset with a type restriction (e.g. empty set of artifacts). In that scenario, an
+      // empty depset retrieved from the provider may "incorrectly" allow itself to participate
+      // in a union with depsets of other types, whereas the original depset would trigger a
+      // Starlark eval error. This is a user-observable difference but a very minor one; the
+      // hazard would be logical errors that are masked by the provider machinery but triggered
+      // by a refactoring of Starlark code. See TODO in Depset#of(Class, NestedSet) for notes
+      // about eliminating this semantic confusion.
+      //
+      // This problem shouldn't arise for non-empty depsets since distinct non-empty element
+      // types are not compatible with one another (i.e. there's no Depset<Any> schema).
+      return depset.getSet();
+    }
+    Class<?> elementClass = depset.getElementClass();
+    Class<?> witness = depsetTypePredictor.compareAndExchange(index, null, elementClass);
+    if (witness == elementClass || witness == null) {
+      return depset.getSet();
+    }
+    return depset;
+  }
+
+  /**
+   * For schemaful providers, wraps a {@link NestedSet} back into a {@link Depset} using the
+   * predicted element type.
+   */
+  Depset rewrapDepset(int index, NestedSet<?> nestedSet) {
+    Class<?> type = nestedSet.isEmpty() ? Object.class : depsetTypePredictor.get(index);
+    return Depset.rewrap(type, nestedSet);
+  }
+
+  Object getKeyOrIdentityToken() {
+    return keyOrIdentityToken;
   }
 
   /**
    * A serializable representation of Starlark-defined {@link StarlarkProvider} that uniquely
    * identifies all {@link StarlarkProvider}s that are exposed to SkyFrame.
    */
+  // TODO: b/335901349 - this is identical to SymbolGenerator.GlobalSymbol<BzlLoadValue.Key> and
+  // serves essentially the same purpose. Consider unifying these types.
   public static final class Key extends Provider.Key {
-    private final Label extensionLabel;
+    private final BzlLoadValue.Key key;
     private final String exportedName;
+    // Marked transient because BzlLoadValue.Key.hashCode() incorporates getClass().hashCode(),
+    // which is non-deterministic across JVM instances, and DynamicCodec serializes non-transient
+    // fields. Recomputed lazily if 0 (e.g., after DynamicCodec unsafe allocation).
+    private transient int hashCode;
 
-    public Key(Label extensionLabel, String exportedName) {
-      this.extensionLabel = Preconditions.checkNotNull(extensionLabel);
-      this.exportedName = Preconditions.checkNotNull(exportedName);
+    public Key(BzlLoadValue.Key key, String exportedName) {
+      this.key = checkNotNull(key);
+      this.exportedName = checkNotNull(exportedName);
+      this.hashCode = hashObjects(key, exportedName);
     }
 
     public Label getExtensionLabel() {
-      return extensionLabel;
+      return key.getLabel();
     }
 
     public String getExportedName() {
       return exportedName;
     }
 
-    @Override
-    public String toString() {
-      return exportedName;
-    }
-
-    @Override
-    void fingerprint(Fingerprint fp) {
-      // False => Not native.
-      fp.addBoolean(false);
-      fp.addString(extensionLabel.getCanonicalForm());
-      fp.addString(exportedName);
+    BzlLoadValue.Key getBzlLoadKey() {
+      return key;
     }
 
     @Override
     public int hashCode() {
-      return Objects.hash(extensionLabel, exportedName);
+      int h = hashCode;
+      if (h == 0) {
+        // Recomputes if the hash happens to be 0 (or after deserialization), like String.hashCode.
+        h = hashObjects(key, exportedName);
+        hashCode = h;
+      }
+      return h;
     }
 
     @Override
@@ -359,12 +687,184 @@ public final class StarlarkProvider implements StarlarkCallable, StarlarkExporta
         return true;
       }
 
-      if (!(obj instanceof Key)) {
+      if (!(obj instanceof Key other)) {
         return false;
       }
-      Key other = (Key) obj;
-      return Objects.equals(this.extensionLabel, other.extensionLabel)
+      // Fast-reject unequal keys (e.g. different providers from the same .bzl file).
+      return this.hashCode() == other.hashCode()
+          && Objects.equals(this.key, other.key)
           && Objects.equals(this.exportedName, other.exportedName);
+    }
+
+    @Override
+    void fingerprint(Fingerprint fp) {
+      // False => Not native.
+      fp.addBoolean(false);
+      fp.addString(getExtensionLabel().getCanonicalForm());
+      fp.addString(getExportedName());
+    }
+
+    @Override
+    public String toString() {
+      return exportedName;
+    }
+  }
+
+  // StarlarkProvider as a Starlark type / type constructor (for Info objects)
+
+  @Override
+  public ImmutableList<StarlarkType> getSupertypes(TypeContext context) {
+    return ImmutableList.of(structType);
+  }
+
+  @Nullable
+  @Override
+  public StarlarkType getField(String name, TypeContext context) {
+    return structType.getField(name);
+  }
+
+  @Override
+  public String typeRepr() {
+    return getName();
+  }
+
+  /** Returns this provider symbol, which is a type of Info objects. */
+  @Override
+  public StarlarkType createStarlarkType(ImmutableList<Term> argsTuple)
+      throws TypeConstructor.Failure {
+    if (!argsTuple.isEmpty()) {
+      throw new TypeConstructor.Failure(String.format("'%s' does not accept arguments", getName()));
+    }
+    return this;
+  }
+
+  // StarlarkProvider as a value having its own Starlark type
+
+  /**
+   * Returns the {@link Provider.ProviderType} of this provider symbol.
+   *
+   * <p>Note that this provider symbol is itself a type - but a different type (a type of Info
+   * objects).
+   */
+  @Override
+  public StarlarkType getStarlarkType(StarlarkSemantics semantics) {
+    return providerSymbolType;
+  }
+
+  /**
+   * The {@link StarlarkType} of a {@link StarlarkProvider} symbol. There should be a 1-1
+   * correspondence between {@link StarlarkProvider} instances and {@link StarlarkProviderType}
+   * instances.
+   */
+  private static final class StarlarkProviderType extends ProviderType {
+    private final StarlarkProvider provider;
+    private final Types.CallableType callableType;
+
+    private StarlarkProviderType(
+        StarlarkProvider provider, StarlarkSemantics starlarkSemantics, TypeContext typeContext) {
+      this.provider = provider;
+      if (provider.init != null) {
+        this.callableType =
+            provider.init.getCallableType(starlarkSemantics, typeContext).withReturnType(provider);
+      } else if (!provider.structType.equals(Types.ANY_STRUCT)) {
+        // Schema, but no init callback - accept keyword-only params matching the fields schema.
+        ImmutableMap<String, StarlarkType> fieldTypes = provider.structType.getFields();
+        this.callableType =
+            Types.generalCallable(
+                fieldTypes.keySet().asList(),
+                fieldTypes.values().asList(),
+                /* numPositionalOnlyParameters= */ 0,
+                /* numPositionalParameters= */ 0,
+                /* mandatoryParams= */ ImmutableSet.of(),
+                /* varargsType= */ null,
+                /* kwargsType= */ null,
+                /* returns= */ provider);
+      } else {
+        // No schema and no init callback - accept arbitrary **kwargs.
+        this.callableType =
+            Types.generalCallable(
+                /* parameterNames= */ ImmutableList.of(),
+                /* parameterTypes= */ ImmutableList.of(),
+                /* numPositionalOnlyParameters= */ 0,
+                /* numPositionalParameters= */ 0,
+                /* mandatoryParams= */ ImmutableSet.of(),
+                /* varargsType= */ null,
+                /* kwargsType= */ Types.ANY,
+                /* returns= */ provider);
+      }
+    }
+
+    @Override
+    public String typeRepr() {
+      // angle brackets because the type is not constructable directly in Starlark code
+      return String.format("<Provider[%s]>", provider.getName());
+    }
+
+    @Override
+    public Types.CallableType asCallableType(TypeContext context) {
+      return callableType;
+    }
+
+    @Override
+    public StarlarkType getInfoType(TypeContext context) {
+      return provider;
+    }
+
+    @Override
+    public int hashCode() {
+      return hashObjects(ProviderType.class, provider);
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      if (this == obj) {
+        return true;
+      }
+      if (!(obj instanceof StarlarkProviderType other)) {
+        return false;
+      }
+      // There should be a at most one provider type for a provider
+      return this.provider.equals(other.provider);
+    }
+  }
+
+  /**
+   * Codec that serializes a {@link StarlarkProvider} as a .bzl global reference.
+   *
+   * <p>Only supports exported providers.
+   */
+  // TODO(bazel-team): consider adding a DynamicCodec-like fallback for unexported providers.
+  @Keep
+  private static final class StarlarkProviderCodec
+      extends AbstractExportedStarlarkSymbolCodec<StarlarkProvider> {
+    @Override
+    public Class<StarlarkProvider> getEncodedClass() {
+      return StarlarkProvider.class;
+    }
+
+    @Override
+    protected BzlLoadValue.Key getBzlLoadKey(StarlarkProvider obj) {
+      checkArgument(
+          obj.isExported(),
+          "Cannot serialize unexported Starlark provider at location: %s, identity token: %s",
+          obj.location,
+          obj.keyOrIdentityToken);
+      return obj.getKey().getBzlLoadKey();
+    }
+
+    @Override
+    protected String getExportedName(StarlarkProvider obj) {
+      return obj.getKey().getExportedName();
+    }
+
+    /**
+     * Exported providers are equal by {@link Key} and deserialize to the canonical instance, so
+     * memoizing by value makes serialization independent of how many equal instances are reachable
+     * (e.g., one kept alive across commands by the {@link StarlarkInfoWithSchema} interner).
+     */
+    @Override
+    public MemoizationEquality getMemoizationEquality(StarlarkProvider obj) {
+      return MemoizationEquality.BY_VALUE;
     }
   }
 }

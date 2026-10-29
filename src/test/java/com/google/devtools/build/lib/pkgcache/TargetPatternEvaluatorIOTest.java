@@ -22,6 +22,7 @@ import com.google.devtools.build.lib.clock.BlazeClock;
 import com.google.devtools.build.lib.cmdline.TargetParsingException;
 import com.google.devtools.build.lib.events.EventKind;
 import com.google.devtools.build.lib.server.FailureDetails;
+import com.google.devtools.build.lib.testutil.TestUtils;
 import com.google.devtools.build.lib.vfs.DigestHashFunction;
 import com.google.devtools.build.lib.vfs.Dirent;
 import com.google.devtools.build.lib.vfs.FileStatus;
@@ -71,14 +72,8 @@ public class TargetPatternEvaluatorIOTest extends AbstractTargetPatternEvaluator
 
       @Nullable
       @Override
-      public FileStatus statIfFound(PathFragment path, boolean followSymlinks) {
-        return statNullable(path, followSymlinks);
-      }
-
-      @Nullable
-      @Override
-      public FileStatus statNullable(PathFragment path, boolean followSymlinks) {
-        FileStatus defaultResult = super.statNullable(path, followSymlinks);
+      public FileStatus statIfFound(PathFragment path, boolean followSymlinks) throws IOException {
+        FileStatus defaultResult = super.statIfFound(path, followSymlinks);
         try {
           return transformer.stat(defaultResult, path, followSymlinks);
         } catch (IOException e) {
@@ -87,7 +82,7 @@ public class TargetPatternEvaluatorIOTest extends AbstractTargetPatternEvaluator
       }
 
       @Override
-      protected Collection<Dirent> readdir(PathFragment path, boolean followSymlinks)
+      public Collection<Dirent> readdir(PathFragment path, boolean followSymlinks)
           throws IOException {
         Collection<Dirent> defaultResult = super.readdir(path, followSymlinks);
         return transformer.readdir(defaultResult, path, followSymlinks);
@@ -102,7 +97,6 @@ public class TargetPatternEvaluatorIOTest extends AbstractTargetPatternEvaluator
   @Test
   public void testBadStat(@TestParameter boolean keepGoing) throws Exception {
     reporter.removeHandler(failFastHandler);
-    getSkyframeExecutor().turnOffSyscallCacheForTesting();
     // Given a package, "parent",
     Path parent = scratch.file("parent/BUILD", "sh_library(name = 'parent')").getParentDirectory();
     // And a child, "badstat",
@@ -130,21 +124,8 @@ public class TargetPatternEvaluatorIOTest extends AbstractTargetPatternEvaluator
   @Test
   public void testBadStatPathAsTarget(@TestParameter boolean keepGoing) throws Exception {
     reporter.removeHandler(failFastHandler);
-    getSkyframeExecutor().turnOffSyscallCacheForTesting();
     scratch.file("parent/BUILD", "sh_library(name = 'parent')").getParentDirectory();
-    AtomicBoolean returnNull = new AtomicBoolean(false);
-    this.transformer =
-        new Transformer() {
-          @Nullable
-          @Override
-          public FileStatus stat(FileStatus stat, PathFragment path, boolean followSymlinks) {
-            if (path.endsWith(PathFragment.create("parent/BUILD")) && returnNull.getAndSet(true)) {
-              return null;
-            }
-            return stat;
-          }
-        };
-
+    delegatingSyscallCache.setDelegate(TestUtils.makeDisappearingFileCache("parent/BUILD"));
     TargetParsingException e =
         assertThrows(
             TargetParsingException.class,
@@ -162,9 +143,8 @@ public class TargetPatternEvaluatorIOTest extends AbstractTargetPatternEvaluator
   @Test
   public void testBadReaddirKeepGoing() throws Exception {
     reporter.removeHandler(failFastHandler);
-    skyframeExecutor.turnOffSyscallCacheForTesting();
     // Given a package, "parent",
-    Path parent = scratch.file("parent/BUILD", "sh_library(name = 'parent')").getParentDirectory();
+    Path parent = scratch.file("parent/BUILD", "filegroup(name = 'parent')").getParentDirectory();
     // And a child, "badstat",
     parent.getRelative("badstat").createDirectoryAndParents();
 

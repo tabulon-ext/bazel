@@ -1,0 +1,389 @@
+// Copyright 2023 The Bazel Authors. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package com.google.devtools.build.lib.analysis.config;
+
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Strings;
+import com.google.common.base.Verify;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import com.google.devtools.build.lib.analysis.PlatformOptions;
+import com.google.devtools.build.lib.analysis.config.FragmentOptions.OutputDirectoriesContext;
+import com.google.devtools.build.lib.cmdline.Label;
+import com.google.devtools.build.lib.server.FailureDetails.BuildConfiguration.Code;
+import com.google.devtools.build.lib.util.ClassName;
+import com.google.devtools.build.lib.util.Fingerprint;
+import com.google.devtools.build.lib.vfs.PathFragment;
+import com.google.devtools.build.lib.vfs.PathFragment.InvalidBaseNameException;
+import com.google.devtools.common.options.OptionDefinition;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import java.util.Map;
+import java.util.Optional;
+import java.util.TreeMap;
+import javax.annotation.Nullable;
+
+/**
+ * Machinery for computing the output path mnemonic given the target options and current baseline
+ * options (which will be null in legacy mode or odd parts of the test infra).
+ */
+@VisibleForTesting
+public final class OutputPathMnemonicComputer {
+  // The length of the hash of the config tacked onto the end of the output path.
+  // Limited for ergonomics and MAX_PATH reasons.
+  private static final int HASH_LENGTH = 12;
+
+  private OutputPathMnemonicComputer() {}
+
+  /** Indicates a failure to construct the mnemonic for an output directory. */
+  public static class InvalidMnemonicException extends InvalidConfigurationException {
+    InvalidMnemonicException(String message, Exception e) {
+      super(
+          message + " is invalid as part of a path: " + e.getMessage(),
+          Code.INVALID_OUTPUT_DIRECTORY_MNEMONIC);
+    }
+  }
+
+  /**
+   * The computed output path mnemonic along with whether it depends on the baseline options.
+   *
+   * <p>If {@link #dependsOnBaseline} is false, {@link #mnemonic} is a pure function of the {@link
+   * BuildOptions} it was computed from (for a fixed Blaze release). If true, the same {@link
+   * BuildOptions} could yield a different mnemonic under a different baseline (e.g. a different
+   * top-level command line), so consumers that need to distinguish output directories cannot rely
+   * on {@link BuildOptions} alone.
+   *
+   * <p>This bit is set when either (a) the ST-hash segment is non-empty or (b) any {@link
+   * FragmentOptions} consulted {@link OutputDirectoriesContext#getBaseline} while contributing to
+   * the mnemonic. It is intentionally conservative: a {@link FragmentOptions} that calls {@link
+   * OutputDirectoriesContext#getBaseline} but ends up contributing nothing still sets the bit.
+   */
+  public record Result(String mnemonic, boolean dependsOnBaseline) {}
+
+  /**
+   * {@link OutputDirectoriesContext} implementation to pass to {@link
+   * FragmentOptions#processForOutputPathMnemonic}.
+   */
+  private static final class MnemonicContext implements OutputDirectoriesContext {
+    @Nullable private final BuildOptions baselineOptions;
+    private final StringBuilder mnemonicBuilder;
+    private final ImmutableSet.Builder<String> explicitInOutputPathBuilder;
+    private boolean baselineConsulted = false;
+
+    MnemonicContext(@Nullable BuildOptions baselineOptions) {
+      this.baselineOptions = baselineOptions;
+      this.mnemonicBuilder = new StringBuilder();
+      this.explicitInOutputPathBuilder = ImmutableSet.builder();
+    }
+
+    @Nullable
+    @Override
+    public <T extends FragmentOptions> T getBaseline(Class<T> optionsClass) {
+      // Any consultation of the baseline means the resulting mnemonic can no longer be assumed to
+      // be a pure function of the target options.
+      baselineConsulted = true;
+      if (baselineOptions == null) {
+        return null;
+      }
+      return baselineOptions.get(optionsClass);
+    }
+
+    @Override
+    @CanIgnoreReturnValue
+    public OutputDirectoriesContext addToMnemonic(@Nullable String value)
+        throws OutputDirectoriesContext.AddToMnemonicException {
+      if (Strings.isNullOrEmpty(value)) {
+        return this;
+      }
+      try {
+        // Allowing for path separators (e.g. /) would be a disaster.
+        PathFragment.checkSeparators(value);
+        // Want dashes in-between additions.
+        // (Note that length of a StringBuilder is very cheap to check so this performs fine.)
+        if (!mnemonicBuilder.isEmpty()) {
+          mnemonicBuilder.append("-");
+        }
+        mnemonicBuilder.append(value);
+      } catch (InvalidBaseNameException e) {
+        throw new AddToMnemonicException(value, e);
+      }
+      return this;
+    }
+
+    @Override
+    @CanIgnoreReturnValue
+    public OutputDirectoriesContext markAsExplicitInOutputPathFor(String optionName) {
+      explicitInOutputPathBuilder.add(optionName);
+      return this;
+    }
+
+    void consume(FragmentOptions options) throws InvalidMnemonicException {
+      try {
+        options.processForOutputPathMnemonic(this);
+      } catch (AddToMnemonicException e) {
+        throw new InvalidMnemonicException(
+            String.format(
+                "Output directory name '%s' specified by %s",
+                e.badValue, ClassName.getSimpleNameWithOuter(options.getOptionsClass())),
+            e.tunneledException);
+      }
+    }
+
+    void checkedAddToMnemonic(@Nullable String value, String valueCtx)
+        throws InvalidMnemonicException {
+      try {
+        addToMnemonic(value);
+      } catch (AddToMnemonicException e) {
+        throw new InvalidMnemonicException(
+            String.format("%s '%s'", valueCtx, e.badValue), e.tunneledException);
+      }
+    }
+
+    String getMnemonic() {
+      return mnemonicBuilder.toString();
+    }
+
+    ImmutableSet<String> getExplicitInOutputPathOptions() {
+      return explicitInOutputPathBuilder.build();
+    }
+  }
+
+  /**
+   * Computes the output path mnemonic.
+   *
+   * <p>The general form is [cpu]-[compilation_mode]-[platform_suffix?]-...-[-ST-hash?] where ... is
+   * any additions requested by the {@link FragmentOptions} via {@link
+   * OutputDirectoriesContext#addToMnemonic} during calls to {@link
+   * FragmentOptions#processForOutputPathMnemonic}.
+   *
+   * <p>platform_suffix is omitted if empty.
+   *
+   * <p>The exact ST-hash used depends on baselineOptions. The hash includes all options that are
+   * different between buildOptions and baselineOptions but were also not excluded from the output
+   * path by a call to {@link OutputDirectoriesContext#markAsExplicitInOutputPathFor}.
+   */
+  public static Result computeMnemonic(
+      BuildOptions buildOptions, @Nullable BuildOptions baselineOptions)
+      throws InvalidMnemonicException {
+
+    CoreOptions coreOptions = buildOptions.get(CoreOptions.class);
+
+    if (buildOptions.hasNoConfig()) {
+      // Historically, the noconfig output path mnemonic had the compilation mode.
+      // See NoConfigTransition.
+      return new Result(
+          coreOptions.getCompilationMode() + "-noconfig", /* dependsOnBaseline= */ false);
+    }
+
+    PlatformOptions platformOptions = buildOptions.get(PlatformOptions.class);
+
+    MnemonicContext ctx = new MnemonicContext(baselineOptions);
+
+    handlePlatformCpuDescriptor(ctx, coreOptions, platformOptions);
+
+    ctx.checkedAddToMnemonic(coreOptions.getCompilationMode().toString(), "Compilation mode");
+    ctx.markAsExplicitInOutputPathFor("compilation_mode");
+
+    if (!Strings.isNullOrEmpty(coreOptions.getPlatformSuffix())) {
+      ctx.checkedAddToMnemonic(coreOptions.getPlatformSuffix(), "Platform suffix");
+    }
+    ctx.markAsExplicitInOutputPathFor("platform_suffix");
+
+    for (FragmentOptions options : buildOptions.getNativeOptions()) {
+      ctx.consume(options);
+    }
+
+    ImmutableSet<String> explicitInOutputPathOptions = ctx.getExplicitInOutputPathOptions();
+
+    // Sanity check that every listed option in explicitInOutputPathOptions actually exists.
+    // TODO(blaze-configurability-team): Should technically be unnecessary to do this every time as
+    // all the calls to markAsExplicitInOutputPathFor should be constant for a given release.
+    // Instead, could do this when a specific flag is supplied and just check in test code.
+    // Alternatively, just do a better job of caching the call to OptionInfo.buildMapFrom as only
+    // that call is the expensive part.
+    ImmutableMap<String, OptionInfo> optionInfoMap = OptionInfo.buildMapFrom(buildOptions);
+    ImmutableSet<String> missingOptions =
+        explicitInOutputPathOptions.stream()
+            .filter(optionName -> !optionInfoMap.containsKey(optionName))
+            .collect(toImmutableSet());
+    if (!missingOptions.isEmpty()) {
+      throw new IllegalStateException(
+          "Internal error: Options registered for special output handling that do not exist: "
+              + missingOptions);
+    }
+
+    String diffFragment =
+        computeNameFragmentWithDiff(
+            buildOptions, Verify.verifyNotNull(baselineOptions), explicitInOutputPathOptions);
+    ctx.checkedAddToMnemonic(diffFragment, "Transition directory name fragment");
+
+    // Everything added to the mnemonic above, other than the ST-hash and anything a FragmentOptions
+    // derived from getBaseline(), is a function of buildOptions alone.
+    boolean dependsOnBaseline = !diffFragment.isEmpty() || ctx.baselineConsulted;
+    return new Result(ctx.getMnemonic(), dependsOnBaseline);
+  }
+
+  private static void handlePlatformCpuDescriptor(
+      MnemonicContext ctx, CoreOptions coreOptions, @Nullable PlatformOptions platformOptions)
+      throws InvalidMnemonicException {
+    if (platformOptions == null
+        || !coreOptions.usePlatformInOutputDir(platformOptions.computeTargetPlatform())) {
+      ctx.checkedAddToMnemonic(coreOptions.getCpu(), "CPU/Platform descriptor");
+      ctx.markAsExplicitInOutputPathFor("cpu");
+      return;
+    }
+
+    if (platformOptions.getPlatforms() != null && platformOptions.getPlatforms().size() > 1) {
+      ctx.checkedAddToMnemonic("multi-platform", "CPU/Platform descriptor");
+      // Intentionally not marking anything as explicit in output path so ST-hash used if needed.
+      return;
+    }
+
+    ctx.checkedAddToMnemonic(
+        computePlatformName(ctx, platformOptions.computeTargetPlatform(), coreOptions),
+        "CPU/Platform descriptor");
+    ctx.markAsExplicitInOutputPathFor("platforms");
+  }
+
+  private static String computePlatformName(
+      MnemonicContext ctx, Label platform, CoreOptions options) {
+    Optional<String> overridePlatformName = options.getPlatformCpuNameOverride(platform);
+    if (overridePlatformName.isPresent()) {
+      return overridePlatformName.get();
+    }
+
+    // Handle legacy heuristic if enabled.
+    // Note that it is known this heuristic is not necessarily complete.
+    if (options.getUsePlatformsInOutputDirLegacyHeuristic()) {
+      // Only use non-default platforms.
+
+      if (!PlatformOptions.platformIsDefault(platform)) {
+        // Target names may contain slashes, but the mnemonic has to be a single path segment.
+        return platform.getName().replace('/', '_');
+      }
+      // Fall back to using the CPU.
+      ctx.markAsExplicitInOutputPathFor("cpu");
+      return options.getCpu();
+    }
+    // As a last resort use hashCode of the unambiguous form of the label.
+    return String.format("platform-%X", platform.getUnambiguousCanonicalForm().hashCode());
+  }
+
+  /**
+   * Compute the hash for the new BuildOptions based on the names and values of all options (both
+   * native and Starlark) that are different from some supplied baseline configuration.
+   */
+  private static String computeNameFragmentWithDiff(
+      BuildOptions toOptions,
+      BuildOptions baselineOptions,
+      ImmutableSet<String> explicitInOutputPathOptions) {
+    // Quick short-circuit for trivial case.
+    if (toOptions.equals(baselineOptions)) {
+      return "";
+    }
+
+    // TODO(blaze-configurability-team): As a mild performance update, getFirst already includes
+    //   details of the corresponding option. Could incorporate this instead of hashChosenOptions
+    //   regenerating the OptionDefinitions and values.
+    OptionsDiff diff = OptionsDiff.diff(toOptions, baselineOptions);
+    // Note: getFirst only excludes options trimmed between baselineOptions to toOptions and this is
+    //   considered OK as a given Rule should not be being built with options of different
+    //   trimmings. See longform note in {@link ConfiguredTargetKey} for details.
+    ImmutableSet<String> chosenNativeOptions =
+        diff.getFirst().keySet().stream()
+            .map(OptionDefinition::getOptionName)
+            .filter(optionName -> !explicitInOutputPathOptions.contains(optionName))
+            .collect(toImmutableSet());
+    // Note: getChangedStarlarkOptions includes all changed options, added options and removed
+    //   options between baselineOptions and toOptions. This is necessary since there is no current
+    //   notion of trimming a Starlark option: 'null' or non-existent justs means set to default.
+    ImmutableSet<String> chosenStarlarkOptions =
+        diff.getChangedStarlarkOptions().stream().map(Label::toString).collect(toImmutableSet());
+    return hashChosenOptions(toOptions, chosenNativeOptions, chosenStarlarkOptions);
+  }
+
+  /**
+   * Compute a hash of the given BuildOptions by hashing only the options referenced in both
+   * chosenNative and chosenStarlark. The order of the chosen order does not matter (as this
+   * function will effectively sort them into a canonical order) and the pre-hash for each option
+   * will be of the form (//command_line_option:[native option]|[Starlark option label])=[value].
+   *
+   * <p>If a supplied native option does not exist, it is skipped (as it is presumed non-existence
+   * is due to trimming).
+   *
+   * <p>If a supplied Starlark option does exist, the pre-hash will be [Starlark option label]@null
+   * (as it is presumed non-existence is due to being set to default value).
+   */
+  private static String hashChosenOptions(
+      BuildOptions toOptions, Iterable<String> chosenNative, Iterable<String> chosenStarlark) {
+    // TODO(blaze-configurability-team): A mild performance optimization would have this be global.
+    ImmutableMap<String, OptionInfo> optionInfoMap = OptionInfo.buildMapFrom(toOptions);
+
+    // Note that the TreeMap guarantees a stable ordering of keys, and thus it is okay if
+    // chosenNative or chosenStarlark do not have a stable iteration order
+    TreeMap<String, Object> toHash = new TreeMap<>();
+    for (String nativeOptionName : chosenNative) {
+      OptionInfo optionInfo = optionInfoMap.get(nativeOptionName);
+      if (optionInfo == null) {
+        // This can occur if toOptions has been trimmed but the supplied chosen native options
+        // includes that trimmed options.
+        // (e.g. legacy naming mode, using --trim_test_configuration and --test_arg transition).
+        continue;
+      }
+      FragmentOptions fragmentOptions =
+          toOptions.get(optionInfoMap.get(nativeOptionName).getOptionClass());
+      Object value = optionInfo.getDefinition().getValue(fragmentOptions);
+      // TODO(blaze-configurability-team): The commandline option is legacy and can be removed
+      //   after fixing up all the associated tests.
+      toHash.put("//command_line_option:" + nativeOptionName, value);
+    }
+    for (String starlarkOptionName : chosenStarlark) {
+      Object value =
+          toOptions.getStarlarkOptions().get(Label.parseCanonicalUnchecked(starlarkOptionName));
+      toHash.put(starlarkOptionName, value);
+    }
+
+    if (toHash.isEmpty()) {
+      return "";
+    } else {
+      ImmutableList.Builder<String> hashStrs = ImmutableList.builderWithExpectedSize(toHash.size());
+      for (Map.Entry<String, Object> singleOptionAndValue : toHash.entrySet()) {
+        Object value = singleOptionAndValue.getValue();
+        if (value != null) {
+          hashStrs.add(singleOptionAndValue.getKey() + "=" + value);
+        } else {
+          // Avoid using =null to different from value being the non-null String "null"
+          hashStrs.add(singleOptionAndValue.getKey() + "@null");
+        }
+      }
+      return transitionDirectoryNameFragment(hashStrs.build());
+    }
+  }
+
+  @VisibleForTesting
+  public static String transitionDirectoryNameFragment(Iterable<String> opts) {
+    Fingerprint fp = new Fingerprint();
+    for (String opt : opts) {
+      fp.addString(opt);
+    }
+    // Shorten the hash to HASH_LENGTH characters. This should provide sufficient collision
+    // avoidance (that is, we don't expect anyone to experience a collision ever).
+    // Shortening the hash is important for Windows paths that tend to be short.
+    String suffix = fp.hexDigestAndReset().substring(0, HASH_LENGTH);
+    return "ST-" + suffix;
+  }
+}

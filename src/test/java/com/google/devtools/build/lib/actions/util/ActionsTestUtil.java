@@ -27,10 +27,10 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
-import com.google.common.eventbus.EventBus;
 import com.google.devtools.build.lib.actions.AbstractAction;
 import com.google.devtools.build.lib.actions.Action;
 import com.google.devtools.build.lib.actions.ActionAnalysisMetadata;
+import com.google.devtools.build.lib.actions.ActionConflictException;
 import com.google.devtools.build.lib.actions.ActionExecutionContext;
 import com.google.devtools.build.lib.actions.ActionExecutionContext.LostInputsCheck;
 import com.google.devtools.build.lib.actions.ActionGraph;
@@ -42,12 +42,13 @@ import com.google.devtools.build.lib.actions.ActionLookupKey;
 import com.google.devtools.build.lib.actions.ActionOwner;
 import com.google.devtools.build.lib.actions.ActionResult;
 import com.google.devtools.build.lib.actions.Artifact;
-import com.google.devtools.build.lib.actions.Artifact.ArtifactExpander;
 import com.google.devtools.build.lib.actions.Artifact.DerivedArtifact;
+import com.google.devtools.build.lib.actions.Artifact.FilesetArtifact;
+import com.google.devtools.build.lib.actions.Artifact.RunfilesArtifact;
 import com.google.devtools.build.lib.actions.Artifact.SourceArtifact;
-import com.google.devtools.build.lib.actions.Artifact.SpecialArtifact;
-import com.google.devtools.build.lib.actions.Artifact.SpecialArtifactType;
+import com.google.devtools.build.lib.actions.Artifact.TreeArtifact;
 import com.google.devtools.build.lib.actions.Artifact.TreeFileArtifact;
+import com.google.devtools.build.lib.actions.Artifact.UnresolvedSymlinkArtifact;
 import com.google.devtools.build.lib.actions.ArtifactOwner;
 import com.google.devtools.build.lib.actions.ArtifactResolver;
 import com.google.devtools.build.lib.actions.ArtifactRoot;
@@ -56,54 +57,47 @@ import com.google.devtools.build.lib.actions.BuildConfigurationEvent;
 import com.google.devtools.build.lib.actions.DiscoveredModulesPruner;
 import com.google.devtools.build.lib.actions.Executor;
 import com.google.devtools.build.lib.actions.FileArtifactValue;
-import com.google.devtools.build.lib.actions.MiddlemanType;
-import com.google.devtools.build.lib.actions.MutableActionGraph.ActionConflictException;
+import com.google.devtools.build.lib.actions.FilesetOutputTree;
+import com.google.devtools.build.lib.actions.InputMetadataProvider;
+import com.google.devtools.build.lib.actions.OutputMetadataStore;
 import com.google.devtools.build.lib.actions.PackageRootResolver;
+import com.google.devtools.build.lib.actions.RunfilesArtifactValue;
+import com.google.devtools.build.lib.actions.RunfilesTree;
 import com.google.devtools.build.lib.actions.ThreadStateReceiver;
-import com.google.devtools.build.lib.actions.cache.MetadataHandler;
+import com.google.devtools.build.lib.actions.VirtualActionInput;
 import com.google.devtools.build.lib.actions.cache.Protos.ActionCacheStatistics.MissDetail;
 import com.google.devtools.build.lib.actions.cache.Protos.ActionCacheStatistics.MissReason;
-import com.google.devtools.build.lib.actions.cache.VirtualActionInput;
 import com.google.devtools.build.lib.analysis.actions.CustomCommandLine;
 import com.google.devtools.build.lib.analysis.actions.SpawnActionTemplate;
 import com.google.devtools.build.lib.analysis.configuredtargets.RuleConfiguredTarget;
+import com.google.devtools.build.lib.analysis.platform.PlatformInfo;
 import com.google.devtools.build.lib.buildeventstream.BuildEventStreamProtos;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.cmdline.RepositoryName;
 import com.google.devtools.build.lib.collect.nestedset.NestedSet;
 import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
 import com.google.devtools.build.lib.collect.nestedset.Order;
-import com.google.devtools.build.lib.events.EventHandler;
 import com.google.devtools.build.lib.events.ExtendedEventHandler;
-import com.google.devtools.build.lib.events.Reporter;
 import com.google.devtools.build.lib.exec.SingleBuildFileCache;
+import com.google.devtools.build.lib.exec.util.FakeActionInputFileCache;
+import com.google.devtools.build.lib.skyframe.ActionExecutionValue;
 import com.google.devtools.build.lib.skyframe.ActionTemplateExpansionValue;
 import com.google.devtools.build.lib.skyframe.ActionTemplateExpansionValue.ActionTemplateExpansionKey;
-import com.google.devtools.build.lib.skyframe.BuildConfigurationKey;
 import com.google.devtools.build.lib.skyframe.TreeArtifactValue;
+import com.google.devtools.build.lib.skyframe.config.BuildConfigurationKey;
 import com.google.devtools.build.lib.skyframe.serialization.autocodec.SerializationConstant;
 import com.google.devtools.build.lib.util.FileType;
 import com.google.devtools.build.lib.util.Fingerprint;
-import com.google.devtools.build.lib.util.ResourceUsage;
 import com.google.devtools.build.lib.util.io.FileOutErr;
 import com.google.devtools.build.lib.vfs.DigestHashFunction;
-import com.google.devtools.build.lib.vfs.FileStatus;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.Root;
 import com.google.devtools.build.lib.vfs.SyscallCache;
 import com.google.devtools.build.lib.vfs.inmemoryfs.InMemoryFileSystem;
-import com.google.devtools.build.skyframe.AbstractSkyFunctionEnvironment;
-import com.google.devtools.build.skyframe.ErrorInfo;
-import com.google.devtools.build.skyframe.EvaluationContext;
-import com.google.devtools.build.skyframe.EvaluationResult;
-import com.google.devtools.build.skyframe.MemoizingEvaluator;
-import com.google.devtools.build.skyframe.SkyFunction;
+import com.google.devtools.build.skyframe.SkyFunction.Environment;
 import com.google.devtools.build.skyframe.SkyFunctionName;
-import com.google.devtools.build.skyframe.SkyKey;
-import com.google.devtools.build.skyframe.SkyValue;
-import com.google.devtools.build.skyframe.ValueOrUntypedException;
-import com.google.protobuf.ByteString;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.ArrayDeque;
@@ -111,7 +105,6 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumMap;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -119,7 +112,6 @@ import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
 import java.util.function.Function;
-import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
@@ -134,7 +126,10 @@ public final class ActionsTestUtil {
     this.actionGraph = actionGraph;
   }
 
-  private static final Label NULL_LABEL = Label.parseAbsoluteUnchecked("//null/action:owner");
+  public static final Label NULL_LABEL = Label.parseCanonicalUnchecked("//null/action:owner");
+
+  public static final Label YET_ANOTHER_NULL_LABEL =
+      Label.parseCanonicalUnchecked("//yet/another/null/action:owner");
 
   public static ActionExecutionContext createContext(
       Executor executor,
@@ -142,15 +137,19 @@ public final class ActionsTestUtil {
       ActionKeyContext actionKeyContext,
       FileOutErr fileOutErr,
       Path execRoot,
-      MetadataHandler metadataHandler) {
+      OutputMetadataStore outputMetadataStore) {
     return createContext(
         executor,
         eventHandler,
         actionKeyContext,
         fileOutErr,
-        execRoot,
-        metadataHandler,
-        /*clientEnv=*/ ImmutableMap.of());
+        new SingleBuildFileCache(
+            execRoot.getPathString(),
+            PathFragment.create("dummy-output-path"),
+            execRoot.getFileSystem(),
+            SyscallCache.NO_CACHE),
+        outputMetadataStore,
+        /* clientEnv= */ ImmutableMap.of());
   }
 
   public static ActionExecutionContext createContext(
@@ -158,25 +157,21 @@ public final class ActionsTestUtil {
       ExtendedEventHandler eventHandler,
       ActionKeyContext actionKeyContext,
       FileOutErr fileOutErr,
-      Path execRoot,
-      MetadataHandler metadataHandler,
+      InputMetadataProvider inputMetadataProvider,
+      OutputMetadataStore outputMetadataStore,
       Map<String, String> clientEnv) {
     return new ActionExecutionContext(
         executor,
-        new SingleBuildFileCache(
-            execRoot.getPathString(), execRoot.getFileSystem(), SyscallCache.NO_CACHE),
+        inputMetadataProvider,
         ActionInputPrefetcher.NONE,
         actionKeyContext,
-        metadataHandler,
-        /*rewindingEnabled=*/ false,
+        outputMetadataStore,
+        /* rewindingEnabled= */ false,
         LostInputsCheck.NONE,
         fileOutErr,
         eventHandler,
         ImmutableMap.copyOf(clientEnv),
-        /*topLevelFilesets=*/ ImmutableMap.of(),
-        (artifact, output) -> {},
-        /*actionFileSystem=*/ null,
-        /*skyframeDepsResult=*/ null,
+        /* actionFileSystem= */ null,
         DiscoveredModulesPruner.DEFAULT,
         SyscallCache.NO_CACHE,
         ThreadStateReceiver.NULL_INSTANCE);
@@ -186,23 +181,32 @@ public final class ActionsTestUtil {
     return createContext(new DummyExecutor(), eventHandler);
   }
 
+  public static ActionExecutionContext createContextForFileWriteAction(
+      ExtendedEventHandler eventHandler) {
+    return createContext(
+        new DummyExecutor(),
+        eventHandler,
+        new ActionKeyContext(),
+        null,
+        new FakeActionInputFileCache(),
+        null,
+        ImmutableMap.of());
+  }
+
   public static ActionExecutionContext createContext(
       Executor executor, ExtendedEventHandler eventHandler) {
     return new ActionExecutionContext(
         executor,
-        /*actionInputFileCache=*/ null,
+        /* inputMetadataProvider= */ null,
         ActionInputPrefetcher.NONE,
         new ActionKeyContext(),
-        /*metadataHandler=*/ null,
-        /*rewindingEnabled=*/ false,
+        /* outputMetadataStore= */ null,
+        /* rewindingEnabled= */ false,
         LostInputsCheck.NONE,
-        /*fileOutErr=*/ null,
+        /* fileOutErr= */ null,
         eventHandler,
-        /*clientEnv=*/ ImmutableMap.of(),
-        /*topLevelFilesets=*/ ImmutableMap.of(),
-        (artifact, output) -> {},
-        /*actionFileSystem=*/ null,
-        /*skyframeDepsResult=*/ null,
+        /* clientEnv= */ ImmutableMap.of(),
+        /* actionFileSystem= */ null,
         DiscoveredModulesPruner.DEFAULT,
         SyscallCache.NO_CACHE,
         ThreadStateReceiver.NULL_INSTANCE);
@@ -214,26 +218,44 @@ public final class ActionsTestUtil {
       ActionKeyContext actionKeyContext,
       FileOutErr fileOutErr,
       Path execRoot,
-      MetadataHandler metadataHandler,
-      MemoizingEvaluator evaluator,
+      Environment environment,
       DiscoveredModulesPruner discoveredModulesPruner) {
     return ActionExecutionContext.forInputDiscovery(
         executor,
         new SingleBuildFileCache(
-            execRoot.getPathString(), execRoot.getFileSystem(), SyscallCache.NO_CACHE),
+            execRoot.getPathString(),
+            PathFragment.create("dummy-output-path"),
+            execRoot.getFileSystem(),
+            SyscallCache.NO_CACHE),
         ActionInputPrefetcher.NONE,
         actionKeyContext,
-        metadataHandler,
-        /*rewindingEnabled=*/ false,
+        /* rewindingEnabled= */ false,
         LostInputsCheck.NONE,
         fileOutErr,
         eventHandler,
         ImmutableMap.of(),
-        new BlockingSkyFunctionEnvironment(evaluator, eventHandler),
-        /*actionFileSystem=*/ null,
+        environment,
+        /* actionFileSystem= */ null,
         discoveredModulesPruner,
         SyscallCache.NO_CACHE,
         ThreadStateReceiver.NULL_INSTANCE);
+  }
+
+  /** Creates an {@link ActionExecutionValue} with only file outputs. */
+  public static ActionExecutionValue createActionExecutionValue(
+      ImmutableMap<Artifact, FileArtifactValue> artifactData) {
+    return createActionExecutionValue(artifactData, /* treeArtifactData= */ ImmutableMap.of());
+  }
+
+  /** Creates an {@link ActionExecutionValue} with only file and tree artifact outputs. */
+  public static ActionExecutionValue createActionExecutionValue(
+      ImmutableMap<Artifact, FileArtifactValue> artifactData,
+      ImmutableMap<Artifact, TreeArtifactValue> treeArtifactData) {
+    return ActionExecutionValue.create(
+        artifactData,
+        treeArtifactData,
+        /* richArtifactData= */ null,
+        /* discoveredModules= */ NestedSetBuilder.emptySet(Order.STABLE_ORDER));
   }
 
   public static Artifact createArtifact(ArtifactRoot root, Path path) {
@@ -256,12 +278,36 @@ public final class ActionsTestUtil {
         : DerivedArtifact.create(root, execPath, NULL_ARTIFACT_OWNER);
   }
 
-  public static SpecialArtifact createTreeArtifactWithGeneratingAction(
+  public static RunfilesArtifact createRunfilesArtifact(ArtifactRoot root, String execPath) {
+    return RunfilesArtifact.create(root, PathFragment.create(execPath), NULL_ARTIFACT_OWNER);
+  }
+
+  public static FilesetArtifact createFilesetArtifact(ArtifactRoot root, String execPath) {
+    return FilesetArtifact.create(root, PathFragment.create(execPath), NULL_ARTIFACT_OWNER);
+  }
+
+  public static TreeArtifact createTreeArtifactWithGeneratingAction(
       ArtifactRoot root, PathFragment execPath) {
-    SpecialArtifact treeArtifact =
-        SpecialArtifact.create(root, execPath, NULL_ARTIFACT_OWNER, SpecialArtifactType.TREE);
+    TreeArtifact treeArtifact = TreeArtifact.create(root, execPath, NULL_ARTIFACT_OWNER);
     treeArtifact.setGeneratingActionKey(NULL_ACTION_LOOKUP_DATA);
     return treeArtifact;
+  }
+
+  public static TreeArtifact createTreeArtifactWithGeneratingAction(
+      ArtifactRoot root, String rootRelativePath) {
+    return createTreeArtifactWithGeneratingAction(
+        root, root.getExecPath().getRelative(rootRelativePath));
+  }
+
+  public static UnresolvedSymlinkArtifact createUnresolvedSymlinkArtifact(
+      ArtifactRoot root, String execPath) {
+    return createUnresolvedSymlinkArtifactWithExecPath(
+        root, root.getExecPath().getRelative(execPath));
+  }
+
+  public static UnresolvedSymlinkArtifact createUnresolvedSymlinkArtifactWithExecPath(
+      ArtifactRoot root, PathFragment execPath) {
+    return UnresolvedSymlinkArtifact.create(root, execPath, NULL_ARTIFACT_OWNER);
   }
 
   public static void assertNoArtifactEndingWith(RuleConfiguredTarget target, String path) {
@@ -274,7 +320,7 @@ public final class ActionsTestUtil {
   }
 
   public static ArtifactRoot createArtifactRootFromTwoPaths(Path root, Path execPath) {
-    return ArtifactRoot.asDerivedRoot(root, RootType.Output, execPath.relativeTo(root));
+    return ArtifactRoot.asDerivedRoot(root, RootType.OUTPUT, execPath.relativeTo(root));
   }
 
   /**
@@ -288,13 +334,6 @@ public final class ActionsTestUtil {
   public static VirtualActionInput createVirtualActionInput(PathFragment path, String contents) {
     return new VirtualActionInput() {
       @Override
-      public ByteString getBytes() throws IOException {
-        ByteString.Output out = ByteString.newOutput();
-        writeTo(out);
-        return out.toByteString();
-      }
-
-      @Override
       public String getExecPathString() {
         return path.getPathString();
       }
@@ -305,98 +344,10 @@ public final class ActionsTestUtil {
       }
 
       @Override
-      public boolean isSymlink() {
-        return false;
-      }
-
-      @Override
       public void writeTo(OutputStream out) throws IOException {
         out.write(contents.getBytes(UTF_8));
       }
     };
-  }
-
-  /**
-   * {@link SkyFunction.Environment} that internally makes a full Skyframe evaluate call for the
-   * requested keys, blocking until the values are ready.
-   */
-  private static final class BlockingSkyFunctionEnvironment extends AbstractSkyFunctionEnvironment {
-    private final MemoizingEvaluator evaluator;
-    private final EventHandler eventHandler;
-
-    private BlockingSkyFunctionEnvironment(
-        MemoizingEvaluator evaluator, EventHandler eventHandler) {
-      this.evaluator = evaluator;
-      this.eventHandler = eventHandler;
-    }
-
-    @Override
-    protected Map<SkyKey, ValueOrUntypedException> getValueOrUntypedExceptions(
-        Iterable<? extends SkyKey> depKeys) {
-      EvaluationResult<SkyValue> evaluationResult;
-      Map<SkyKey, ValueOrUntypedException> result = new HashMap<>();
-      try {
-        EvaluationContext evaluationContext =
-            EvaluationContext.newBuilder()
-                .setKeepGoing(false)
-                .setNumThreads(ResourceUsage.getAvailableProcessors())
-                .setEventHandler(new Reporter(new EventBus(), eventHandler))
-                .build();
-        evaluationResult = evaluator.evaluate(depKeys, evaluationContext);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        for (SkyKey key : depKeys) {
-          result.put(key, ValueOrUntypedException.ofNull());
-        }
-        return result;
-      }
-      for (SkyKey key : depKeys) {
-        SkyValue value = evaluationResult.get(key);
-        if (value != null) {
-          result.put(key, ValueOrUntypedException.ofValueUntyped(value));
-          continue;
-        }
-        errorMightHaveBeenFound = true;
-        ErrorInfo errorInfo = evaluationResult.getError(key);
-        if (errorInfo == null || errorInfo.getException() == null) {
-          result.put(key, ValueOrUntypedException.ofNull());
-          continue;
-        }
-        result.put(key, ValueOrUntypedException.ofExn(errorInfo.getException()));
-      }
-      return result;
-    }
-
-    @Override
-    protected List<ValueOrUntypedException> getOrderedValueOrUntypedExceptions(
-        Iterable<? extends SkyKey> depKeys) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ExtendedEventHandler getListener() {
-      return null;
-    }
-
-    @Override
-    public void registerDependencies(Iterable<SkyKey> keys) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public boolean inErrorBubblingForSkyFunctionsThatCanFullyRecoverFromErrors() {
-      return false;
-    }
-
-    @Override
-    public boolean restartPermitted() {
-      return false;
-    }
-
-    @Override
-    public <T extends SkyKeyComputeState> T getState(Supplier<T> stateSupplier) {
-      return stateSupplier.get();
-    }
   }
 
   @SerializationConstant
@@ -425,34 +376,67 @@ public final class ActionsTestUtil {
         }
       };
 
+  @SerializationConstant
+  public static final ActionLookupKey YET_ANOTHER_NULL_ARTIFACT_OWNER =
+      new ActionLookupKey() {
+
+        @Override
+        public SkyFunctionName functionName() {
+          return null;
+        }
+
+        @Override
+        public Label getLabel() {
+          return YET_ANOTHER_NULL_LABEL;
+        }
+
+        @Nullable
+        @Override
+        public BuildConfigurationKey getConfigurationKey() {
+          return null;
+        }
+
+        @Override
+        public String toString() {
+          return "YET_ANOTHER_NULL_ARTIFACT_OWNER";
+        }
+      };
+
   public static final ActionTemplateExpansionKey NULL_TEMPLATE_EXPANSION_ARTIFACT_OWNER =
-      ActionTemplateExpansionValue.key(NULL_ARTIFACT_OWNER, /*actionIndex=*/ 0);
+      ActionTemplateExpansionValue.key(NULL_ARTIFACT_OWNER, /* actionIndex= */ 0);
+
+  @SerializationConstant
+  static final InMemoryFileSystem DUMMY_ARTIFACT_FILE_SYSTEM =
+      new InMemoryFileSystem(DigestHashFunction.SHA256);
 
   public static final Artifact DUMMY_ARTIFACT =
       new Artifact.SourceArtifact(
-          ArtifactRoot.asSourceRoot(
-              Root.absoluteRoot(new InMemoryFileSystem(DigestHashFunction.SHA256))),
+          ArtifactRoot.asSourceRoot(Root.absoluteRoot(DUMMY_ARTIFACT_FILE_SYSTEM)),
           PathFragment.create("/dummy"),
           NULL_ARTIFACT_OWNER);
 
   public static final ActionOwner NULL_ACTION_OWNER =
-      ActionOwner.create(
+      ActionOwner.createDummy(
           NULL_LABEL,
-          ImmutableList.of(),
           new Location("dummy-file", 0, 0),
-          "dummy-configuration-mnemonic",
-          "dummy-kind",
-          "dummy-configuration",
+          /* targetKind= */ "dummy-kind",
+          /* buildConfigurationMnemonic= */ "dummy-configuration-mnemonic",
+          /* configurationChecksum= */ "dummy-configuration",
           new BuildConfigurationEvent(
               BuildEventStreamProtos.BuildEventId.getDefaultInstance(),
               BuildEventStreamProtos.BuildEvent.getDefaultInstance()),
-          null,
-          ImmutableMap.of(),
-          null);
+          /* isToolConfiguration= */ false,
+          /* executionPlatform= */ PlatformInfo.EMPTY_PLATFORM_INFO,
+          /* aspectDescriptors= */ ImmutableList.of(),
+          /* execProperties= */ ImmutableMap.of());
 
   @SerializationConstant
   public static final ActionLookupData NULL_ACTION_LOOKUP_DATA =
       ActionLookupData.create(NULL_ARTIFACT_OWNER, 0);
+
+  @SerializationConstant
+  public static final ActionLookupData YET_ANOTHER_NULL_ACTION_LOOKUP_DATA =
+      ActionLookupData.create(YET_ANOTHER_NULL_ARTIFACT_OWNER, 0);
 
   /** An unchecked exception class for action conflicts. */
   public static class UncheckedActionConflictException extends RuntimeException {
@@ -473,6 +457,10 @@ public final class ActionsTestUtil {
 
     public NullAction(ActionOwner owner, Artifact... outputs) {
       super(owner, NestedSetBuilder.emptySet(Order.STABLE_ORDER), ImmutableList.copyOf(outputs));
+    }
+
+    public NullAction(ActionOwner owner, NestedSet<Artifact> inputs) {
+      super(owner, inputs, ImmutableList.of(DUMMY_ARTIFACT));
     }
 
     public NullAction(Artifact... outputs) {
@@ -497,7 +485,7 @@ public final class ActionsTestUtil {
     @Override
     protected void computeKey(
         ActionKeyContext actionKeyContext,
-        @Nullable ArtifactExpander artifactExpander,
+        @Nullable InputMetadataProvider inputMetadataProvider,
         Fingerprint fp) {
       fp.addString("action");
     }
@@ -508,41 +496,37 @@ public final class ActionsTestUtil {
     }
   }
 
+  /** {@link NullAction} that can be used in place of a shadowed action that discovers inputs. */
+  public static final class InputDiscoveringNullAction extends NullAction {
+    @Override
+    public boolean discoversInputs() {
+      return true;
+    }
+
+    @Override
+    protected boolean inputsDiscovered() {
+      return false;
+    }
+  }
+
   /**
-   * A mocked action containing the inputs and outputs of the action and determines whether or not
-   * the action is a middleman. Used for tests that do not need to execute the action.
+   * A mocked action containing the inputs and outputs of the action. Used for tests that do not
+   * need to execute the action.
    */
   public static class MockAction extends AbstractAction {
-
-    private final boolean middleman;
     private final boolean isShareable;
 
     public MockAction(Iterable<Artifact> inputs, ImmutableSet<Artifact> outputs) {
-      this(inputs, outputs, /*middleman=*/ false, /*isShareable=*/ true);
+      this(inputs, outputs, /* isShareable= */ true);
     }
 
     public MockAction(
-        Iterable<Artifact> inputs, ImmutableSet<Artifact> outputs, boolean middleman) {
-      this(inputs, outputs, middleman, /*isShareable*/ true);
-    }
-
-    public MockAction(
-        Iterable<Artifact> inputs,
-        ImmutableSet<Artifact> outputs,
-        boolean middleman,
-        boolean isShareable) {
+        Iterable<Artifact> inputs, ImmutableSet<Artifact> outputs, boolean isShareable) {
       super(
           NULL_ACTION_OWNER,
           NestedSetBuilder.<Artifact>stableOrder().addAll(inputs).build(),
           outputs);
-      this.middleman = middleman;
       this.isShareable = isShareable;
-    }
-
-    @Override
-    public MiddlemanType getActionType() {
-      // RUNFILES_MIDDLEMAN is chosen arbitrarily among the middleman types.
-      return middleman ? MiddlemanType.RUNFILES_MIDDLEMAN : super.getActionType();
     }
 
     @Override
@@ -553,7 +537,7 @@ public final class ActionsTestUtil {
     @Override
     protected void computeKey(
         ActionKeyContext actionKeyContext,
-        @Nullable ArtifactExpander artifactExpander,
+        @Nullable InputMetadataProvider inputMetadataProvider,
         Fingerprint fp) {
       fp.addString("Mock Action " + getPrimaryOutput());
     }
@@ -610,7 +594,7 @@ public final class ActionsTestUtil {
   }
 
   /** For a bunch of artifacts, gets the basenames and accumulates them in a List. */
-  public static List<String> baseArtifactNames(Iterable<Artifact> artifacts) {
+  public static List<String> baseArtifactNames(Iterable<? extends ActionInput> artifacts) {
     return transform(artifacts, artifact -> artifact.getExecPath().getBaseName());
   }
 
@@ -852,6 +836,7 @@ public final class ActionsTestUtil {
         return artifact;
       }
     }
+
     throw new AssertionError("No input with basename '" + basename + "' in action " + action);
   }
 
@@ -879,7 +864,7 @@ public final class ActionsTestUtil {
   }
 
   public static SpawnActionTemplate createDummySpawnActionTemplate(
-      SpecialArtifact inputTreeArtifact, SpecialArtifact outputTreeArtifact) {
+      TreeArtifact inputTreeArtifact, TreeArtifact outputTreeArtifact) {
     return new SpawnActionTemplate.Builder(inputTreeArtifact, outputTreeArtifact)
         .setCommandLineTemplate(CustomCommandLine.builder().build())
         .setExecutable(PathFragment.create("bin/executable"))
@@ -904,6 +889,7 @@ public final class ActionsTestUtil {
     }
 
     /** Sets the count of the given miss reason to the given value. */
+    @CanIgnoreReturnValue
     public MissDetailsBuilder set(MissReason reason, int count) {
       checkArgument(details.containsKey(reason));
       details.put(reason, count);
@@ -946,6 +932,12 @@ public final class ActionsTestUtil {
     }
 
     @Override
+    public ImmutableList<SourceArtifact> resolveSourceArtifactsAsciiCaseInsensitively(
+        PathFragment execPath, RepositoryName repositoryName) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
     public Map<PathFragment, SourceArtifact> resolveSourceArtifacts(
         Iterable<PathFragment> execPaths, PackageRootResolver resolver) {
       throw new UnsupportedOperationException();
@@ -955,14 +947,19 @@ public final class ActionsTestUtil {
     public Path getPathFromSourceExecPath(Path execRoot, PathFragment execPath) {
       throw new UnsupportedOperationException();
     }
+
+    @Override
+    public boolean isDerivedArtifact(PathFragment execPath) {
+      throw new UnsupportedOperationException();
+    }
   }
 
   /**
-   * A {@link MetadataHandler} for tests that throws {@link UnsupportedOperationException} for its
-   * operations.
+   * A {@link OutputMetadataStore} for tests that throws {@link UnsupportedOperationException} for
+   * its operations.
    */
-  public static final MetadataHandler THROWING_METADATA_HANDLER =
-      new FakeMetadataHandlerBase() {
+  public static final OutputMetadataStore THROWING_METADATA_HANDLER =
+      new FakeInputMetadataHandlerBase() {
         @Override
         public String toString() {
           return "THROWING_METADATA_HANDLER";
@@ -970,41 +967,67 @@ public final class ActionsTestUtil {
       };
 
   /**
-   * A {@link MetadataHandler} all of whose operations throw an exception.
+   * A {@link OutputMetadataStore} all of whose operations throw an exception.
    *
    * <p>This is to be used as a base class by other test programs that need to implement only a few
    * of the hooks required by the scenario under test. Tests that need an instance but do not need
    * any functionality can use {@link #THROWING_METADATA_HANDLER}.
    */
-  public static class FakeMetadataHandlerBase implements MetadataHandler {
+  public static class FakeInputMetadataHandlerBase
+      implements InputMetadataProvider, OutputMetadataStore {
     @Override
-    public FileArtifactValue getMetadata(ActionInput input) throws IOException {
+    public FileArtifactValue getInputMetadataChecked(ActionInput input) throws IOException {
+      throw new UnsupportedOperationException();
+    }
+
+    @Nullable
+    @Override
+    public TreeArtifactValue getTreeMetadata(ActionInput actionInput) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Nullable
+    @Override
+    public TreeArtifactValue getEnclosingTreeMetadata(PathFragment execPath) {
       throw new UnsupportedOperationException();
     }
 
     @Override
-    public ActionInput getInput(String execPath) {
+    @Nullable
+    public FilesetOutputTree getFileset(ActionInput input) {
       throw new UnsupportedOperationException();
     }
 
     @Override
-    public void setDigestForVirtualArtifact(Artifact artifact, byte[] digest) {
+    public Map<Artifact, FilesetOutputTree> getFilesets() {
       throw new UnsupportedOperationException();
     }
 
     @Override
-    public ImmutableSet<TreeFileArtifact> getTreeArtifactChildren(SpecialArtifact treeArtifact) {
+    @Nullable
+    public RunfilesArtifactValue getRunfilesMetadata(ActionInput input) {
       throw new UnsupportedOperationException();
     }
 
     @Override
-    public TreeArtifactValue getTreeArtifactValue(SpecialArtifact treeArtifact) throws IOException {
+    public ImmutableList<RunfilesTree> getRunfilesTrees() {
       throw new UnsupportedOperationException();
     }
 
     @Override
-    public FileArtifactValue constructMetadataForDigest(
-        Artifact output, FileStatus statNoFollow, byte[] digest) {
+    public FileArtifactValue getOutputMetadata(Artifact artifact)
+        throws IOException, InterruptedException {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public ActionInput getInput(PathFragment execPath) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public TreeArtifactValue getTreeArtifactValue(TreeArtifact treeArtifact)
+        throws IOException, InterruptedException {
       throw new UnsupportedOperationException();
     }
 
@@ -1014,7 +1037,7 @@ public final class ActionsTestUtil {
     }
 
     @Override
-    public void injectTree(SpecialArtifact treeArtifact, TreeArtifactValue tree) {
+    public void injectTree(TreeArtifact treeArtifact, TreeArtifactValue tree) {
       throw new UnsupportedOperationException();
     }
 
@@ -1032,5 +1055,52 @@ public final class ActionsTestUtil {
     public void resetOutputs(Iterable<? extends Artifact> outputs) {
       throw new UnsupportedOperationException();
     }
+  }
+
+  /**
+   * Ensures the special, meaningless, `memoizedIsInitialized` field in {@link ActionOwner} is set.
+   *
+   * <p>This field is set upon serializing a proto. It's intended to memoize checking that all the
+   * required fields are set. Since the protos in question are proto3, there are no required fields
+   * so the field is meaningless. However, serialization tests sometimes use reflection to compare
+   * the round tripped output to the input.
+   *
+   * <p>In particular, {@link BuildConfigurationEvent} contains a couple of instances of this field.
+   */
+  public static void ensureMemoizedIsInitializedIsSet(ActionAnalysisMetadata action) {
+    BuildConfigurationEvent buildConfigurationEvent =
+        action.getOwner().getBuildConfigurationEvent();
+    assertThat(buildConfigurationEvent.getEventId().isInitialized()).isTrue();
+    assertThat(buildConfigurationEvent.asStreamProto(/* unusedConverters= */ null).isInitialized())
+        .isTrue();
+  }
+
+  private static final class SimpleActionLookupKey implements ActionLookupKey {
+    private final String name;
+
+    SimpleActionLookupKey(String name) {
+      this.name = name;
+    }
+
+    @Override
+    public SkyFunctionName functionName() {
+      return SkyFunctionName.createHermetic(name);
+    }
+
+    @Nullable
+    @Override
+    public Label getLabel() {
+      return null;
+    }
+
+    @Nullable
+    @Override
+    public BuildConfigurationKey getConfigurationKey() {
+      return null;
+    }
+  }
+
+  public static ActionLookupKey createActionLookupKey(String name) {
+    return new SimpleActionLookupKey(name);
   }
 }

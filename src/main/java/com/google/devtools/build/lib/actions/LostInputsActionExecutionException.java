@@ -15,7 +15,7 @@
 package com.google.devtools.build.lib.actions;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSetMultimap;
 import com.google.devtools.build.lib.util.DetailedExitCode;
 import com.google.devtools.build.lib.util.io.FileOutErr;
 import com.google.devtools.build.lib.vfs.Path;
@@ -24,13 +24,14 @@ import javax.annotation.Nullable;
 /**
  * An {@link ActionExecutionException} thrown when an action fails to execute because one or more of
  * its inputs was lost. In some cases, Bazel may know how to fix this on its own.
+ *
+ * <p>The lost inputs may include outputs of the action itself that it read or downloaded after
+ * creating them.
  */
-public class LostInputsActionExecutionException extends ActionExecutionException {
+public final class LostInputsActionExecutionException extends ActionExecutionException {
 
-  /** Maps lost input digests to their ActionInputs. */
-  private final ImmutableMap<String, ActionInput> lostInputs;
-
-  private final ActionInputDepOwners owners;
+  /** Maps lost input digests to their {@link ActionInput}s. */
+  private final ImmutableSetMultimap<String, ActionInput> lostInputs;
 
   /**
    * The {@link ActionLookupData} for the action whose evaluation failed. Used to distinguish
@@ -64,22 +65,16 @@ public class LostInputsActionExecutionException extends ActionExecutionException
 
   public LostInputsActionExecutionException(
       String message,
-      ImmutableMap<String, ActionInput> lostInputs,
-      ActionInputDepOwners owners,
+      ImmutableSetMultimap<String, ActionInput> lostInputs,
       Action action,
       Exception cause,
       DetailedExitCode detailedExitCode) {
-    super(message, cause, action, /*catastrophe=*/ false, detailedExitCode);
+    super(message, cause, action, /* catastrophe= */ false, detailedExitCode);
     this.lostInputs = lostInputs;
-    this.owners = owners;
   }
 
-  public ImmutableMap<String, ActionInput> getLostInputs() {
+  public ImmutableSetMultimap<String, ActionInput> getLostInputs() {
     return lostInputs;
-  }
-
-  public ActionInputDepOwners getOwners() {
-    return owners;
   }
 
   public Path getPrimaryOutputPath() {
@@ -141,6 +136,6 @@ public class LostInputsActionExecutionException extends ActionExecutionException
     Preconditions.checkState(primaryOutputPath == null);
     Preconditions.checkState(fileOutErr == null);
     Preconditions.checkState(!fromInputDiscovery);
-    return new LostInputsExecException(lostInputs, owners, this);
+    return new LostInputsExecException(lostInputs, this);
   }
 }

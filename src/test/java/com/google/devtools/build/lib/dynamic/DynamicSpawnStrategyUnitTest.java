@@ -15,12 +15,14 @@ package com.google.devtools.build.lib.dynamic;
 
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.common.truth.Truth.assertWithMessage;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.junit.Assert.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNotNull;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -28,20 +30,24 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSetMultimap;
 import com.google.devtools.build.lib.actions.ActionExecutionContext;
+import com.google.devtools.build.lib.actions.ActionInputHelper;
+import com.google.devtools.build.lib.actions.Artifact;
 import com.google.devtools.build.lib.actions.Artifact.SourceArtifact;
 import com.google.devtools.build.lib.actions.ArtifactRoot;
 import com.google.devtools.build.lib.actions.ArtifactRoot.RootType;
 import com.google.devtools.build.lib.actions.DynamicStrategyRegistry;
 import com.google.devtools.build.lib.actions.DynamicStrategyRegistry.DynamicMode;
 import com.google.devtools.build.lib.actions.ExecException;
+import com.google.devtools.build.lib.actions.LostInputsExecException;
 import com.google.devtools.build.lib.actions.SandboxedSpawnStrategy;
 import com.google.devtools.build.lib.actions.SandboxedSpawnStrategy.StopConcurrentSpawns;
 import com.google.devtools.build.lib.actions.Spawn;
 import com.google.devtools.build.lib.actions.SpawnResult;
 import com.google.devtools.build.lib.actions.SpawnResult.Status;
 import com.google.devtools.build.lib.actions.UserExecException;
-import com.google.devtools.build.lib.events.Event;
+import com.google.devtools.build.lib.actions.util.ActionsTestUtil;
 import com.google.devtools.build.lib.events.ExtendedEventHandler;
 import com.google.devtools.build.lib.exec.ExecutionPolicy;
 import com.google.devtools.build.lib.exec.util.SpawnBuilder;
@@ -52,11 +58,15 @@ import com.google.devtools.build.lib.testutil.TestFileOutErr;
 import com.google.devtools.build.lib.testutil.TestUtils;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
+import com.google.devtools.common.options.Options;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import org.junit.After;
@@ -65,8 +75,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 import org.mockito.ArgumentCaptor;
-import org.mockito.Mock;
-import org.mockito.MockitoAnnotations;
+import org.mockito.stubbing.Answer;
 
 /** Unit tests for {@link DynamicSpawnStrategy}. */
 @RunWith(JUnit4.class)
@@ -74,27 +83,55 @@ public class DynamicSpawnStrategyUnitTest {
 
   private static final SpawnResult SUCCESSFUL_SPAWN_RESULT =
       new SpawnResult.Builder().setRunnerName("test").setStatus(Status.SUCCESS).build();
+  private static final SpawnResult SUCCESSFUL_LOCAL_SPAWN_RESULT =
+      new SpawnResult.Builder().setRunnerName("local").setStatus(Status.SUCCESS).build();
+  private static final SpawnResult SUCCESSFUL_REMOTE_SPAWN_RESULT =
+      new SpawnResult.Builder().setRunnerName("remote").setStatus(Status.SUCCESS).build();
   private static final FailureDetail FAILURE_DETAIL =
       FailureDetail.newBuilder().setExecution(Execution.getDefaultInstance()).build();
 
   private ExecutorService executorServiceForCleanup;
 
-  @Mock private Function<Spawn, Optional<Spawn>> mockGetPostProcessingSpawn;
-  @Mock private ExtendedEventHandler reporter;
+  private Function<Spawn, Optional<Spawn>> mockGetPostProcessingSpawn;
+  private ExtendedEventHandler reporter;
 
   private Scratch scratch;
   private Path execDir;
   private ArtifactRoot rootDir;
+  private Artifact output1;
+  private Artifact output2;
+  private final List<DynamicExecutionFinishedEvent> events = new ArrayList<>();
 
   @Before
+  @SuppressWarnings("unchecked")
   public void initMocks() throws IOException {
     scratch = new Scratch();
     execDir = scratch.dir("/base/exec");
-    rootDir = ArtifactRoot.asDerivedRoot(execDir, RootType.Output, "root");
-    MockitoAnnotations.initMocks(this);
-    // Mockito can't see that we want the function to return Optional.empty() instead
-    // of null on apply by default (thanks generic type erasure). Set that up ourselves.
-    when(mockGetPostProcessingSpawn.apply(any())).thenReturn(Optional.empty());
+    rootDir = ArtifactRoot.asDerivedRoot(execDir, RootType.OUTPUT, "root");
+    output1 =
+        Artifact.DerivedArtifact.create(
+            rootDir,
+            rootDir.getExecPath().getRelative("dir/output1.txt"),
+            ActionsTestUtil.NULL_ARTIFACT_OWNER);
+    output2 =
+        Artifact.DerivedArtifact.create(
+            rootDir,
+            rootDir.getExecPath().getRelative("dir/output2.txt"),
+            ActionsTestUtil.NULL_ARTIFACT_OWNER);
+    reporter = mock(ExtendedEventHandler.class);
+    events.clear();
+    doAnswer(
+            (Answer<Void>)
+                inv -> {
+                  Object event = inv.getArgument(0);
+                  if (event instanceof DynamicExecutionFinishedEvent newEvent) {
+                    events.add(newEvent);
+                  }
+                  return null;
+                })
+        .when(reporter)
+        .post(any());
+    mockGetPostProcessingSpawn = mock(Function.class);
   }
 
   @After
@@ -110,31 +147,34 @@ public class DynamicSpawnStrategyUnitTest {
 
   @Test
   public void exec_remoteOnlySpawn_doesNotExecLocalPostProcessingSpawn() throws Exception {
+    Spawn spawn = new SpawnBuilder().withOwnerPrimaryOutput(output1).build();
+
     DynamicSpawnStrategy dynamicSpawnStrategy =
         createDynamicSpawnStrategy(
             ExecutionPolicy.REMOTE_EXECUTION_ONLY, mockGetPostProcessingSpawn);
+    when(mockGetPostProcessingSpawn.apply(spawn)).thenReturn(Optional.empty());
     SandboxedSpawnStrategy local = createMockSpawnStrategy();
     SandboxedSpawnStrategy remote = createMockSpawnStrategy();
     ArgumentCaptor<Spawn> remoteSpawnCaptor = ArgumentCaptor.forClass(Spawn.class);
     when(remote.exec(remoteSpawnCaptor.capture(), any(), any()))
         .thenReturn(ImmutableList.of(SUCCESSFUL_SPAWN_RESULT));
     ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
-    Spawn spawn = new SpawnBuilder().build();
 
     ImmutableList<SpawnResult> results = dynamicSpawnStrategy.exec(spawn, actionExecutionContext);
 
     assertThat(results).containsExactly(SUCCESSFUL_SPAWN_RESULT);
-    verify(mockGetPostProcessingSpawn, never()).apply(any());
     verify(local, never()).exec(any(), any(), any());
     assertThat(remoteSpawnCaptor.getAllValues()).containsExactly(spawn);
   }
 
   @Test
   public void exec_remoteOnlySpawn_noneCanExec_fails() throws Exception {
-    Spawn spawn = new SpawnBuilder().withMnemonic("TheThing").build();
+    Spawn spawn =
+        new SpawnBuilder().withMnemonic("TheThing").withOwnerPrimaryOutput(output1).build();
     DynamicSpawnStrategy dynamicSpawnStrategy =
         createDynamicSpawnStrategy(
             ExecutionPolicy.REMOTE_EXECUTION_ONLY, mockGetPostProcessingSpawn);
+    when(mockGetPostProcessingSpawn.apply(spawn)).thenReturn(Optional.empty());
     SandboxedSpawnStrategy local = createMockSpawnStrategy();
     SandboxedSpawnStrategy remote = createMockSpawnStrategy(false);
     ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
@@ -143,21 +183,24 @@ public class DynamicSpawnStrategyUnitTest {
         assertThrows(
             UserExecException.class,
             () -> dynamicSpawnStrategy.exec(spawn, actionExecutionContext));
+    assertThat(thrown)
+        .hasMessageThat()
+        .isEqualTo(
+            "Spawn is not executable in local: No usable dynamic_remote_strategy found (and local"
+                + " execution disabled) for action TheThing. ");
     assertThat(thrown).hasMessageThat().doesNotContain("dynamic_local_strategy");
-    assertThat(thrown).hasMessageThat().containsMatch("\\bdynamic_remote_strategy\\b");
-    assertThat(thrown).hasMessageThat().containsMatch("\\bTheThing\\b");
     verifyNoInteractions(local);
-    // No post processing because local never ran.
-    verify(mockGetPostProcessingSpawn, never()).apply(any());
   }
 
   @Test
   public void exec_localOnlySpawn_runsLocalPostProcessingSpawn() throws Exception {
-    Spawn spawn = new SpawnBuilder("command").build();
-    Spawn postProcessingSpawn = new SpawnBuilder("extra_command").build();
+    Spawn spawn = new SpawnBuilder("command").withOwnerPrimaryOutput(output1).build();
+    Spawn postProcessingSpawn =
+        new SpawnBuilder("extra_command").withOwnerPrimaryOutput(output2).build();
     DynamicSpawnStrategy dynamicSpawnStrategy =
         createDynamicSpawnStrategy(
-            ExecutionPolicy.LOCAL_EXECUTION_ONLY, ignored -> Optional.of(postProcessingSpawn));
+            ExecutionPolicy.LOCAL_EXECUTION_ONLY, mockGetPostProcessingSpawn);
+    when(mockGetPostProcessingSpawn.apply(spawn)).thenReturn(Optional.of(postProcessingSpawn));
     SandboxedSpawnStrategy local = createMockSpawnStrategy();
     ArgumentCaptor<Spawn> localSpawnCaptor = ArgumentCaptor.forClass(Spawn.class);
     when(local.exec(localSpawnCaptor.capture(), any(), any()))
@@ -175,22 +218,16 @@ public class DynamicSpawnStrategyUnitTest {
   }
 
   @Test
-  public void exec_failedLocalSpawn_doesNotExecLocalPostProcessingSpawn() throws Exception {
-    testExecFailedLocalSpawnDoesNotExecLocalPostProcessingSpawn(
-        new SpawnResult.Builder()
-            .setRunnerName("test")
-            .setStatus(Status.TIMEOUT)
-            .setExitCode(SpawnResult.POSIX_TIMEOUT_EXIT_CODE)
-            .setFailureDetail(FAILURE_DETAIL)
-            .build());
-  }
-
-  @Test
   public void exec_localOnlySpawn_noneCanExec_fails() throws Exception {
-    Spawn spawn = new SpawnBuilder().withMnemonic("TheThing").build();
+    Spawn spawn =
+        new SpawnBuilder().withMnemonic("ThisMnemonic1").withOwnerPrimaryOutput(output1).build();
+    Spawn postProcessingSpawn =
+        new SpawnBuilder().withMnemonic("ThatMnemonic2").withOwnerPrimaryOutput(output2).build();
+
     DynamicSpawnStrategy dynamicSpawnStrategy =
         createDynamicSpawnStrategy(
             ExecutionPolicy.LOCAL_EXECUTION_ONLY, mockGetPostProcessingSpawn);
+    when(mockGetPostProcessingSpawn.apply(spawn)).thenReturn(Optional.of(postProcessingSpawn));
     SandboxedSpawnStrategy local = createMockSpawnStrategy(false);
     SandboxedSpawnStrategy remote = createMockSpawnStrategy();
     ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
@@ -199,12 +236,73 @@ public class DynamicSpawnStrategyUnitTest {
         assertThrows(
             UserExecException.class,
             () -> dynamicSpawnStrategy.exec(spawn, actionExecutionContext));
-    assertThat(thrown).hasMessageThat().containsMatch("\\bdynamic_local_strategy\\b");
+    assertThat(thrown)
+        .hasMessageThat()
+        .isEqualTo(
+            "Spawn is not executable in local: No usable dynamic_local_strategy found (and remote"
+                + " execution disabled) for action ThisMnemonic1. Post-Processing Spawn is not"
+                + " executable in local: No usable dynamic_local_strategy found (and remote"
+                + " execution disabled) for action ThatMnemonic2. ");
     assertThat(thrown).hasMessageThat().doesNotContain("dynamic_remote_strategy");
-    assertThat(thrown).hasMessageThat().containsMatch("\\bTheThing\\b");
     verifyNoInteractions(remote);
-    // No post processing because local never completed.
-    verify(mockGetPostProcessingSpawn, never()).apply(any());
+  }
+
+  @Test
+  public void exec_localOnlySpawnWithNonExecutablePostProcessingSpawn_doesNotExecLocalSpawn()
+      throws Exception {
+    Spawn spawn =
+        new SpawnBuilder().withMnemonic("ThisMnemonic1").withOwnerPrimaryOutput(output1).build();
+    Spawn postProcessingSpawn =
+        new SpawnBuilder().withMnemonic("ThatMnemonic2").withOwnerPrimaryOutput(output2).build();
+
+    DynamicSpawnStrategy dynamicSpawnStrategy =
+        createDynamicSpawnStrategy(
+            ExecutionPolicy.LOCAL_EXECUTION_ONLY, mockGetPostProcessingSpawn);
+    when(mockGetPostProcessingSpawn.apply(spawn)).thenReturn(Optional.of(postProcessingSpawn));
+
+    SandboxedSpawnStrategy local = createMockSpawnStrategy();
+
+    ActionExecutionContext actionExecutionContext = mock(ActionExecutionContext.class);
+    when(actionExecutionContext.getFileOutErr()).thenReturn(new TestFileOutErr());
+    when(actionExecutionContext.getContext(DynamicStrategyRegistry.class))
+        .thenReturn(
+            new DynamicStrategyRegistry() {
+              @Override
+              public ImmutableList<SandboxedSpawnStrategy> getDynamicSpawnActionContexts(
+                  Spawn spawn, DynamicMode dynamicMode) {
+                if (spawn.getMnemonic().equals("ThisMnemonic1")) {
+                  return ImmutableList.of(local);
+                }
+                return ImmutableList.of();
+              }
+
+              @Override
+              public void notifyUsedDynamic(ActionContextRegistry actionContextRegistry) {}
+            });
+    when(actionExecutionContext.withFileOutErr(any())).thenReturn(actionExecutionContext);
+
+    UserExecException thrown =
+        assertThrows(
+            UserExecException.class,
+            () -> dynamicSpawnStrategy.exec(spawn, actionExecutionContext));
+
+    assertThat(thrown)
+        .hasMessageThat()
+        .isEqualTo(
+            "Post-Processing Spawn is not executable in local: No usable dynamic_local_strategy"
+                + " found (and remote execution disabled) for action ThatMnemonic2. ");
+    assertThat(thrown).hasMessageThat().doesNotContain("dynamic_remote_strategy");
+  }
+
+  @Test
+  public void exec_failedLocalSpawn_doesNotExecLocalPostProcessingSpawn() throws Exception {
+    testExecFailedLocalSpawnDoesNotExecLocalPostProcessingSpawn(
+        new SpawnResult.Builder()
+            .setRunnerName("test")
+            .setStatus(Status.TIMEOUT)
+            .setExitCode(SpawnResult.POSIX_TIMEOUT_EXIT_CODE)
+            .setFailureDetail(FAILURE_DETAIL)
+            .build());
   }
 
   @Test
@@ -221,37 +319,42 @@ public class DynamicSpawnStrategyUnitTest {
 
   private void testExecFailedLocalSpawnDoesNotExecLocalPostProcessingSpawn(SpawnResult failedResult)
       throws Exception {
+    Spawn spawn = new SpawnBuilder().withOwnerPrimaryOutput(output1).build();
+    Spawn postProcessingSpawn = createMockSpawn();
+
     DynamicSpawnStrategy dynamicSpawnStrategy =
         createDynamicSpawnStrategy(
             ExecutionPolicy.LOCAL_EXECUTION_ONLY, mockGetPostProcessingSpawn);
+    when(mockGetPostProcessingSpawn.apply(spawn)).thenReturn(Optional.of(postProcessingSpawn));
     SandboxedSpawnStrategy local = createMockSpawnStrategy();
     ArgumentCaptor<Spawn> localSpawnCaptor = ArgumentCaptor.forClass(Spawn.class);
     when(local.exec(localSpawnCaptor.capture(), any(), any()))
         .thenReturn(ImmutableList.of(failedResult));
     SandboxedSpawnStrategy remote = createMockSpawnStrategy();
     ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
-    Spawn spawn = new SpawnBuilder().build();
 
     ImmutableList<SpawnResult> results = dynamicSpawnStrategy.exec(spawn, actionExecutionContext);
 
     assertThat(results).containsExactly(failedResult);
     assertThat(localSpawnCaptor.getAllValues()).containsExactly(spawn);
     verify(remote, never()).exec(any(), any(), any());
+    verifyNoInteractions(postProcessingSpawn);
   }
 
   @Test
   public void exec_runAnywhereSpawn_runsLocalPostProcessingSpawn() throws Exception {
-    Spawn spawn = new SpawnBuilder().build();
-    Spawn postProcessingSpawn = new SpawnBuilder("extra_command").build();
+    Spawn spawn = new SpawnBuilder().withOwnerPrimaryOutput(output1).build();
+    Spawn postProcessingSpawn =
+        new SpawnBuilder("extra_command").withOwnerPrimaryOutput(output2).build();
     DynamicSpawnStrategy dynamicSpawnStrategy =
-        createDynamicSpawnStrategy(
-            ExecutionPolicy.ANYWHERE, ignored -> Optional.of(postProcessingSpawn));
+        createDynamicSpawnStrategy(ExecutionPolicy.ANYWHERE, mockGetPostProcessingSpawn);
+    when(mockGetPostProcessingSpawn.apply(spawn)).thenReturn(Optional.of(postProcessingSpawn));
     SandboxedSpawnStrategy local = createMockSpawnStrategy();
     // Make sure that local execution does not win the race before remote starts.
     Semaphore remoteStarted = new Semaphore(0);
     // Only the first spawn should be able to stop the concurrent remote execution (get the output
     // lock).
-    when(local.exec(eq(spawn), any(), /*stopConcurrentSpawns=*/ isNotNull()))
+    when(local.exec(eq(spawn), any(), /* stopConcurrentSpawns= */ isNotNull()))
         .thenAnswer(
             invocation -> {
               remoteStarted.acquire();
@@ -259,7 +362,7 @@ public class DynamicSpawnStrategyUnitTest {
               stopConcurrentSpawns.stop(0, "", null);
               return ImmutableList.of(SUCCESSFUL_SPAWN_RESULT);
             });
-    when(local.exec(eq(postProcessingSpawn), any(), /*stopConcurrentSpawns=*/ isNull()))
+    when(local.exec(eq(postProcessingSpawn), any(), /* stopConcurrentSpawns= */ isNull()))
         .thenReturn(ImmutableList.of(SUCCESSFUL_SPAWN_RESULT));
     SandboxedSpawnStrategy remote = createMockSpawnStrategy();
     when(remote.exec(eq(spawn), any(), any()))
@@ -270,6 +373,7 @@ public class DynamicSpawnStrategyUnitTest {
               throw new AssertionError("Timed out waiting for interruption");
             });
     ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
+    when(actionExecutionContext.getEventHandler()).thenReturn(reporter);
 
     ImmutableList<SpawnResult> results = dynamicSpawnStrategy.exec(spawn, actionExecutionContext);
 
@@ -277,8 +381,183 @@ public class DynamicSpawnStrategyUnitTest {
   }
 
   @Test
+  public void exec_runAnywhereSpawn_localWins() throws Exception {
+    Spawn spawn = new SpawnBuilder().withOwnerPrimaryOutput(output1).build();
+    DynamicSpawnStrategy dynamicSpawnStrategy =
+        createDynamicSpawnStrategy(ExecutionPolicy.ANYWHERE, mockGetPostProcessingSpawn);
+    when(mockGetPostProcessingSpawn.apply(any())).thenReturn(Optional.empty());
+    SandboxedSpawnStrategy local = createMockSpawnStrategy("local");
+    SandboxedSpawnStrategy remote = createMockSpawnStrategy("remote");
+    // Make sure that local execution does not win the race before remote starts.
+    Semaphore remoteStarted = new Semaphore(0);
+    Semaphore remoteDone = new Semaphore(0);
+    when(remote.exec(eq(spawn), any(), isNotNull()))
+        .thenAnswer(
+            invocation -> {
+              remoteStarted.release();
+              remoteDone.acquire();
+              StopConcurrentSpawns stopConcurrentSpawns = invocation.getArgument(2);
+              stopConcurrentSpawns.stop(0, "", null);
+              return ImmutableList.of(SUCCESSFUL_REMOTE_SPAWN_RESULT);
+            });
+    when(local.exec(eq(spawn), any(), isNotNull()))
+        .thenAnswer(
+            invocation -> {
+              remoteStarted.acquire();
+              StopConcurrentSpawns stopConcurrentSpawns = invocation.getArgument(2);
+              stopConcurrentSpawns.stop(0, "", null);
+              return ImmutableList.of(SUCCESSFUL_LOCAL_SPAWN_RESULT);
+            });
+    ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
+    when(actionExecutionContext.getEventHandler()).thenReturn(reporter);
+
+    ImmutableList<SpawnResult> results = dynamicSpawnStrategy.exec(spawn, actionExecutionContext);
+
+    assertThat(results).containsExactly(SUCCESSFUL_LOCAL_SPAWN_RESULT);
+    assertThat(events).hasSize(1);
+    assertThat(events.get(0).getWinnerBranchType()).isEqualTo(DynamicMode.LOCAL);
+    assertThat(events.get(0).getRemoteBranchName()).isEqualTo("remote");
+    assertThat(events.get(0).getLocalBranchName()).isEqualTo("local");
+  }
+
+  @Test
+  public void exec_runAnywhereSpawn_remoteWins() throws Exception {
+    Spawn spawn = new SpawnBuilder().withOwnerPrimaryOutput(output1).build();
+    DynamicSpawnStrategy dynamicSpawnStrategy =
+        createDynamicSpawnStrategy(ExecutionPolicy.ANYWHERE, mockGetPostProcessingSpawn);
+    when(mockGetPostProcessingSpawn.apply(any())).thenReturn(Optional.empty());
+    SandboxedSpawnStrategy local = createMockSpawnStrategy("local");
+    SandboxedSpawnStrategy remote = createMockSpawnStrategy("remote");
+    // Make sure that local execution does not win the race before remote starts.
+    Semaphore remoteStarted = new Semaphore(0);
+    Semaphore localDone = new Semaphore(0);
+    when(remote.exec(eq(spawn), any(), isNotNull()))
+        .thenAnswer(
+            invocation -> {
+              remoteStarted.release();
+              StopConcurrentSpawns stopConcurrentSpawns = invocation.getArgument(2);
+              stopConcurrentSpawns.stop(0, "", null);
+              return ImmutableList.of(SUCCESSFUL_REMOTE_SPAWN_RESULT);
+            });
+    when(local.exec(eq(spawn), any(), isNotNull()))
+        .thenAnswer(
+            invocation -> {
+              remoteStarted.acquire();
+              localDone.acquire();
+              StopConcurrentSpawns stopConcurrentSpawns = invocation.getArgument(2);
+              stopConcurrentSpawns.stop(0, "", null);
+              return ImmutableList.of(SUCCESSFUL_LOCAL_SPAWN_RESULT);
+            });
+    ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
+    when(actionExecutionContext.getEventHandler()).thenReturn(reporter);
+
+    ImmutableList<SpawnResult> results = dynamicSpawnStrategy.exec(spawn, actionExecutionContext);
+
+    assertThat(results).containsExactly(SUCCESSFUL_REMOTE_SPAWN_RESULT);
+    assertThat(events).hasSize(1);
+    assertThat(events.get(0).getWinnerBranchType()).isEqualTo(DynamicMode.REMOTE);
+    assertThat(events.get(0).getRemoteBranchName()).isEqualTo("remote");
+    assertThat(events.get(0).getLocalBranchName()).isEqualTo("local");
+  }
+
+  @Test
+  public void exec_runAnywhereSpawn_localWins_doesNotCancelRemoteWhenFlagDisabled()
+      throws Exception {
+    Spawn spawn = new SpawnBuilder().withOwnerPrimaryOutput(output1).build();
+    DynamicExecutionOptions options = Options.getDefaults(DynamicExecutionOptions.class);
+    options.setCancelRemoteBranchOnLocalWin(false);
+    DynamicSpawnStrategy dynamicSpawnStrategy =
+        createDynamicSpawnStrategy(ExecutionPolicy.ANYWHERE, mockGetPostProcessingSpawn, options);
+    when(mockGetPostProcessingSpawn.apply(any())).thenReturn(Optional.empty());
+    SandboxedSpawnStrategy local = createMockSpawnStrategy("local");
+    SandboxedSpawnStrategy remote = createMockSpawnStrategy("remote");
+    Semaphore remoteStarted = new Semaphore(0);
+    Semaphore remoteCanFinish = new Semaphore(0);
+    AtomicBoolean remoteWasCancelled = new AtomicBoolean(false);
+    when(remote.exec(eq(spawn), any(), isNotNull()))
+        .thenAnswer(
+            invocation -> {
+              remoteStarted.release();
+              try {
+                remoteCanFinish.acquire();
+              } catch (InterruptedException e) {
+                remoteWasCancelled.set(true);
+                throw e;
+              }
+              StopConcurrentSpawns stopConcurrentSpawns = invocation.getArgument(2);
+              stopConcurrentSpawns.stop(0, "", null);
+              return ImmutableList.of(SUCCESSFUL_REMOTE_SPAWN_RESULT);
+            });
+    when(local.exec(eq(spawn), any(), isNotNull()))
+        .thenAnswer(
+            invocation -> {
+              remoteStarted.acquire();
+              StopConcurrentSpawns stopConcurrentSpawns = invocation.getArgument(2);
+              stopConcurrentSpawns.stop(0, "", null);
+              return ImmutableList.of(SUCCESSFUL_LOCAL_SPAWN_RESULT);
+            });
+    ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
+    when(actionExecutionContext.getEventHandler()).thenReturn(reporter);
+
+    ImmutableList<SpawnResult> results = dynamicSpawnStrategy.exec(spawn, actionExecutionContext);
+
+    assertThat(results).containsExactly(SUCCESSFUL_LOCAL_SPAWN_RESULT);
+    assertThat(remoteWasCancelled.get()).isFalse();
+
+    // Release remote branch so background execution finishes cleanly.
+    remoteCanFinish.release();
+
+    assertThat(events).hasSize(1);
+    assertThat(events.get(0).getWinnerBranchType()).isEqualTo(DynamicMode.LOCAL);
+    assertThat(events.get(0).getRemoteBranchName()).isEqualTo("remote");
+    assertThat(events.get(0).getLocalBranchName()).isEqualTo("local");
+  }
+
+  @Test
+  public void exec_runAnywhereSpawn_remoteWins_stillCancelsLocalWhenFlagDisabled()
+      throws Exception {
+    Spawn spawn = new SpawnBuilder().withOwnerPrimaryOutput(output1).build();
+    DynamicExecutionOptions options = Options.getDefaults(DynamicExecutionOptions.class);
+    options.setCancelRemoteBranchOnLocalWin(false);
+    DynamicSpawnStrategy dynamicSpawnStrategy =
+        createDynamicSpawnStrategy(ExecutionPolicy.ANYWHERE, mockGetPostProcessingSpawn, options);
+    when(mockGetPostProcessingSpawn.apply(any())).thenReturn(Optional.empty());
+    SandboxedSpawnStrategy local = createMockSpawnStrategy("local");
+    SandboxedSpawnStrategy remote = createMockSpawnStrategy("remote");
+    Semaphore remoteStarted = new Semaphore(0);
+    Semaphore localDone = new Semaphore(0);
+    when(remote.exec(eq(spawn), any(), isNotNull()))
+        .thenAnswer(
+            invocation -> {
+              remoteStarted.release();
+              StopConcurrentSpawns stopConcurrentSpawns = invocation.getArgument(2);
+              stopConcurrentSpawns.stop(0, "", null);
+              return ImmutableList.of(SUCCESSFUL_REMOTE_SPAWN_RESULT);
+            });
+    when(local.exec(eq(spawn), any(), isNotNull()))
+        .thenAnswer(
+            invocation -> {
+              remoteStarted.acquire();
+              localDone.acquire();
+              StopConcurrentSpawns stopConcurrentSpawns = invocation.getArgument(2);
+              stopConcurrentSpawns.stop(0, "", null);
+              return ImmutableList.of(SUCCESSFUL_LOCAL_SPAWN_RESULT);
+            });
+    ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
+    when(actionExecutionContext.getEventHandler()).thenReturn(reporter);
+
+    ImmutableList<SpawnResult> results = dynamicSpawnStrategy.exec(spawn, actionExecutionContext);
+
+    assertThat(results).containsExactly(SUCCESSFUL_REMOTE_SPAWN_RESULT);
+    assertThat(events).hasSize(1);
+    assertThat(events.get(0).getWinnerBranchType()).isEqualTo(DynamicMode.REMOTE);
+    assertThat(events.get(0).getRemoteBranchName()).isEqualTo("remote");
+    assertThat(events.get(0).getLocalBranchName()).isEqualTo("local");
+  }
+
+  @Test
   public void exec_runAnywhereSpawn_allowsIgnoringFailure() throws Exception {
-    Spawn spawn = new SpawnBuilder().build();
+    Spawn spawn = new SpawnBuilder().withOwnerPrimaryOutput(output1).build();
     checkState(
         executorServiceForCleanup == null,
         "Creating the DynamicSpawnStrategy twice in the same test is not supported.");
@@ -286,19 +565,19 @@ public class DynamicSpawnStrategyUnitTest {
     DynamicSpawnStrategy dynamicSpawnStrategy =
         new DynamicSpawnStrategy(
             executorServiceForCleanup,
-            new DynamicExecutionOptions(),
+            Options.getDefaults(DynamicExecutionOptions.class),
             ignored -> ExecutionPolicy.ANYWHERE,
             ignored -> Optional.empty(),
-            false,
             10,
             10,
-            (s, exitCode, errorMsg, outErr, isLocal) -> isLocal && errorMsg.contains("Ignorable"));
+            (s, context, exitCode, errorMsg, outErr, isLocal) ->
+                isLocal && errorMsg.contains("Ignorable"));
     SandboxedSpawnStrategy local = createMockSpawnStrategy();
     // Make sure that local execution does not win the race before remote starts.
     Semaphore remoteStarted = new Semaphore(0);
     // Only the first spawn should be able to stop the concurrent remote execution (get the output
     // lock).
-    when(local.exec(eq(spawn), any(), /*stopConcurrentSpawns=*/ isNotNull()))
+    when(local.exec(eq(spawn), any(), /* stopConcurrentSpawns= */ isNotNull()))
         .thenAnswer(
             invocation -> {
               remoteStarted.acquire();
@@ -316,6 +595,7 @@ public class DynamicSpawnStrategyUnitTest {
               return ImmutableList.of(SUCCESSFUL_SPAWN_RESULT);
             });
     ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
+    when(actionExecutionContext.getEventHandler()).thenReturn(reporter);
 
     ImmutableList<SpawnResult> results = dynamicSpawnStrategy.exec(spawn, actionExecutionContext);
 
@@ -324,7 +604,7 @@ public class DynamicSpawnStrategyUnitTest {
 
   @Test
   public void exec_runAnywhereSpawn_notAlwaysIgnoringFailure() throws Exception {
-    Spawn spawn = new SpawnBuilder().build();
+    Spawn spawn = new SpawnBuilder().withOwnerPrimaryOutput(output1).build();
     checkState(
         executorServiceForCleanup == null,
         "Creating the DynamicSpawnStrategy twice in the same test is not supported.");
@@ -332,20 +612,20 @@ public class DynamicSpawnStrategyUnitTest {
     DynamicSpawnStrategy dynamicSpawnStrategy =
         new DynamicSpawnStrategy(
             executorServiceForCleanup,
-            new DynamicExecutionOptions(),
+            Options.getDefaults(DynamicExecutionOptions.class),
             ignored -> ExecutionPolicy.ANYWHERE,
             ignored -> Optional.empty(),
-            false,
             10,
             10,
-            (s, exitCode, errorMsg, outErr, isLocal) -> isLocal && errorMsg.contains("Ignorable"));
+            (s, context, exitCode, errorMsg, outErr, isLocal) ->
+                isLocal && errorMsg.contains("Ignorable"));
     SandboxedSpawnStrategy local = createMockSpawnStrategy();
     // Make sure that local execution does not win the race before remote starts.
     Semaphore remoteStarted = new Semaphore(0);
     Semaphore localDone = new Semaphore(0);
     // Only the first spawn should be able to stop the concurrent remote execution (get the output
     // lock).
-    when(local.exec(eq(spawn), any(), /*stopConcurrentSpawns=*/ isNotNull()))
+    when(local.exec(eq(spawn), any(), /* stopConcurrentSpawns= */ isNotNull()))
         .thenAnswer(
             invocation -> {
               remoteStarted.acquire();
@@ -362,6 +642,7 @@ public class DynamicSpawnStrategyUnitTest {
               return ImmutableList.of(SUCCESSFUL_SPAWN_RESULT);
             });
     ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
+    when(actionExecutionContext.getEventHandler()).thenReturn(reporter);
 
     ImmutableList<SpawnResult> results = dynamicSpawnStrategy.exec(spawn, actionExecutionContext);
     localDone.release();
@@ -369,32 +650,19 @@ public class DynamicSpawnStrategyUnitTest {
   }
 
   @Test
-  public void exec_localOnlySpawn_skipFirst_isRun() throws Exception {
-    Spawn spawn = new SpawnBuilder().withMnemonic("TheThing").build();
-    DynamicExecutionOptions options = new DynamicExecutionOptions();
-    options.skipFirstBuild = true;
+  public void exec_runAnywhereSpawn_excludeTools_onlyRemote() throws Exception {
+    Spawn spawn =
+        new SpawnBuilder()
+            .withMnemonic("TheThing")
+            .withOwnerPrimaryOutput(output1)
+            .withProgressMessage("Building the thing")
+            .setBuiltForToolConfiguration(true)
+            .build();
+    DynamicExecutionOptions options = Options.getDefaults(DynamicExecutionOptions.class);
+    options.setExcludeTools(true);
+    options.setLocalExecutionDelay(0);
     DynamicSpawnStrategy dynamicSpawnStrategy =
-        createDynamicSpawnStrategy(
-            ExecutionPolicy.LOCAL_EXECUTION_ONLY, (s) -> Optional.empty(), options, true);
-
-    SandboxedSpawnStrategy local = createMockSpawnStrategy();
-    when(local.exec(eq(spawn), any(), any())).thenReturn(ImmutableList.of(SUCCESSFUL_SPAWN_RESULT));
-    SandboxedSpawnStrategy remote = createMockSpawnStrategy();
-    ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
-
-    assertThat(dynamicSpawnStrategy.exec(spawn, actionExecutionContext))
-        .containsExactly(SUCCESSFUL_SPAWN_RESULT);
-    verifyNoInteractions(remote);
-  }
-
-  @Test
-  public void exec_runAnywhereSpawn_skipFirst_onlyRemote() throws Exception {
-    Spawn spawn = new SpawnBuilder().withMnemonic("TheThing").build();
-    DynamicExecutionOptions options = new DynamicExecutionOptions();
-    options.skipFirstBuild = true;
-    DynamicSpawnStrategy dynamicSpawnStrategy =
-        createDynamicSpawnStrategy(
-            ExecutionPolicy.ANYWHERE, (s) -> Optional.empty(), options, true);
+        createDynamicSpawnStrategy(ExecutionPolicy.ANYWHERE, (s) -> Optional.empty(), options);
 
     SandboxedSpawnStrategy local = createMockSpawnStrategy();
     SandboxedSpawnStrategy remote = createMockSpawnStrategy();
@@ -403,14 +671,114 @@ public class DynamicSpawnStrategyUnitTest {
     ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
     when(actionExecutionContext.getEventHandler()).thenReturn(reporter);
 
-    assertThat(dynamicSpawnStrategy.exec(spawn, actionExecutionContext))
-        .containsExactly(SUCCESSFUL_SPAWN_RESULT);
+    ImmutableList<SpawnResult> spawnResults =
+        dynamicSpawnStrategy.maybeExecuteNonDynamically(spawn, actionExecutionContext);
+
+    assertWithMessage("Should have been executed remote-only").that(spawnResults).isNotNull();
+    assertThat(spawnResults).containsExactly(SUCCESSFUL_SPAWN_RESULT);
     verify(local, never()).exec(any(), any(), any());
-    verify(reporter)
-        .handle(
-            Event.info(
-                "Disabling dynamic execution until we have seen a successful build, see"
-                    + " --experimental_dynamic_skip_first_build."));
+  }
+
+  @Test
+  public void exec_runAnywhereSpawn_localLosesInput_returnsRemoteResult() throws Exception {
+    Spawn spawn = new SpawnBuilder().withOwnerPrimaryOutput(output1).build();
+    DynamicSpawnStrategy dynamicSpawnStrategy =
+        createDynamicSpawnStrategy(ExecutionPolicy.ANYWHERE, mockGetPostProcessingSpawn);
+    when(mockGetPostProcessingSpawn.apply(any())).thenReturn(Optional.empty());
+    SandboxedSpawnStrategy local = createMockSpawnStrategy("local");
+    SandboxedSpawnStrategy remote = createMockSpawnStrategy("remote");
+    Semaphore localFailed = new Semaphore(0);
+    when(local.exec(eq(spawn), any(), isNotNull()))
+        .thenAnswer(
+            invocation -> {
+              localFailed.release();
+              throw lostInput();
+            });
+    when(remote.exec(eq(spawn), any(), isNotNull()))
+        .thenAnswer(
+            invocation -> {
+              // The remote branch produces its result after the local branch has failed.
+              localFailed.acquire();
+              StopConcurrentSpawns stopConcurrentSpawns = invocation.getArgument(2);
+              stopConcurrentSpawns.stop(0, "", null);
+              return ImmutableList.of(SUCCESSFUL_REMOTE_SPAWN_RESULT);
+            });
+    ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
+    when(actionExecutionContext.getEventHandler()).thenReturn(reporter);
+
+    ImmutableList<SpawnResult> results = dynamicSpawnStrategy.exec(spawn, actionExecutionContext);
+
+    assertThat(results).containsExactly(SUCCESSFUL_REMOTE_SPAWN_RESULT);
+  }
+
+  @Test
+  public void exec_runAnywhereSpawn_localLosesInputAndRemoteFails_reportsLostInput()
+      throws Exception {
+    Spawn spawn = new SpawnBuilder().withOwnerPrimaryOutput(output1).build();
+    DynamicSpawnStrategy dynamicSpawnStrategy =
+        createDynamicSpawnStrategy(ExecutionPolicy.ANYWHERE, mockGetPostProcessingSpawn);
+    when(mockGetPostProcessingSpawn.apply(any())).thenReturn(Optional.empty());
+    SandboxedSpawnStrategy local = createMockSpawnStrategy("local");
+    SandboxedSpawnStrategy remote = createMockSpawnStrategy("remote");
+    Semaphore localFailed = new Semaphore(0);
+    when(local.exec(eq(spawn), any(), isNotNull()))
+        .thenAnswer(
+            invocation -> {
+              localFailed.release();
+              throw lostInput();
+            });
+    when(remote.exec(eq(spawn), any(), isNotNull()))
+        .thenAnswer(
+            invocation -> {
+              localFailed.acquire();
+              throw new UserExecException(
+                  FailureDetail.newBuilder()
+                      .setMessage("remote failed")
+                      .setExecution(
+                          Execution.newBuilder().setCode(Execution.Code.UNEXPECTED_EXCEPTION))
+                      .build());
+            });
+    ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
+    when(actionExecutionContext.getEventHandler()).thenReturn(reporter);
+
+    assertThrows(
+        LostInputsExecException.class,
+        () -> dynamicSpawnStrategy.exec(spawn, actionExecutionContext));
+  }
+
+  @Test
+  public void exec_runAnywhereSpawn_remoteLosesInput_cancelsLocal() throws Exception {
+    Spawn spawn = new SpawnBuilder().withOwnerPrimaryOutput(output1).build();
+    DynamicSpawnStrategy dynamicSpawnStrategy =
+        createDynamicSpawnStrategy(ExecutionPolicy.ANYWHERE, mockGetPostProcessingSpawn);
+    when(mockGetPostProcessingSpawn.apply(any())).thenReturn(Optional.empty());
+    SandboxedSpawnStrategy local = createMockSpawnStrategy("local");
+    SandboxedSpawnStrategy remote = createMockSpawnStrategy("remote");
+    Semaphore localStarted = new Semaphore(0);
+    when(local.exec(eq(spawn), any(), isNotNull()))
+        .thenAnswer(
+            invocation -> {
+              localStarted.release();
+              Thread.sleep(TestUtils.WAIT_TIMEOUT_MILLISECONDS);
+              throw new AssertionError("Timed out waiting for interruption");
+            });
+    when(remote.exec(eq(spawn), any(), isNotNull()))
+        .thenAnswer(
+            invocation -> {
+              localStarted.acquire();
+              throw lostInput();
+            });
+    ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
+    when(actionExecutionContext.getEventHandler()).thenReturn(reporter);
+
+    assertThrows(
+        LostInputsExecException.class,
+        () -> dynamicSpawnStrategy.exec(spawn, actionExecutionContext));
+  }
+
+  private static LostInputsExecException lostInput() {
+    return new LostInputsExecException(
+        ImmutableSetMultimap.of("digest", ActionInputHelper.fromPath("lost")));
   }
 
   @Test
@@ -423,7 +791,7 @@ public class DynamicSpawnStrategyUnitTest {
     SandboxedSpawnStrategy remote = createMockSpawnStrategy();
     ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
     AtomicReference<DynamicMode> strategyThatCancelled = new AtomicReference<>();
-    DynamicExecutionOptions options = new DynamicExecutionOptions();
+    DynamicExecutionOptions options = Options.getDefaults(DynamicExecutionOptions.class);
     LocalBranch localBranch =
         new LocalBranch(
             actionExecutionContext, spawn, strategyThatCancelled, options, null, null, null);
@@ -441,16 +809,19 @@ public class DynamicSpawnStrategyUnitTest {
                     localBranch,
                     remoteBranch,
                     spawn,
-                    new DynamicExecutionOptions(),
+                    Options.getDefaults(DynamicExecutionOptions.class),
                     actionExecutionContext));
     assertThat(error).hasMessageThat().contains("Neither branch of /foo completed.");
   }
 
   @Test
   public void exec_runAnywhereSpawn_localCantExec_runsRemote() throws Exception {
-    Spawn spawn = new SpawnBuilder().build();
+    Spawn spawn = new SpawnBuilder().withOwnerPrimaryOutput(output1).build();
+    Spawn postProcessingSpawn = createMockSpawn();
+
     DynamicSpawnStrategy dynamicSpawnStrategy =
         createDynamicSpawnStrategy(ExecutionPolicy.ANYWHERE, mockGetPostProcessingSpawn);
+    when(mockGetPostProcessingSpawn.apply(spawn)).thenReturn(Optional.of(postProcessingSpawn));
     SandboxedSpawnStrategy local = createMockSpawnStrategy(false);
     SandboxedSpawnStrategy remote = createMockSpawnStrategy();
     when(remote.exec(eq(spawn), any(), any()))
@@ -469,16 +840,17 @@ public class DynamicSpawnStrategyUnitTest {
     assertThat(results).containsExactly(SUCCESSFUL_SPAWN_RESULT);
     // Never runs anything as it says it can't execute anything at all.
     verify(local, never()).exec(any(), any(), any());
-    verify(mockGetPostProcessingSpawn, never()).apply(any());
+    verifyNoInteractions(postProcessingSpawn);
   }
 
   @Test
   public void exec_runAnywhereSpawn_remoteCantExec_runsLocal() throws Exception {
-    Spawn spawn = new SpawnBuilder().build();
-    Spawn postProcessingSpawn = new SpawnBuilder("extra_command").build();
+    Spawn spawn = new SpawnBuilder().withOwnerPrimaryOutput(output1).build();
+    Spawn postProcessingSpawn =
+        new SpawnBuilder("extra_command").withOwnerPrimaryOutput(output2).build();
     DynamicSpawnStrategy dynamicSpawnStrategy =
-        createDynamicSpawnStrategy(
-            ExecutionPolicy.ANYWHERE, ignored -> Optional.of(postProcessingSpawn));
+        createDynamicSpawnStrategy(ExecutionPolicy.ANYWHERE, mockGetPostProcessingSpawn);
+    when(mockGetPostProcessingSpawn.apply(spawn)).thenReturn(Optional.of(postProcessingSpawn));
     SandboxedSpawnStrategy local = createMockSpawnStrategy();
     ArgumentCaptor<Spawn> localSpawnCaptor = ArgumentCaptor.forClass(Spawn.class);
     when(local.exec(localSpawnCaptor.capture(), any(), any()))
@@ -504,9 +876,14 @@ public class DynamicSpawnStrategyUnitTest {
 
   @Test
   public void exec_runAnywhereSpawn_noneCanExec_fails() throws Exception {
-    Spawn spawn = new SpawnBuilder().withMnemonic("TheThing").build();
+    Spawn spawn =
+        new SpawnBuilder().withMnemonic("ThisMnemonic1").withOwnerPrimaryOutput(output1).build();
+    Spawn postProcessingSpawn =
+        new SpawnBuilder().withMnemonic("ThatMnemonic2").withOwnerPrimaryOutput(output2).build();
+
     DynamicSpawnStrategy dynamicSpawnStrategy =
         createDynamicSpawnStrategy(ExecutionPolicy.ANYWHERE, mockGetPostProcessingSpawn);
+    when(mockGetPostProcessingSpawn.apply(spawn)).thenReturn(Optional.of(postProcessingSpawn));
     SandboxedSpawnStrategy local = createMockSpawnStrategy(false);
     SandboxedSpawnStrategy remote = createMockSpawnStrategy(false);
     ActionExecutionContext actionExecutionContext = createMockActionExecutionContext(local, remote);
@@ -515,11 +892,13 @@ public class DynamicSpawnStrategyUnitTest {
         assertThrows(
             UserExecException.class,
             () -> dynamicSpawnStrategy.exec(spawn, actionExecutionContext));
-    assertThat(thrown).hasMessageThat().containsMatch("\\bdynamic_local_strategy\\b");
-    assertThat(thrown).hasMessageThat().containsMatch("\\bdynamic_remote_strategy\\b");
-    assertThat(thrown).hasMessageThat().containsMatch("\\bTheThing\\b");
-    // No post processing because local never completed.
-    verify(mockGetPostProcessingSpawn, never()).apply(any());
+    assertThat(thrown)
+        .hasMessageThat()
+        .isEqualTo(
+            "Spawn is not executable in local: No usable dynamic_local_strategy or"
+                + " dynamic_remote_strategy found for action ThisMnemonic1. Post-Processing Spawn"
+                + " is not executable in local: No usable dynamic_local_strategy or"
+                + " dynamic_remote_strategy found for action ThatMnemonic2. ");
   }
 
   private DynamicSpawnStrategy createDynamicSpawnStrategy(
@@ -528,15 +907,13 @@ public class DynamicSpawnStrategyUnitTest {
     return createDynamicSpawnStrategy(
         executionPolicy,
         getPostProcessingSpawnForLocalExecution,
-        new DynamicExecutionOptions(),
-        false);
+        Options.getDefaults(DynamicExecutionOptions.class));
   }
 
   private DynamicSpawnStrategy createDynamicSpawnStrategy(
       ExecutionPolicy executionPolicy,
       Function<Spawn, Optional<Spawn>> getPostProcessingSpawnForLocalExecution,
-      DynamicExecutionOptions options,
-      boolean isFirst) {
+      DynamicExecutionOptions options) {
     checkState(
         executorServiceForCleanup == null,
         "Creating the DynamicSpawnStrategy twice in the same test is not supported.");
@@ -546,7 +923,6 @@ public class DynamicSpawnStrategyUnitTest {
         options,
         ignored -> executionPolicy,
         getPostProcessingSpawnForLocalExecution,
-        isFirst,
         10,
         10,
         null);
@@ -578,16 +954,29 @@ public class DynamicSpawnStrategyUnitTest {
     return actionExecutionContext;
   }
 
+  private static Spawn createMockSpawn() {
+    return mock(Spawn.class);
+  }
+
   private static SandboxedSpawnStrategy createMockSpawnStrategy()
       throws InterruptedException, ExecException {
     return createMockSpawnStrategy(true);
   }
 
   private static SandboxedSpawnStrategy createMockSpawnStrategy(boolean canExec)
-      throws InterruptedException {
+      throws InterruptedException, ExecException {
     SandboxedSpawnStrategy strategy = mock(SandboxedSpawnStrategy.class);
     when(strategy.canExec(any(), any())).thenReturn(canExec);
-    when(strategy.beginExecution(any(), any())).thenThrow(UnsupportedOperationException.class);
+    when(strategy.exec(any(), any())).thenThrow(UnsupportedOperationException.class);
+    return strategy;
+  }
+
+  private static SandboxedSpawnStrategy createMockSpawnStrategy(String name)
+      throws InterruptedException, ExecException {
+    SandboxedSpawnStrategy strategy = mock(SandboxedSpawnStrategy.class);
+    when(strategy.canExec(any(), any())).thenReturn(true);
+    when(strategy.toString()).thenReturn(name);
+    when(strategy.exec(any(), any())).thenThrow(UnsupportedOperationException.class);
     return strategy;
   }
 }

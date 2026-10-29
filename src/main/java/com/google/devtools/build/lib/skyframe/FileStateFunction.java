@@ -17,13 +17,16 @@ import com.google.devtools.build.lib.actions.FileStateValue;
 import com.google.devtools.build.lib.io.InconsistentFilesystemException;
 import com.google.devtools.build.lib.skyframe.ExternalFilesHelper.FileType;
 import com.google.devtools.build.lib.util.io.TimestampGranularityMonitor;
+import com.google.devtools.build.lib.vfs.DetailedIOException;
 import com.google.devtools.build.lib.vfs.RootedPath;
 import com.google.devtools.build.lib.vfs.SyscallCache;
 import com.google.devtools.build.skyframe.SkyFunction;
 import com.google.devtools.build.skyframe.SkyFunctionException;
+import com.google.devtools.build.skyframe.SkyFunctionException.Transience;
 import com.google.devtools.build.skyframe.SkyKey;
 import java.io.IOException;
 import java.util.function.Supplier;
+import javax.annotation.Nullable;
 
 /**
  * A {@link SkyFunction} for {@link FileStateValue}s.
@@ -34,12 +37,12 @@ import java.util.function.Supplier;
 public class FileStateFunction implements SkyFunction {
 
   private final Supplier<TimestampGranularityMonitor> tsgm;
-  private final Supplier<SyscallCache> syscallCache;
+  private final SyscallCache syscallCache;
   private final ExternalFilesHelper externalFilesHelper;
 
   public FileStateFunction(
       Supplier<TimestampGranularityMonitor> tsgm,
-      Supplier<SyscallCache> syscallCache,
+      SyscallCache syscallCache,
       ExternalFilesHelper externalFilesHelper) {
     this.tsgm = tsgm;
     this.syscallCache = syscallCache;
@@ -51,6 +54,7 @@ public class FileStateFunction implements SkyFunction {
   // deciding which overload of FileStateFunctionException() to call.
   @SuppressWarnings("UseMultiCatch")
   @Override
+  @Nullable
   public FileStateValue compute(SkyKey skyKey, Environment env)
       throws FileStateFunctionException, InterruptedException {
     RootedPath rootedPath = (RootedPath) skyKey.argument();
@@ -60,18 +64,19 @@ public class FileStateFunction implements SkyFunction {
       if (env.valuesMissing()) {
         return null;
       }
-      if (fileType == FileType.EXTERNAL_REPO
-          || fileType == FileType.EXTERNAL_IN_MANAGED_DIRECTORY) {
+      if (fileType == FileType.EXTERNAL_REPO) {
         // do not use syscallCache as files under repositories get generated during the build
-        return FileStateValue.create(rootedPath, tsgm.get());
+        return FileStateValue.create(rootedPath, SyscallCache.NO_CACHE, tsgm.get());
       }
-      return FileStateValue.create(rootedPath, syscallCache.get(), tsgm.get());
+      return FileStateValue.create(rootedPath, syscallCache, tsgm.get());
     } catch (ExternalFilesHelper.NonexistentImmutableExternalFileException e) {
       return FileStateValue.NONEXISTENT_FILE_STATE_NODE;
     } catch (InconsistentFilesystemException e) {
-      throw new FileStateFunctionException(e);
+      throw new FileStateFunctionException(e, Transience.TRANSIENT);
+    } catch (DetailedIOException e) {
+      throw new FileStateFunctionException(e, e.getTransience());
     } catch (IOException e) {
-      throw new FileStateFunctionException(e);
+      throw new FileStateFunctionException(e, Transience.TRANSIENT);
     }
   }
 
@@ -82,13 +87,13 @@ public class FileStateFunction implements SkyFunction {
   public static final class FileStateFunctionException extends SkyFunctionException {
     private final boolean isCatastrophic;
 
-    private FileStateFunctionException(InconsistentFilesystemException e) {
-      super(e, Transience.TRANSIENT);
+    private FileStateFunctionException(InconsistentFilesystemException e, Transience transience) {
+      super(e, transience);
       this.isCatastrophic = true;
     }
 
-    private FileStateFunctionException(IOException e) {
-      super(e, Transience.TRANSIENT);
+    private FileStateFunctionException(IOException e, Transience transience) {
+      super(e, transience);
       this.isCatastrophic = false;
     }
 

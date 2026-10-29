@@ -14,7 +14,10 @@
 
 #include "src/tools/launcher/java_launcher.h"
 
+#include <cstddef>
+#include <fstream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -32,6 +35,7 @@ namespace bazel {
 namespace launcher {
 
 using std::getline;
+using std::ofstream;
 using std::string;
 using std::vector;
 using std::wofstream;
@@ -45,6 +49,7 @@ static constexpr const char* JAR_BIN_PATH = "jar_bin_path";
 static constexpr const char* CLASSPATH = "classpath";
 static constexpr const char* JAVA_START_CLASS = "java_start_class";
 static constexpr const char* JVM_FLAGS = "jvm_flags";
+static constexpr const char* JAVA_VERSION = "java_version";
 
 // Check if a string start with a certain prefix.
 // If it's true, store the substring without the prefix in value.
@@ -162,10 +167,9 @@ static void WriteJarClasspath(const wstring& jar_path,
 }
 
 wstring JavaBinaryLauncher::GetJunctionBaseDir() {
-  wstring binary_base_path =
-      GetBinaryPathWithExtension(this->GetCommandlineArguments()[0]);
+  wstring binary_base_path = GetBinaryPathWithExtension(GetLauncherPath());
   wstring result;
-  if (!NormalizePath(binary_base_path + L".j", &result)) {
+  if (!NormalizePath(binary_base_path + L".j-" + rand_id_, &result)) {
     die(L"Failed to get normalized junction base directory.");
   }
   return result;
@@ -191,8 +195,7 @@ void JavaBinaryLauncher::DeleteJunctionBaseDir() {
 }
 
 wstring JavaBinaryLauncher::CreateClasspathJar(const wstring& classpath) {
-  wstring binary_base_path =
-      GetBinaryPathWithoutExtension(this->GetCommandlineArguments()[0]);
+  wstring binary_base_path = GetBinaryPathWithoutExtension(GetLauncherPath());
   wstring abs_manifest_jar_dir_norm = GetManifestJarDir(binary_base_path);
 
   wostringstream manifest_classpath;
@@ -246,12 +249,12 @@ wstring JavaBinaryLauncher::CreateClasspathJar(const wstring& classpath) {
     WriteJarClasspath(path, &manifest_classpath);
   }
 
-  wstring rand_id = L"-" + GetRandomStr(10);
+  const wstring rand_id = L"-" + rand_id_;
   // Enable long path support for jar_manifest_file_path.
   wstring jar_manifest_file_path =
       binary_base_path + rand_id + L".jar_manifest";
   blaze_util::AddUncPrefixMaybe(&jar_manifest_file_path);
-  wofstream jar_manifest_file(jar_manifest_file_path);
+  wofstream jar_manifest_file{jar_manifest_file_path.c_str()};
   jar_manifest_file << L"Manifest-Version: 1.0\n";
   // No line in the MANIFEST.MF file may be longer than 72 bytes.
   // A space prefix indicates the line is still the content of the last
@@ -287,6 +290,48 @@ wstring JavaBinaryLauncher::CreateClasspathJar(const wstring& classpath) {
   return manifest_jar_path;
 }
 
+wstring JavaBinaryLauncher::CreateClasspathFlagfile(const wstring& classpath) {
+  wstring binary_base_path = GetBinaryPathWithoutExtension(GetLauncherPath());
+
+  // Wrap in quotes so that space isn't interpreted as an argument delimiter.
+  // Replace backslashes with forward slashes to avoid accidental interpretation
+  // as escape sequences.
+  wstring contents;
+  contents.reserve(classpath.length() + 3);
+  contents += L"\"";
+  for (const wchar_t& c : classpath) {
+    contents += (c == L'\\' ? L'/' : c);
+  }
+  contents += L"\"\n";
+
+  // Flagfiles must be UTF-8.
+  std::string contents_utf8;
+  if (!blaze_util::WcsToUtf8(contents, &contents_utf8)) {
+    die(L"Couldn't convert classpath to UTF-8: %s", contents.c_str());
+  }
+
+  // Enable long path support for flagfile_path.
+  wstring flagfile_path =
+      binary_base_path + L"-" + rand_id_ + L"-classpath.txt";
+  blaze_util::AddUncPrefixMaybe(&flagfile_path);
+  ofstream flagfile{flagfile_path.c_str()};
+  flagfile << contents_utf8;
+  flagfile.close();
+  if (flagfile.fail()) {
+    die(L"Couldn't write classpath flagfile: %s", flagfile_path.c_str());
+  }
+
+  return flagfile_path;
+}
+
+std::optional<int> JavaBinaryLauncher::GetJavaVersion() {
+  wstring version_str = GetLaunchInfoByKeyOrEmpty(JAVA_VERSION);
+  if (version_str.empty()) {
+    return std::nullopt;
+  }
+  return std::stoi(version_str);
+}
+
 ExitCode JavaBinaryLauncher::Launch() {
   // Parse the original command line.
   vector<wstring> remaining_args = this->ProcessesCommandLine();
@@ -312,8 +357,7 @@ ExitCode JavaBinaryLauncher::Launch() {
   // Run deploy jar if needed, otherwise generate the CLASSPATH by rlocation.
   if (this->singlejar) {
     wstring deploy_jar =
-        GetBinaryPathWithoutExtension(this->GetCommandlineArguments()[0]) +
-        L"_deploy.jar";
+        GetBinaryPathWithoutExtension(GetLauncherPath()) + L"_deploy.jar";
     if (!DoesFilePathExist(deploy_jar.c_str())) {
       die(L"Option --singlejar was passed, but %s does not exist.\n  (You may "
           "need to build it explicitly.)",
@@ -321,11 +365,14 @@ ExitCode JavaBinaryLauncher::Launch() {
     }
     classpath << deploy_jar << L';';
   } else {
+    wstring path;
     // Add main advice classpath if exists
     if (!this->main_advice_classpath.empty()) {
-      classpath << this->main_advice_classpath << L';';
+      wstringstream main_advice_classpath_ss(this->main_advice_classpath);
+      while (getline(main_advice_classpath_ss, path, L';')) {
+        classpath << this->Rlocation(path) << L';';
+      }
     }
-    wstring path;
     wstringstream classpath_ss(this->GetLaunchInfoByKey(CLASSPATH));
     while (getline(classpath_ss, path, L';')) {
       classpath << this->Rlocation(path) << L';';
@@ -374,13 +421,21 @@ ExitCode JavaBinaryLauncher::Launch() {
   vector<wstring> arguments;
   // Add classpath flags
   arguments.push_back(L"-classpath");
-  // Check if CLASSPATH is over classpath length limit.
-  // If it does, then we create a classpath jar to pass CLASSPATH value.
+  // Check whether the classpath exceeds the length limit.
+  // If it does, spill it to a JAR (Java <= 8) or a flagfile (Java > 8).
   wstring classpath_str = classpath.str();
-  wstring classpath_jar = L"";
-  if (classpath_str.length() > this->classpath_limit) {
-    classpath_jar = CreateClasspathJar(classpath_str);
-    arguments.push_back(classpath_jar);
+  wstring classpath_file;
+  bool delete_junction_base_dir = false;
+  if (classpath_str.length() > classpath_limit) {
+    std::optional<int> java_version = GetJavaVersion();
+    if (!java_version.has_value() || java_version.value() <= 8) {
+      classpath_file = CreateClasspathJar(classpath_str);
+      arguments.push_back(classpath_file);
+      delete_junction_base_dir = true;
+    } else {
+      classpath_file = CreateClasspathFlagfile(classpath_str);
+      arguments.push_back(L"@" + classpath_file);
+    }
   } else {
     arguments.push_back(classpath_str);
   }
@@ -408,17 +463,13 @@ ExitCode JavaBinaryLauncher::Launch() {
     arguments.push_back(arg);
   }
 
-  vector<wstring> escaped_arguments;
-  // Quote the arguments if having spaces
-  for (const auto& arg : arguments) {
-    escaped_arguments.push_back(bazel::windows::WindowsEscapeArg(arg));
+  ExitCode exit_code = this->LaunchProcess(java_bin, arguments);
+
+  // Delete classpath file after execution.
+  if (!classpath_file.empty()) {
+    DeleteFileByPath(classpath_file.c_str());
   }
-
-  ExitCode exit_code = this->LaunchProcess(java_bin, escaped_arguments);
-
-  // Delete classpath jar file after execution.
-  if (!classpath_jar.empty()) {
-    DeleteFileByPath(classpath_jar.c_str());
+  if (delete_junction_base_dir) {
     DeleteJunctionBaseDir();
   }
 

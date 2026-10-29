@@ -13,15 +13,26 @@
 // limitations under the License.
 package com.google.devtools.build.lib.buildtool;
 
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.devtools.build.lib.analysis.config.BuildConfigurationValue.configurationId;
+import static com.google.devtools.build.lib.util.StringUtil.formatCount;
+
+import com.google.auto.value.AutoBuilder;
+import com.google.common.base.Preconditions;
 import com.google.common.base.Stopwatch;
-import com.google.common.collect.ImmutableList;
+import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.flogger.GoogleLogger;
 import com.google.devtools.build.lib.actions.BuildFailedException;
+import com.google.devtools.build.lib.actions.TestExecException;
 import com.google.devtools.build.lib.analysis.AnalysisPhaseCompleteEvent;
 import com.google.devtools.build.lib.analysis.AnalysisResult;
 import com.google.devtools.build.lib.analysis.BuildView;
+import com.google.devtools.build.lib.analysis.ConfiguredAspect;
 import com.google.devtools.build.lib.analysis.ConfiguredTarget;
+import com.google.devtools.build.lib.analysis.Project;
+import com.google.devtools.build.lib.analysis.ProjectResolutionException;
 import com.google.devtools.build.lib.analysis.ViewCreationFailedException;
 import com.google.devtools.build.lib.analysis.config.BuildConfigurationValue;
 import com.google.devtools.build.lib.analysis.config.BuildOptions;
@@ -33,31 +44,39 @@ import com.google.devtools.build.lib.buildeventstream.BuildEventStreamProtos.Abo
 import com.google.devtools.build.lib.buildtool.buildevent.NoAnalyzeEvent;
 import com.google.devtools.build.lib.buildtool.buildevent.TestFilteringCompleteEvent;
 import com.google.devtools.build.lib.cmdline.Label;
+import com.google.devtools.build.lib.cmdline.RepositoryMapping;
+import com.google.devtools.build.lib.cmdline.RepositoryName;
 import com.google.devtools.build.lib.cmdline.TargetParsingException;
 import com.google.devtools.build.lib.cmdline.TargetPattern;
+import com.google.devtools.build.lib.cmdline.TargetPattern.Parser;
 import com.google.devtools.build.lib.events.Event;
-import com.google.devtools.build.lib.packages.Target;
 import com.google.devtools.build.lib.pkgcache.LoadingFailedException;
+import com.google.devtools.build.lib.profiler.MemoryProfiler;
 import com.google.devtools.build.lib.profiler.ProfilePhase;
 import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
 import com.google.devtools.build.lib.runtime.BlazeModule;
 import com.google.devtools.build.lib.runtime.CommandEnvironment;
-import com.google.devtools.build.lib.server.FailureDetails.BuildConfiguration.Code;
 import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
-import com.google.devtools.build.lib.skyframe.BuildConfigurationKey;
-import com.google.devtools.build.lib.skyframe.BuildInfoCollectionFunction;
-import com.google.devtools.build.lib.skyframe.PrecomputedValue;
+import com.google.devtools.build.lib.skyframe.AspectKeyCreator.AspectKey;
+import com.google.devtools.build.lib.skyframe.RepositoryMappingValue.RepositoryMappingResolutionException;
 import com.google.devtools.build.lib.skyframe.TargetPatternPhaseValue;
+import com.google.devtools.build.lib.skyframe.TopLevelStatusEvents.AspectAnalyzedEvent;
+import com.google.devtools.build.lib.skyframe.TopLevelStatusEvents.TestAnalyzedEvent;
+import com.google.devtools.build.lib.skyframe.TopLevelStatusEvents.TopLevelTargetAnalyzedEvent;
+import com.google.devtools.build.lib.skyframe.TopLevelStatusEvents.TopLevelTargetSkippedEvent;
+import com.google.devtools.build.lib.skyframe.config.BuildConfigurationKey;
+import com.google.devtools.build.lib.skyframe.serialization.analysis.RemoteAnalysisCacheReaderDepsProvider;
+import com.google.devtools.build.lib.skyframe.serialization.analysis.RemoteAnalysisCachingDependenciesProvider;
 import com.google.devtools.build.lib.util.AbruptExitException;
 import com.google.devtools.build.lib.util.DetailedExitCode;
-import com.google.devtools.build.lib.util.RegexFilter;
-import com.google.devtools.common.options.OptionsParsingException;
+import com.google.devtools.build.lib.util.ExitCode;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Objects;
-import java.util.Set;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
@@ -71,88 +90,61 @@ public final class AnalysisPhaseRunner {
   public static AnalysisResult execute(
       CommandEnvironment env,
       BuildRequest request,
+      TargetPatternPhaseValue targetPatternPhaseValue,
       BuildOptions buildOptions,
-      TargetValidator validator)
-      throws BuildFailedException, InterruptedException, ViewCreationFailedException,
-          TargetParsingException, LoadingFailedException, AbruptExitException,
-          InvalidConfigurationException {
-
-    // Target pattern evaluation.
-    TargetPatternPhaseValue loadingResult;
-    Profiler.instance().markPhase(ProfilePhase.TARGET_PATTERN_EVAL);
-    try (SilentCloseable c = Profiler.instance().profile("evaluateTargetPatterns")) {
-      loadingResult = evaluateTargetPatterns(env, request, validator);
-    }
-    env.setWorkspaceName(loadingResult.getWorkspaceName());
-
-    // Compute the heuristic instrumentation filter if needed.
-    if (request.needsInstrumentationFilter()) {
-      try (SilentCloseable c = Profiler.instance().profile("Compute instrumentation filter")) {
-        String instrumentationFilter =
-            InstrumentationFilterSupport.computeInstrumentationFilter(
-                env.getReporter(),
-                // TODO(ulfjack): Expensive. Make this part of the TargetPatternPhaseValue or write
-                // a new SkyFunction to compute it?
-                loadingResult.getTestsToRun(env.getReporter(), env.getPackageManager()));
-        try {
-          // We're modifying the buildOptions in place, which is not ideal, but we also don't want
-          // to pay the price for making a copy. Maybe reconsider later if this turns out to be a
-          // problem (and the performance loss may not be a big deal).
-          buildOptions.get(CoreOptions.class).instrumentationFilter =
-              new RegexFilter.RegexFilterConverter().convert(instrumentationFilter);
-        } catch (OptionsParsingException e) {
-          throw new InvalidConfigurationException(Code.HEURISTIC_INSTRUMENTATION_FILTER_INVALID, e);
-        }
-      }
-    }
-
+      RemoteAnalysisCachingDependenciesProvider remoteAnalysisCachingDependenciesProvider,
+      RemoteAnalysisCacheReaderDepsProvider remoteAnalysisCacheReaderDeps)
+      throws BuildFailedException,
+          InterruptedException,
+          ViewCreationFailedException,
+          AbruptExitException,
+          InvalidConfigurationException,
+          RepositoryMappingResolutionException {
     // Exit if there are any pending exceptions from modules.
     env.throwPendingException();
 
     AnalysisResult analysisResult = null;
-    if (request.getBuildOptions().performAnalysisPhase) {
+    if (request.getBuildOptions().getPerformAnalysisPhase()) {
+      MemoryProfiler.instance().markPhase(ProfilePhase.ANALYZE);
       Profiler.instance().markPhase(ProfilePhase.ANALYZE);
 
-      // The build info factories are immutable during the life time of this server. However, we
-      // sometimes clean the graph, which requires re-injecting the value, which requires a hook to
-      // do so afterwards, and there is no such hook at the server / workspace level right now. For
-      // simplicity, we keep the code here for now.
-      env.getSkyframeExecutor()
-          .injectExtraPrecomputedValues(
-              ImmutableList.of(
-                  PrecomputedValue.injected(
-                      BuildInfoCollectionFunction.BUILD_INFO_FACTORIES,
-                      env.getRuntime().getRuleClassProvider().getBuildInfoFactoriesAsMap())));
-
       try (SilentCloseable c = Profiler.instance().profile("runAnalysisPhase")) {
-        analysisResult =
-            runAnalysisPhase(env, request, loadingResult, buildOptions, request.getMultiCpus());
+        env.getBuildResultListener().setAnalysisTimer(Stopwatch.createStarted());
+        try {
+          analysisResult =
+              runAnalysisPhase(
+                  env,
+                  request,
+                  targetPatternPhaseValue,
+                  buildOptions,
+                  remoteAnalysisCachingDependenciesProvider,
+                  remoteAnalysisCacheReaderDeps);
+        } finally {
+          env.getBuildResultListener().stopAnalysisTimer();
+        }
       }
 
       for (BlazeModule module : env.getRuntime().getBlazeModules()) {
         module.afterAnalysis(env, request, buildOptions, analysisResult);
       }
 
-      reportTargets(env, analysisResult);
-
-      for (ConfiguredTarget target : analysisResult.getTargetsToSkip()) {
-        BuildConfigurationValue config =
-            env.getSkyframeExecutor()
-                .getConfiguration(env.getReporter(), target.getConfigurationKey());
-        Label label = target.getLabel();
-        env.getEventBus()
-            .post(
-                new AbortedEvent(
-                    BuildEventIdUtil.targetCompleted(label, config.getEventId()),
-                    AbortReason.SKIPPED,
-                    String.format("Target %s build was skipped.", label),
-                    label));
+      if (request.shouldRunTests()) {
+        reportTargetsWithTests(
+            env,
+            analysisResult.getTargetsToBuild(),
+            Preconditions.checkNotNull(analysisResult.getTargetsToTest()));
+      } else {
+        reportTargets(env, analysisResult.getTargetsToBuild());
       }
+
+      postAbortedEventsForSkippedTargets(env, analysisResult.getTargetsToSkip());
     } else {
       env.getReporter().handle(Event.progress("Loading complete."));
       env.getReporter().post(new NoAnalyzeEvent());
       logger.atInfo().log("No analysis requested, so finished");
-      FailureDetail failureDetail = BuildView.createFailureDetail(loadingResult, null, null);
+      FailureDetail failureDetail =
+          BuildView.createAnalysisFailureDetail(
+              targetPatternPhaseValue, /* skyframeAnalysisResult= */ null);
       if (failureDetail != null) {
         throw new BuildFailedException(
             failureDetail.getMessage(), DetailedExitCode.of(failureDetail));
@@ -162,26 +154,107 @@ public final class AnalysisPhaseRunner {
     return analysisResult;
   }
 
-  private static TargetPatternPhaseValue evaluateTargetPatterns(
-      CommandEnvironment env, final BuildRequest request, final TargetValidator validator)
-      throws LoadingFailedException, TargetParsingException, InterruptedException {
-    boolean keepGoing = request.getKeepGoing();
-    TargetPatternPhaseValue result =
-        env.getSkyframeExecutor()
-            .loadTargetPatternsWithFilters(
-                env.getReporter(),
-                request.getTargets(),
-                env.getRelativeWorkingDirectory(),
-                request.getLoadingOptions(),
-                request.getLoadingPhaseThreadCount(),
-                keepGoing,
-                request.shouldRunTests());
-    if (validator != null) {
-      Collection<Target> targets =
-          result.getTargets(env.getReporter(), env.getSkyframeExecutor().getPackageManager());
-      validator.validateTargets(targets, keepGoing);
+  /** A simple container for storing processed evaluation results of the PROJECT.scl file. */
+  record ProjectEvaluationResult(ImmutableSet<String> buildOptions, Optional<Label> projectFile) {
+
+    public ProjectEvaluationResult {
+      checkArgument(buildOptions != null, "buildOptions cannot be null.");
+      checkArgument(projectFile != null, "projectFile cannot be null.");
     }
-    return result;
+
+    public static Builder builder() {
+      return new AutoBuilder_AnalysisPhaseRunner_ProjectEvaluationResult_Builder();
+    }
+
+    @AutoBuilder
+    public interface Builder {
+      Builder buildOptions(ImmutableSet<String> buildOptions);
+
+      Builder projectFile(Optional<Label> projectFile);
+
+      ProjectEvaluationResult build();
+    }
+  }
+
+  /**
+   * Evaluates the PROJECT.scl file and set corresponding options, if required by specific feature
+   * flags (e.g. canonical configurations).
+   *
+   * <p>May have a side-effect from updating the fields in the {@link CommandEnvironment} {@code
+   * env} parameter.
+   *
+   * <p>Shared by both Skymeld and non-Skymeld analysis.
+   */
+  static ProjectEvaluationResult evaluateProjectFile(
+      BuildRequest request,
+      BuildOptions buildOptions,
+      ImmutableSet<String> allOptionNames,
+      ImmutableMap<String, String> userOptions,
+      TargetPatternPhaseValue targetPatternPhaseValue,
+      CommandEnvironment env)
+      throws LoadingFailedException, InvalidConfigurationException {
+    ProjectEvaluationResult.Builder resultBuilder =
+        ProjectEvaluationResult.builder()
+            .buildOptions(ImmutableSet.of())
+            .projectFile(Optional.empty());
+
+    if (Strings.isNullOrEmpty(buildOptions.get(CoreOptions.class).getSclConfig())
+        && !request.getBuildOptions().getEnforceProjectConfigs()) {
+      return resultBuilder.build();
+    }
+
+    Project.ActiveProjects activeProjects;
+    try {
+      activeProjects =
+          Project.getProjectFiles(
+              targetPatternPhaseValue.getNonExpandedLabels(),
+              env.getSkyframeExecutor(),
+              env.getReporter());
+    } catch (ProjectResolutionException e) {
+      throw new LoadingFailedException(
+          e.getMessage(),
+          DetailedExitCode.of(ExitCode.PARSING_FAILURE, FailureDetail.getDefaultInstance()));
+    }
+
+    if (!activeProjects.isEmpty()) {
+      // Do not apply canonical configurations if there are no project files.
+      ImmutableSet<String> options =
+          Project.applySclConfig(
+              buildOptions,
+              activeProjects,
+              buildOptions.get(CoreOptions.class).getSclConfig(),
+              allOptionNames,
+              userOptions,
+              env.getConfigFlagDefinitions(),
+              request.getBuildOptions().getEnforceProjectConfigs(),
+              env.getReporter(),
+              env.getSkyframeExecutor());
+      resultBuilder.buildOptions(options);
+      resultBuilder.projectFile(
+          Optional.ofNullable(
+              activeProjects.isEmpty()
+                  ? null
+                  : activeProjects.projectFilesToTargetLabels().keySet().iterator().next()));
+    }
+
+    return resultBuilder.build();
+  }
+
+  static void postAbortedEventsForSkippedTargets(
+      CommandEnvironment env, ImmutableSet<ConfiguredTarget> targetsToSkip) {
+    for (ConfiguredTarget target : targetsToSkip) {
+      BuildConfigurationValue config =
+          env.getSkyframeExecutor()
+              .getConfiguration(env.getReporter(), target.getConfigurationKey());
+      Label label = target.getOriginalLabel();
+      env.getEventBus()
+          .post(
+              new AbortedEvent(
+                  BuildEventIdUtil.targetCompleted(label, configurationId(config)),
+                  AbortReason.SKIPPED,
+                  String.format("Target %s build was skipped.", label),
+                  label));
+    }
   }
 
   /**
@@ -199,13 +272,22 @@ public final class AnalysisPhaseRunner {
       BuildRequest request,
       TargetPatternPhaseValue loadingResult,
       BuildOptions targetOptions,
-      Set<String> multiCpu)
-      throws InterruptedException, InvalidConfigurationException, ViewCreationFailedException {
+      RemoteAnalysisCachingDependenciesProvider remoteAnalysisCachingDependenciesProvider,
+      RemoteAnalysisCacheReaderDepsProvider remoteAnalysisCacheReaderDeps)
+      throws InterruptedException,
+          InvalidConfigurationException,
+          RepositoryMappingResolutionException,
+          ViewCreationFailedException,
+          AbruptExitException {
     Stopwatch timer = Stopwatch.createStarted();
     env.getReporter().handle(Event.progress("Loading complete.  Analyzing..."));
 
-    ImmutableSet<String> explicitTargetPatterns =
-        getExplicitTargetPatterns(env, request.getTargets());
+    ImmutableSet<Label> explicitTargetPatterns =
+        getExplicitTargetPatterns(
+            env,
+            request.getTargets(),
+            request.getKeepGoing(),
+            request.getLoadingPhaseThreadCount());
 
     BuildView view =
         new BuildView(
@@ -213,24 +295,38 @@ public final class AnalysisPhaseRunner {
             env.getRuntime().getRuleClassProvider(),
             env.getSkyframeExecutor(),
             env.getRuntime().getCoverageReportActionFactory(request));
-    AnalysisResult analysisResult =
-        view.update(
-            loadingResult,
-            targetOptions,
-            multiCpu,
-            explicitTargetPatterns,
-            request.getAspects(),
-            request.getAspectsParameters(),
-            request.getViewOptions(),
-            request.getKeepGoing(),
-            request.getCheckForActionConflicts(),
-            request.getLoadingPhaseThreadCount(),
-            request.getTopLevelArtifactContext(),
-            request.reportIncompatibleTargets(),
-            env.getReporter(),
-            env.getEventBus(),
-            /*includeExecutionPhase=*/ false,
-            /*mergedPhasesExecutionJobsCount=*/ 0);
+    AnalysisResult analysisResult;
+    try {
+      analysisResult =
+          view.update(
+              loadingResult,
+              targetOptions,
+              explicitTargetPatterns,
+              request.getAspects(),
+              request.getAspectsParameters(),
+              request.getViewOptions(),
+              request.getBuildOptions(),
+              request.getKeepGoing(),
+              request.getViewOptions().getSkipIncompatibleExplicitTargets(),
+              request.getCheckForActionConflicts(),
+              env.getQuiescingExecutors(),
+              request.getTopLevelArtifactContext(),
+              request.reportIncompatibleTargets(),
+              env.getReporter(),
+              env.getEventBus(),
+              env.getRuntime().getBugReporter(),
+              /* includeExecutionPhase= */ false,
+              /* resourceManager= */ null,
+              /* buildResultListener= */ null,
+              /* executionSetupCallback= */ null,
+              /* buildConfigurationsCreatedCallback= */ null,
+              /* buildDriverKeyTestContext= */ null,
+              env.getAdditionalConfigurationChangeEvent(),
+              remoteAnalysisCachingDependenciesProvider,
+              remoteAnalysisCacheReaderDeps);
+    } catch (BuildFailedException | TestExecException unexpected) {
+      throw new IllegalStateException("Unexpected execution exception type: ", unexpected);
+    }
 
     // TODO(bazel-team): Merge these into one event.
     env.getEventBus()
@@ -239,6 +335,7 @@ public final class AnalysisPhaseRunner {
                 analysisResult.getTargetsToBuild(),
                 view.getEvaluatedCounts(),
                 view.getEvaluatedActionsCounts(),
+                view.getEvaluatedActionsCountsByMnemonic(),
                 timer.stop().elapsed(TimeUnit.MILLISECONDS),
                 view.getAndClearPkgManagerStatistics(),
                 env.getSkyframeExecutor().wasAnalysisCacheInvalidatedAndResetBit()));
@@ -264,39 +361,71 @@ public final class AnalysisPhaseRunner {
                 analysisResult.getTargetsToTest(),
                 analysisResult.getTargetsToSkip(),
                 configurationMap));
+    postTopLevelStatusEvents(env, analysisResult, configurationMap);
+
     return analysisResult;
   }
 
-  private static void reportTargets(CommandEnvironment env, AnalysisResult analysisResult) {
-    Collection<ConfiguredTarget> targetsToBuild = analysisResult.getTargetsToBuild();
-    Collection<ConfiguredTarget> targetsToTest = analysisResult.getTargetsToTest();
-    if (targetsToTest != null) {
-      int testCount = targetsToTest.size();
-      int targetCount = targetsToBuild.size() - testCount;
-      if (targetCount == 0) {
-        env.getReporter()
-            .handle(
-                Event.info(
-                    "Found "
-                        + testCount
-                        + (testCount == 1 ? " test target..." : " test targets...")));
-      } else {
-        env.getReporter()
-            .handle(
-                Event.info(
-                    "Found "
-                        + targetCount
-                        + (targetCount == 1 ? " target and " : " targets and ")
-                        + testCount
-                        + (testCount == 1 ? " test target..." : " test targets...")));
+  /** Post the appropriate {@link com.google.devtools.build.lib.skyframe.TopLevelStatusEvents}. */
+  private static void postTopLevelStatusEvents(
+      CommandEnvironment env,
+      AnalysisResult analysisResult,
+      Map<BuildConfigurationKey, BuildConfigurationValue> configurationMap) {
+    for (ConfiguredTarget configuredTarget : analysisResult.getTargetsToBuild()) {
+      env.getEventBus().post(TopLevelTargetAnalyzedEvent.create(configuredTarget));
+      if (analysisResult.getTargetsToSkip().contains(configuredTarget)) {
+        env.getEventBus().post(TopLevelTargetSkippedEvent.create(configuredTarget));
       }
-    } else {
-      int targetCount = targetsToBuild.size();
+
+      if (analysisResult.getTargetsToTest() != null
+          && analysisResult.getTargetsToTest().contains(configuredTarget)) {
+        env.getEventBus()
+            .post(
+                TestAnalyzedEvent.create(
+                    configuredTarget,
+                    configurationMap.get(configuredTarget.getConfigurationKey()),
+                    /* isSkipped= */ analysisResult.getTargetsToSkip().contains(configuredTarget)));
+      }
+    }
+
+    for (Entry<AspectKey, ConfiguredAspect> entry : analysisResult.getAspectsMap().entrySet()) {
+      env.getEventBus().post(AspectAnalyzedEvent.create(entry.getKey(), entry.getValue()));
+    }
+  }
+
+  static void reportTargetsWithTests(
+      CommandEnvironment env,
+      Collection<ConfiguredTarget> targetsToBuild,
+      Collection<ConfiguredTarget> targetsToTest) {
+    int testCount = targetsToTest.size();
+    int targetCount = targetsToBuild.size() - testCount;
+    if (targetCount == 0) {
       env.getReporter()
           .handle(
               Event.info(
-                  "Found " + targetCount + (targetCount == 1 ? " target..." : " targets...")));
+                  "Found "
+                      + formatCount(testCount)
+                      + (testCount == 1 ? " test target..." : " test targets...")));
+    } else {
+      env.getReporter()
+          .handle(
+              Event.info(
+                  "Found "
+                      + formatCount(targetCount)
+                      + (targetCount == 1 ? " target and " : " targets and ")
+                      + formatCount(testCount)
+                      + (testCount == 1 ? " test target..." : " test targets...")));
     }
+  }
+
+  static void reportTargets(CommandEnvironment env, Collection<ConfiguredTarget> targetsToBuild) {
+    int targetCount = targetsToBuild.size();
+    env.getReporter()
+        .handle(
+            Event.info(
+                "Found "
+                    + formatCount(targetCount)
+                    + (targetCount == 1 ? " target..." : " targets...")));
   }
 
   /**
@@ -306,15 +435,29 @@ public final class AnalysisPhaseRunner {
    *
    * @param env the action's environment.
    * @param requestedTargetPatterns the list of target patterns specified on the command line.
+   * @param keepGoing --keep_going command line option.
+   * @param loadingPhaseThreads no of threads to be used in execution.
    * @return the set of stringified labels of target patterns that represent single targets. The
    *     stringified labels are in the "unambiguous canonical form".
    * @throws ViewCreationFailedException if a pattern fails to parse for some reason.
    */
-  private static ImmutableSet<String> getExplicitTargetPatterns(
-      CommandEnvironment env, List<String> requestedTargetPatterns)
-      throws ViewCreationFailedException {
-    ImmutableSet.Builder<String> explicitTargetPatterns = ImmutableSet.builder();
-    TargetPattern.Parser parser = TargetPattern.mainRepoParser(env.getRelativeWorkingDirectory());
+  private static ImmutableSet<Label> getExplicitTargetPatterns(
+      CommandEnvironment env,
+      List<String> requestedTargetPatterns,
+      boolean keepGoing,
+      int loadingPhaseThreads)
+      throws ViewCreationFailedException,
+          RepositoryMappingResolutionException,
+          InterruptedException {
+    ImmutableSet.Builder<Label> explicitTargetPatterns = ImmutableSet.builder();
+
+    // TODO(andreisolo): Don't re-compute these here as they should be already computed inside the
+    //  TargetPatternPhaseValue
+    RepositoryMapping mainRepoMapping =
+        env.getSkyframeExecutor()
+            .getMainRepoMapping(keepGoing, loadingPhaseThreads, env.getReporter());
+    TargetPattern.Parser parser =
+        new Parser(env.getRelativeWorkingDirectory(), RepositoryName.MAIN, mainRepoMapping);
 
     for (String requestedTargetPattern : requestedTargetPatterns) {
       if (requestedTargetPattern.startsWith("-")) {
@@ -337,7 +480,7 @@ public final class AnalysisPhaseRunner {
       }
 
       if (parsedPattern.getType() == TargetPattern.Type.SINGLE_TARGET) {
-        explicitTargetPatterns.add(parsedPattern.getSingleTargetPath());
+        explicitTargetPatterns.add(parsedPattern.getSingleTargetLabel());
       }
     }
 

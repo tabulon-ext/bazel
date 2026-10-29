@@ -14,12 +14,14 @@
 package com.google.devtools.build.lib.vfs;
 
 import static com.google.common.truth.Truth.assertThat;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.Assert.assertThrows;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.devtools.build.lib.testutil.TestUtils;
+import com.google.devtools.build.lib.vfs.UnixGlob.FilesystemOps;
 import com.google.devtools.build.lib.vfs.inmemoryfs.InMemoryFileSystem;
 import com.google.devtools.build.lib.vfs.util.TestUnixGlobPathDiscriminator;
 import java.io.FileNotFoundException;
@@ -31,12 +33,13 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
+import javax.annotation.Nullable;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -163,12 +166,12 @@ public class GlobTest {
   public void testFilteredResults_noDirs() throws Exception {
 
     assertThat(
-            new UnixGlob.Builder(tmpPath)
+            new UnixGlob.Builder(tmpPath, FilesystemOps.DIRECT)
                 .addPatterns("**")
                 .setPathDiscriminator(
                     new TestUnixGlobPathDiscriminator(
-                        p -> /*traversalPredicate=*/ true,
-                        /*resultPredicate=*/ (p, isDir) -> !isDir))
+                        p -> /* traversalPredicate= */ true,
+                        /* resultPredicate= */ (p, isDir) -> !isDir))
                 .globInterruptible())
         .containsExactlyElementsIn(resolvePaths("foo/bar/wiz/file"));
   }
@@ -176,12 +179,12 @@ public class GlobTest {
   @Test
   public void testFilteredResults_noFiles() throws Exception {
     assertThat(
-            new UnixGlob.Builder(tmpPath)
+            new UnixGlob.Builder(tmpPath, FilesystemOps.DIRECT)
                 .addPatterns("**")
                 .setPathDiscriminator(
                     new TestUnixGlobPathDiscriminator(
-                        /*traversalPredicate=*/ p -> true,
-                        /*resultPredicate=*/ (p, isDir) -> isDir))
+                        /* traversalPredicate= */ p -> true,
+                        /* resultPredicate= */ (p, isDir) -> isDir))
                 .globInterruptible())
         .containsExactlyElementsIn(
             resolvePaths(
@@ -205,12 +208,12 @@ public class GlobTest {
     Path wanted = tmpPath.getRelative("food/barnacle/wiz");
 
     assertThat(
-            new UnixGlob.Builder(tmpPath)
+            new UnixGlob.Builder(tmpPath, FilesystemOps.DIRECT)
                 .addPatterns("**")
                 .setPathDiscriminator(
                     new TestUnixGlobPathDiscriminator(
-                        /*traversalPredicate=*/ p -> true,
-                        /*resultPredicate=*/ (path, isDir) -> path.equals(wanted)))
+                        /* traversalPredicate= */ p -> true,
+                        /* resultPredicate= */ (path, isDir) -> path.equals(wanted)))
                 .globInterruptible())
         .containsExactly(wanted);
   }
@@ -220,15 +223,15 @@ public class GlobTest {
     // Use a directory traversal filter to only walk the root dir and "foo", but not "fool or "food"
     // So we'll end up the directories, "fool" and "food", but not sub-dirs.
     assertThat(
-            new UnixGlob.Builder(tmpPath)
+            new UnixGlob.Builder(tmpPath, FilesystemOps.DIRECT)
                 .addPatterns("**")
                 .setPathDiscriminator(
                     new TestUnixGlobPathDiscriminator(
-                        /*traversalPredicate=*/ path ->
+                        /* traversalPredicate= */ path ->
                             path.equals(tmpPath)
                                 || path.getPathString().contains("foo/")
                                 || path.getPathString().endsWith("foo"),
-                        /*resultPredicate=*/ (x, isDir) -> true))
+                        /* resultPredicate= */ (x, isDir) -> true))
                 .globInterruptible())
         .containsExactlyElementsIn(
             resolvePaths(
@@ -246,7 +249,9 @@ public class GlobTest {
   @Test
   public void testGlobWithNonExistentBase() throws Exception {
     Collection<Path> globResult =
-        UnixGlob.forPath(fs.getPath("/does/not/exist")).addPattern("*.txt").globInterruptible();
+        new UnixGlob.Builder(fs.getPath("/does/not/exist"), FilesystemOps.DIRECT)
+            .addPattern("*.txt")
+            .globInterruptible();
     assertThat(globResult).isEmpty();
   }
 
@@ -260,7 +265,10 @@ public class GlobTest {
   }
 
   private void assertGlobMatches(Collection<String> pattern, String... expecteds) throws Exception {
-    assertThat(new UnixGlob.Builder(tmpPath).addPatterns(pattern).globInterruptible())
+    assertThat(
+            new UnixGlob.Builder(tmpPath, FilesystemOps.DIRECT)
+                .addPatterns(pattern)
+                .globInterruptible())
         .containsExactlyElementsIn(resolvePaths(expecteds));
   }
 
@@ -274,8 +282,8 @@ public class GlobTest {
   }
 
   @Test
-  public void testIOFailureOnStat() throws Exception {
-    SyscallCache syscalls =
+  public void testIOFailureOnStat() {
+    SyscallCache syscallCache =
         new SyscallCache() {
           @Override
           public FileStatus statIfFound(Path path, Symlinks symlinks) throws IOException {
@@ -288,7 +296,12 @@ public class GlobTest {
           }
 
           @Override
-          public Dirent.Type getType(Path path, Symlinks symlinks) {
+          public DirentTypeWithSkip getType(Path path, Symlinks symlinks) {
+            throw new IllegalStateException();
+          }
+
+          @Override
+          public void clear() {
             throw new IllegalStateException();
           }
         };
@@ -297,38 +310,27 @@ public class GlobTest {
         assertThrows(
             IOException.class,
             () ->
-                new UnixGlob.Builder(tmpPath)
-                    .addPattern("foo/bar/wiz/file")
-                    .setFilesystemCalls(syscalls)
-                    .glob());
+                new UnixGlob.Builder(tmpPath, syscallCache).addPattern("foo/bar/wiz/file").glob());
     assertThat(e).hasMessageThat().isEqualTo("EIO");
   }
 
   @Test
   public void testGlobWithoutWildcardsDoesNotCallReaddir() throws Exception {
-    SyscallCache syscallCache =
-        new SyscallCache() {
+    FilesystemOps filesystemOps =
+        new FilesystemOps() {
+          @Nullable
           @Override
-          public FileStatus statIfFound(Path path, Symlinks symlinks) throws IOException {
-            return SyscallCache.NO_CACHE.statIfFound(path, symlinks);
+          public FileStatus statIfFound(Path path) throws IOException {
+            return FilesystemOps.DIRECT.statIfFound(path);
           }
 
           @Override
           public Collection<Dirent> readdir(Path path) {
             throw new IllegalStateException();
           }
-
-          @Override
-          public Dirent.Type getType(Path path, Symlinks symlinks) {
-            throw new IllegalStateException();
-          }
         };
 
-    assertThat(
-            new UnixGlob.Builder(tmpPath)
-                .addPattern("foo/bar/wiz/file")
-                .setFilesystemCalls(syscallCache)
-                .glob())
+    assertThat(new UnixGlob.Builder(tmpPath, filesystemOps).addPattern("foo/bar/wiz/file").glob())
         .containsExactly(tmpPath.getRelative("foo/bar/wiz/file"));
   }
 
@@ -363,15 +365,30 @@ public class GlobTest {
     FileSystemUtils.createEmptyFile(tmpPath2.getChild("aab"));
     // Note: these contain two asterisks because otherwise a RE is not built,
     // as an optimization.
-    assertThat(UnixGlob.forPath(tmpPath2).addPattern("*a.b*").globInterruptible())
+    assertThat(
+            new UnixGlob.Builder(tmpPath2, FilesystemOps.DIRECT)
+                .addPattern("*a.b*")
+                .globInterruptible())
         .containsExactly(aDotB);
-    assertThat(UnixGlob.forPath(tmpPath2).addPattern("*a+b*").globInterruptible())
+    assertThat(
+            new UnixGlob.Builder(tmpPath2, FilesystemOps.DIRECT)
+                .addPattern("*a+b*")
+                .globInterruptible())
         .containsExactly(aPlusB);
-    assertThat(UnixGlob.forPath(tmpPath2).addPattern("*a\\wb*").globInterruptible())
+    assertThat(
+            new UnixGlob.Builder(tmpPath2, FilesystemOps.DIRECT)
+                .addPattern("*a\\wb*")
+                .globInterruptible())
         .containsExactly(aWordCharacterB);
-    assertThat(UnixGlob.forPath(tmpPath2).addPattern("*aab|a{1,2}[ab]*").globInterruptible())
+    assertThat(
+            new UnixGlob.Builder(tmpPath2, FilesystemOps.DIRECT)
+                .addPattern("*aab|a{1,2}[ab]*")
+                .globInterruptible())
         .containsExactly(disjunctionsAndBrackets);
-    assertThat(UnixGlob.forPath(tmpPath2).addPattern("*\\|}[{[].+*").globInterruptible())
+    assertThat(
+            new UnixGlob.Builder(tmpPath2, FilesystemOps.DIRECT)
+                .addPattern("*\\|}[{[].+*")
+                .globInterruptible())
         .containsExactly(lineNoise);
   }
 
@@ -391,20 +408,55 @@ public class GlobTest {
     FileSystemUtils.createEmptyFile(fooBarInParentheses);
     // Note: these contain two asterisks because otherwise a RE is not built,
     // as an optimization.
-    assertThat(UnixGlob.forPath(tmpPath3).addPattern("*foo (bar)*").globInterruptible())
+    assertThat(
+            new UnixGlob.Builder(tmpPath3, FilesystemOps.DIRECT)
+                .addPattern("*foo (bar)*")
+                .globInterruptible())
         .containsExactly(fooBar);
-    assertThat(UnixGlob.forPath(tmpPath3).addPattern("(*foo bar*)").globInterruptible())
+    assertThat(
+            new UnixGlob.Builder(tmpPath3, FilesystemOps.DIRECT)
+                .addPattern("(*foo bar*)")
+                .globInterruptible())
         .containsExactly(fooBar);
-    assertThat(UnixGlob.forPath(tmpPath3).addPattern("*)((foo ))bar(*").globInterruptible())
+    assertThat(
+            new UnixGlob.Builder(tmpPath3, FilesystemOps.DIRECT)
+                .addPattern("*)((foo ))bar(*")
+                .globInterruptible())
         .containsExactly(fooBar);
-    assertThat(UnixGlob.forPath(tmpPath3).addPattern("*foo (bar*").globInterruptible())
+    assertThat(
+            new UnixGlob.Builder(tmpPath3, FilesystemOps.DIRECT)
+                .addPattern("*foo (bar*")
+                .globInterruptible())
         .containsExactly(fooBar);
-    assertThat(UnixGlob.forPath(tmpPath3).addPattern("*foo bar*)").globInterruptible())
+    assertThat(
+            new UnixGlob.Builder(tmpPath3, FilesystemOps.DIRECT)
+                .addPattern("*foo bar*)")
+                .globInterruptible())
         .containsExactly(fooBar);
     // Note: the following glob pattern doesn't contain asterisks, and a RE wouldn't be expected to
     // be built.
-    assertThat(UnixGlob.forPath(tmpPath3).addPattern("foo (bar)").globInterruptible())
+    assertThat(
+            new UnixGlob.Builder(tmpPath3, FilesystemOps.DIRECT)
+                .addPattern("foo (bar)")
+                .globInterruptible())
         .containsExactly(fooBarInParentheses);
+  }
+
+  @Test
+  public void testMatchesLiteralSegments() {
+    for (String literal :
+        ImmutableList.of("node_modules", ".venv", "a.b", "a+b", "a\\wb", "aab|a{1,2}[ab]")) {
+      assertThat(UnixGlob.matches(literal, literal)).isTrue();
+      assertThat(UnixGlob.matches(literal, "other")).isFalse();
+    }
+  }
+
+  @Test
+  public void testMatchesLiteralParenthesesUsesLegacyRegex() {
+    for (String pattern : ImmutableList.of("foo(bar)", "foo(bar", "foo)bar")) {
+      assertThat(UnixGlob.matches(pattern, "foobar")).isTrue();
+      assertThat(UnixGlob.matches(pattern, "foo(bar)")).isFalse();
+    }
   }
 
   @Test
@@ -434,21 +486,28 @@ public class GlobTest {
     assertGlobMatchesAnyOrder(Lists.newArrayList("food", "?ood", "f??d"), "food");
     assertThat(resolvePaths("food", "fool", "foo"))
         .containsExactlyElementsIn(
-            new UnixGlob.Builder(tmpPath).addPatterns("food", "xxx", "*").glob());
+            new UnixGlob.Builder(tmpPath, FilesystemOps.DIRECT)
+                .addPatterns("food", "xxx", "*")
+                .glob());
   }
 
   private void assertGlobMatchesAnyOrder(ArrayList<String> patterns, String... paths)
       throws Exception {
     assertThat(resolvePaths(paths))
         .containsExactlyElementsIn(
-            new UnixGlob.Builder(tmpPath).addPatterns(patterns).globInterruptible());
+            new UnixGlob.Builder(tmpPath, FilesystemOps.DIRECT)
+                .addPatterns(patterns)
+                .globInterruptible());
   }
 
   private void assertIllegalPattern(String pattern) throws Exception {
     UnixGlob.BadPattern e =
         assertThrows(
             UnixGlob.BadPattern.class,
-            () -> new UnixGlob.Builder(tmpPath).addPattern(pattern).globInterruptible());
+            () ->
+                new UnixGlob.Builder(tmpPath, FilesystemOps.DIRECT)
+                    .addPattern(pattern)
+                    .globInterruptible());
     assertThat(e).hasMessageThat().containsMatch("in glob pattern");
   }
 
@@ -471,7 +530,8 @@ public class GlobTest {
     throwOnReaddir = fs.getPath("/throw_on_readdir");
     throwOnReaddir.createDirectory();
     assertThrows(
-        IOException.class, () -> new UnixGlob.Builder(throwOnReaddir).addPattern("**").glob());
+        IOException.class,
+        () -> new UnixGlob.Builder(throwOnReaddir, FilesystemOps.DIRECT).addPattern("**").glob());
   }
 
   @Test
@@ -479,7 +539,9 @@ public class GlobTest {
     Thread.currentThread().interrupt();
     throwOnStat = tmpPath;
     FileNotFoundException e =
-        assertThrows(FileNotFoundException.class, () -> new UnixGlob.Builder(tmpPath).glob());
+        assertThrows(
+            FileNotFoundException.class,
+            () -> new UnixGlob.Builder(tmpPath, FilesystemOps.DIRECT).glob());
     assertThat(e).hasMessageThat().contains("globtmp");
   }
 
@@ -488,11 +550,23 @@ public class GlobTest {
     final Thread mainThread = Thread.currentThread();
     final ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(10);
 
+    var interruptExactlyOnce = new AtomicBoolean(false);
+    // Ensures the cancellation occurs while the glob is running.
+    var waitInPredicate = new CountDownLatch(1);
+
     Predicate<Path> interrupterPredicate =
         new Predicate<Path>() {
           @Override
           public boolean test(Path input) {
-            mainThread.interrupt();
+            if (interruptExactlyOnce.compareAndSet(false, true)) {
+              mainThread.interrupt();
+            } else {
+              try {
+                assertThat(waitInPredicate.await(TestUtils.WAIT_TIMEOUT_SECONDS, SECONDS)).isTrue();
+              } catch (InterruptedException e) {
+                throw new AssertionError(e);
+              }
+            }
             return true;
           }
         };
@@ -502,7 +576,7 @@ public class GlobTest {
             /*traversalPredicate=*/ interrupterPredicate, /*resultPredicate=*/ (x, isDir) -> true);
 
     Future<?> globResult =
-        new UnixGlob.Builder(tmpPath)
+        new UnixGlob.Builder(tmpPath, FilesystemOps.DIRECT)
             .addPattern("**")
             .setPathDiscriminator(interrupterDiscriminator)
             .setExecutor(executor)
@@ -510,14 +584,15 @@ public class GlobTest {
     assertThrows(InterruptedException.class, () -> globResult.get());
 
     globResult.cancel(true);
+    waitInPredicate.countDown();
+
     assertThrows(
         CancellationException.class, () -> Uninterruptibles.getUninterruptibly(globResult));
 
     Thread.interrupted();
     assertThat(executor.isShutdown()).isFalse();
     executor.shutdown();
-    assertThat(executor.awaitTermination(TestUtils.WAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS))
-        .isTrue();
+    assertThat(executor.awaitTermination(TestUtils.WAIT_TIMEOUT_SECONDS, SECONDS)).isTrue();
   }
 
   @Test
@@ -542,7 +617,7 @@ public class GlobTest {
             /*traversalPredicate=*/ interrupterPredicate, /*resultPredicate=*/ (x, isDir) -> true);
 
     List<Path> result =
-        new UnixGlob.Builder(tmpPath)
+        new UnixGlob.Builder(tmpPath, FilesystemOps.DIRECT)
             .addPatterns("**", "*")
             .setPathDiscriminator(interrupterDiscriminator)
             .setExecutor(executor)
@@ -570,8 +645,7 @@ public class GlobTest {
 
     assertThat(executor.isShutdown()).isFalse();
     executor.shutdown();
-    assertThat(executor.awaitTermination(TestUtils.WAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS))
-        .isTrue();
+    assertThat(executor.awaitTermination(TestUtils.WAIT_TIMEOUT_SECONDS, SECONDS)).isTrue();
   }
 
   private static Collection<String> removeExcludes(ImmutableList<String> paths, String... excludes)

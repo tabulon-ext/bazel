@@ -15,17 +15,25 @@
 package com.google.devtools.build.lib.remote;
 
 import static com.google.common.base.Strings.isNullOrEmpty;
+import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
+import static com.google.devtools.build.lib.remote.util.DigestUtil.isOldStyleDigestFunction;
 
 import build.bazel.remote.execution.v2.ActionCacheGrpc;
 import build.bazel.remote.execution.v2.ActionCacheGrpc.ActionCacheFutureStub;
 import build.bazel.remote.execution.v2.ActionResult;
+import build.bazel.remote.execution.v2.ChunkingFunction;
 import build.bazel.remote.execution.v2.ContentAddressableStorageGrpc;
 import build.bazel.remote.execution.v2.ContentAddressableStorageGrpc.ContentAddressableStorageFutureStub;
 import build.bazel.remote.execution.v2.Digest;
+import build.bazel.remote.execution.v2.DigestFunction;
 import build.bazel.remote.execution.v2.FindMissingBlobsRequest;
 import build.bazel.remote.execution.v2.FindMissingBlobsResponse;
 import build.bazel.remote.execution.v2.GetActionResultRequest;
 import build.bazel.remote.execution.v2.RequestMetadata;
+import build.bazel.remote.execution.v2.ServerCapabilities;
+import build.bazel.remote.execution.v2.SpliceBlobRequest;
+import build.bazel.remote.execution.v2.SplitBlobRequest;
+import build.bazel.remote.execution.v2.SplitBlobResponse;
 import build.bazel.remote.execution.v2.UpdateActionResultRequest;
 import com.google.bytestream.ByteStreamGrpc;
 import com.google.bytestream.ByteStreamGrpc.ByteStreamStub;
@@ -37,6 +45,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.flogger.GoogleLogger;
+import com.google.common.io.CountingOutputStream;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.MoreExecutors;
@@ -44,8 +53,11 @@ import com.google.common.util.concurrent.SettableFuture;
 import com.google.devtools.build.lib.authandtls.CallCredentialsProvider;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;
 import com.google.devtools.build.lib.remote.RemoteRetrier.ProgressiveBackoff;
+import com.google.devtools.build.lib.remote.common.ActionKey;
+import com.google.devtools.build.lib.remote.common.BlobNotSplittableException;
 import com.google.devtools.build.lib.remote.common.CacheNotFoundException;
 import com.google.devtools.build.lib.remote.common.MissingDigestsFinder;
+import com.google.devtools.build.lib.remote.common.OutputDigestMismatchException;
 import com.google.devtools.build.lib.remote.common.RemoteActionExecutionContext;
 import com.google.devtools.build.lib.remote.common.RemoteCacheClient;
 import com.google.devtools.build.lib.remote.options.RemoteOptions;
@@ -54,28 +66,63 @@ import com.google.devtools.build.lib.remote.util.DigestUtil;
 import com.google.devtools.build.lib.remote.util.TracingMetadataUtils;
 import com.google.devtools.build.lib.remote.util.Utils;
 import com.google.devtools.build.lib.remote.zstd.ZstdDecompressingOutputStream;
-import com.google.devtools.build.lib.vfs.Path;
 import com.google.protobuf.ByteString;
 import io.grpc.Channel;
 import io.grpc.Status;
 import io.grpc.Status.Code;
 import io.grpc.StatusRuntimeException;
-import io.grpc.stub.StreamObserver;
+import io.grpc.stub.ClientCallStreamObserver;
+import io.grpc.stub.ClientResponseObserver;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import javax.annotation.Nullable;
-import org.apache.commons.compress.utils.CountingOutputStream;
 
 /** A RemoteActionCache implementation that uses gRPC calls to a remote cache server. */
 @ThreadSafe
-public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder {
+public class GrpcCacheClient extends RemoteCacheClient implements MissingDigestsFinder {
   private static final GoogleLogger logger = GoogleLogger.forEnclosingClass();
+
+  private static final class SizeLimitingOutputStream extends OutputStream {
+    private final CountingOutputStream out;
+    private final Digest digest;
+
+    private SizeLimitingOutputStream(CountingOutputStream out, Digest digest) {
+      this.out = out;
+      this.digest = digest;
+    }
+
+    @Override
+    public void write(int b) throws IOException {
+      checkSize(1);
+      out.write(b);
+    }
+
+    @Override
+    public void write(byte[] b, int off, int len) throws IOException {
+      checkSize(len);
+      out.write(b, off, len);
+    }
+
+    @Override
+    public void flush() throws IOException {
+      out.flush();
+    }
+
+    private void checkSize(int bytesToWrite) throws IOException {
+      if (bytesToWrite > digest.getSizeBytes() - out.getCount()) {
+        throw new IOException(
+            String.format(
+                "Received more bytes than expected for digest '%s/%d'. "
+                    + "Server may have ignored read_offset.",
+                digest.getHash(), digest.getSizeBytes()));
+      }
+    }
+  }
 
   private final CallCredentialsProvider callCredentialsProvider;
   private final ReferenceCountedChannel channel;
@@ -85,7 +132,12 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
   private final ByteStreamUploader uploader;
   private final int maxMissingBlobsDigestsPerMessage;
 
-  private AtomicBoolean closed = new AtomicBoolean();
+  private final AtomicBoolean closed = new AtomicBoolean();
+
+  @Override
+  public boolean shouldVerifyDownloads() {
+    return options.getRemoteVerifyDownloads();
+  }
 
   @VisibleForTesting
   public GrpcCacheClient(
@@ -94,19 +146,34 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
       RemoteOptions options,
       RemoteRetrier retrier,
       DigestUtil digestUtil) {
+    this(
+        channel,
+        callCredentialsProvider,
+        options,
+        retrier,
+        digestUtil,
+        new ByteStreamUploader(
+            options.getRemoteInstanceName(),
+            channel,
+            callCredentialsProvider,
+            retrier,
+            digestUtil.getDigestFunction()));
+  }
+
+  @VisibleForTesting
+  public GrpcCacheClient(
+      ReferenceCountedChannel channel,
+      CallCredentialsProvider callCredentialsProvider,
+      RemoteOptions options,
+      RemoteRetrier retrier,
+      DigestUtil digestUtil,
+      ByteStreamUploader uploader) {
     this.callCredentialsProvider = callCredentialsProvider;
     this.channel = channel;
     this.options = options;
     this.digestUtil = digestUtil;
     this.retrier = retrier;
-    this.uploader =
-        new ByteStreamUploader(
-            options.remoteInstanceName,
-            channel,
-            callCredentialsProvider,
-            options.remoteTimeout.getSeconds(),
-            retrier,
-            options.maximumOpenFiles);
+    this.uploader = uploader;
     maxMissingBlobsDigestsPerMessage = computeMaxMissingBlobsDigestsPerMessage();
     Preconditions.checkState(
         maxMissingBlobsDigestsPerMessage > 0, "Error: gRPC message size too small.");
@@ -115,7 +182,8 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
   private int computeMaxMissingBlobsDigestsPerMessage() {
     final int overhead =
         FindMissingBlobsRequest.newBuilder()
-            .setInstanceName(options.remoteInstanceName)
+            .setInstanceName(options.getRemoteInstanceName())
+            .setDigestFunction(digestUtil.getDigestFunction())
             .build()
             .getSerializedSize();
     final int tagSize =
@@ -126,7 +194,7 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
             - FindMissingBlobsRequest.getDefaultInstance().getSerializedSize();
     // We assume all non-empty digests have the same size. This is true for fixed-length hashes.
     final int digestSize = digestUtil.compute(new byte[] {1}).getSerializedSize() + tagSize;
-    return (options.maxOutboundMessageSize - overhead) / digestSize;
+    return (options.getMaxOutboundMessageSize() - overhead) / digestSize;
   }
 
   private ContentAddressableStorageFutureStub casFutureStub(
@@ -135,8 +203,7 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
         .withInterceptors(
             TracingMetadataUtils.attachMetadataInterceptor(context.getRequestMetadata()),
             new NetworkTimeInterceptor(context::getNetworkTime))
-        .withCallCredentials(callCredentialsProvider.getCallCredentials())
-        .withDeadlineAfter(options.remoteTimeout.getSeconds(), TimeUnit.SECONDS);
+        .withCallCredentials(callCredentialsProvider.getCallCredentials());
   }
 
   private ByteStreamStub bsAsyncStub(RemoteActionExecutionContext context, Channel channel) {
@@ -144,8 +211,7 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
         .withInterceptors(
             TracingMetadataUtils.attachMetadataInterceptor(context.getRequestMetadata()),
             new NetworkTimeInterceptor(context::getNetworkTime))
-        .withCallCredentials(callCredentialsProvider.getCallCredentials())
-        .withDeadlineAfter(options.remoteTimeout.getSeconds(), TimeUnit.SECONDS);
+        .withCallCredentials(callCredentialsProvider.getCallCredentials());
   }
 
   private ActionCacheFutureStub acFutureStub(
@@ -154,8 +220,92 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
         .withInterceptors(
             TracingMetadataUtils.attachMetadataInterceptor(context.getRequestMetadata()),
             new NetworkTimeInterceptor(context::getNetworkTime))
-        .withCallCredentials(callCredentialsProvider.getCallCredentials())
-        .withDeadlineAfter(options.remoteTimeout.getSeconds(), TimeUnit.SECONDS);
+        .withCallCredentials(callCredentialsProvider.getCallCredentials());
+  }
+
+  /**
+   * Registers a blob as the concatenation of previously uploaded chunks via the SpliceBlob RPC. All
+   * chunks must already be present in the CAS.
+   *
+   * @return a future that completes when the splice is acknowledged, or null if chunking is not
+   *     enabled
+   */
+  @Override
+  @Nullable
+  public ListenableFuture<Void> spliceBlob(
+      RemoteActionExecutionContext context,
+      Digest blobDigest,
+      List<Digest> chunkDigests,
+      ChunkingFunction.Value chunkingFunction) {
+    if (!options.getExperimentalRemoteCacheChunking()) {
+      return null;
+    }
+    SpliceBlobRequest request =
+        SpliceBlobRequest.newBuilder()
+            .setInstanceName(options.getRemoteInstanceName())
+            .setBlobDigest(blobDigest)
+            .addAllChunkDigests(chunkDigests)
+            .setDigestFunction(digestUtil.getDigestFunction())
+            .setChunkingFunction(chunkingFunction)
+            .build();
+    return Futures.catchingAsync(
+        Futures.transform(
+            Utils.refreshIfUnauthenticatedAsync(
+                () ->
+                    retrier.executeAsync(
+                        () ->
+                            channel.withChannelFuture(
+                                ch -> casFutureStub(context, ch).spliceBlob(request))),
+                callCredentialsProvider),
+            unused -> null,
+            directExecutor()),
+        StatusRuntimeException.class,
+        (e) -> Futures.immediateFailedFuture(new IOException(e)),
+        directExecutor());
+  }
+
+  /**
+   * Queries the server for chunk information about a blob using the SplitBlob RPC.
+   *
+   * <p>The returned future fails with a {@link BlobNotSplittableException} if the server does not
+   * implement the RPC or has no chunks for this blob.
+   *
+   * @return a future with the split blob response, or null if chunking is not enabled
+   */
+  @Nullable
+  public ListenableFuture<SplitBlobResponse> splitBlob(
+      RemoteActionExecutionContext context,
+      Digest digest,
+      ChunkingFunction.Value chunkingFunction) {
+    if (!options.getExperimentalRemoteCacheChunking()) {
+      return null;
+    }
+    SplitBlobRequest request =
+        SplitBlobRequest.newBuilder()
+            .setInstanceName(options.getRemoteInstanceName())
+            .setBlobDigest(digest)
+            .setDigestFunction(digestUtil.getDigestFunction())
+            .setChunkingFunction(chunkingFunction)
+            .build();
+    return Futures.catchingAsync(
+        Utils.refreshIfUnauthenticatedAsync(
+            () ->
+                retrier.executeAsync(
+                    () ->
+                        channel.withChannelFuture(
+                            ch -> casFutureStub(context, ch).splitBlob(request))),
+            callCredentialsProvider),
+        StatusRuntimeException.class,
+        (e) ->
+            switch (e.getStatus().getCode()) {
+              // NOT_FOUND: the server knows how to split blobs, but has no chunks for this one.
+              // UNIMPLEMENTED: the server advertised the parameters of a chunking function in its
+              // capabilities, but does not actually implement SplitBlob.
+              case NOT_FOUND, UNIMPLEMENTED ->
+                  Futures.immediateFailedFuture(new BlobNotSplittableException(digest));
+              default -> Futures.immediateFailedFuture(new IOException(e));
+            },
+        directExecutor());
   }
 
   @Override
@@ -166,14 +316,14 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
     channel.release();
   }
 
-  /** Returns true if 'options.remoteCache' uses 'grpc' or an empty scheme */
+  /** Returns true if 'options.getRemoteCache()' uses 'grpc' or an empty scheme */
   public static boolean isRemoteCacheOptions(RemoteOptions options) {
-    if (isNullOrEmpty(options.remoteCache)) {
+    if (isNullOrEmpty(options.getRemoteCache())) {
       return false;
     }
     // TODO(ishikhman): add proper URI validation/parsing for remote options
-    return !(Ascii.toLowerCase(options.remoteCache).startsWith("http://")
-        || Ascii.toLowerCase(options.remoteCache).startsWith("https://"));
+    return !(Ascii.toLowerCase(options.getRemoteCache()).startsWith("http://")
+        || Ascii.toLowerCase(options.getRemoteCache()).startsWith("https://"));
   }
 
   @Override
@@ -184,7 +334,9 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
     }
     // Need to potentially split the digests into multiple requests.
     FindMissingBlobsRequest.Builder requestBuilder =
-        FindMissingBlobsRequest.newBuilder().setInstanceName(options.remoteInstanceName);
+        FindMissingBlobsRequest.newBuilder()
+            .setInstanceName(options.getRemoteInstanceName())
+            .setDigestFunction(digestUtil.getDigestFunction());
     List<ListenableFuture<FindMissingBlobsResponse>> getMissingDigestCalls = new ArrayList<>();
     for (Digest digest : digests) {
       requestBuilder.addBlobDigests(digest);
@@ -238,12 +390,9 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
         callCredentialsProvider);
   }
 
-  private ListenableFuture<CachedActionResult> handleStatus(
-      ListenableFuture<ActionResult> download) {
-    ListenableFuture<CachedActionResult> cachedActionResult =
-        Futures.transform(download, CachedActionResult::remote, MoreExecutors.directExecutor());
+  private ListenableFuture<ActionResult> handleStatus(ListenableFuture<ActionResult> download) {
     return Futures.catchingAsync(
-        cachedActionResult,
+        download,
         StatusRuntimeException.class,
         (sre) ->
             sre.getStatus().getCode() == Code.NOT_FOUND
@@ -254,14 +403,34 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
   }
 
   @Override
-  public ListenableFuture<CachedActionResult> downloadActionResult(
-      RemoteActionExecutionContext context, ActionKey actionKey, boolean inlineOutErr) {
+  public ServerCapabilities getServerCapabilities() throws IOException {
+    return channel.getServerCapabilities();
+  }
+
+  @Override
+  public ListenableFuture<ServerCapabilities> serverCapabilities() {
+    return channel.serverCapabilities();
+  }
+
+  @Override
+  public ListenableFuture<String> getAuthority() {
+    return channel.withChannelFuture(ch -> Futures.immediateFuture(ch.authority()));
+  }
+
+  @Override
+  public ListenableFuture<ActionResult> downloadActionResult(
+      RemoteActionExecutionContext context,
+      ActionKey actionKey,
+      boolean inlineOutErr,
+      Set<String> inlineOutputFiles) {
     GetActionResultRequest request =
         GetActionResultRequest.newBuilder()
-            .setInstanceName(options.remoteInstanceName)
-            .setActionDigest(actionKey.getDigest())
+            .setInstanceName(options.getRemoteInstanceName())
+            .setDigestFunction(digestUtil.getDigestFunction())
+            .setActionDigest(actionKey.digest())
             .setInlineStderr(inlineOutErr)
             .setInlineStdout(inlineOutErr)
+            .addAllInlineOutputFiles(inlineOutputFiles)
             .build();
     return Utils.refreshIfUnauthenticatedAsync(
         () ->
@@ -287,8 +456,9 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
                                     acFutureStub(context, channel)
                                         .updateActionResult(
                                             UpdateActionResultRequest.newBuilder()
-                                                .setInstanceName(options.remoteInstanceName)
-                                                .setActionDigest(actionKey.getDigest())
+                                                .setInstanceName(options.getRemoteInstanceName())
+                                                .setDigestFunction(digestUtil.getDigestFunction())
+                                                .setActionDigest(actionKey.digest())
                                                 .setActionResult(actionResult)
                                                 .build())),
                             StatusRuntimeException.class,
@@ -303,28 +473,17 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
   public ListenableFuture<Void> downloadBlob(
       RemoteActionExecutionContext context, Digest digest, OutputStream out) {
     if (digest.getSizeBytes() == 0) {
-      return Futures.immediateFuture(null);
+      return Futures.immediateVoidFuture();
     }
 
     @Nullable Supplier<Digest> digestSupplier = null;
-    if (options.remoteVerifyDownloads) {
+    if (options.getRemoteVerifyDownloads()) {
       DigestOutputStream digestOut = digestUtil.newDigestOutputStream(out);
       digestSupplier = digestOut::digest;
       out = digestOut;
     }
 
-    CountingOutputStream outputStream;
-    if (options.cacheCompression) {
-      try {
-        outputStream = new ZstdDecompressingOutputStream(out);
-      } catch (IOException e) {
-        return Futures.immediateFailedFuture(e);
-      }
-    } else {
-      outputStream = new CountingOutputStream(out);
-    }
-
-    return downloadBlob(context, digest, outputStream, digestSupplier);
+    return downloadBlob(context, digest, new CountingOutputStream(out), digestSupplier);
   }
 
   private ListenableFuture<Void> downloadBlob(
@@ -332,7 +491,6 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
       Digest digest,
       CountingOutputStream out,
       @Nullable Supplier<Digest> digestSupplier) {
-    AtomicLong offset = new AtomicLong(0);
     ProgressiveBackoff progressiveBackoff = new ProgressiveBackoff(retrier::newBackoff);
     ListenableFuture<Long> downloadFuture =
         Utils.refreshIfUnauthenticatedAsync(
@@ -343,7 +501,6 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
                             channel ->
                                 requestRead(
                                     context,
-                                    offset,
                                     progressiveBackoff,
                                     digest,
                                     out,
@@ -359,43 +516,74 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
         MoreExecutors.directExecutor());
   }
 
-  public static String getResourceName(String instanceName, Digest digest, boolean compressed) {
+  public static String getResourceName(
+      String instanceName, Digest digest, boolean compressed, DigestFunction.Value digestFunction) {
     String resourceName = "";
     if (!instanceName.isEmpty()) {
       resourceName += instanceName + "/";
     }
     resourceName += compressed ? "compressed-blobs/zstd/" : "blobs/";
+    if (!isOldStyleDigestFunction(digestFunction)) {
+      resourceName += Ascii.toLowerCase(digestFunction.getValueDescriptor().getName()) + "/";
+    }
     return resourceName + DigestUtil.toString(digest);
   }
 
   private ListenableFuture<Long> requestRead(
       RemoteActionExecutionContext context,
-      AtomicLong offset,
       ProgressiveBackoff progressiveBackoff,
       Digest digest,
-      CountingOutputStream out,
+      CountingOutputStream rawOut,
       @Nullable Supplier<Digest> digestSupplier,
       Channel channel) {
+    boolean compressed = shouldCompress(digest);
     String resourceName =
-        getResourceName(options.remoteInstanceName, digest, options.cacheCompression);
+        getResourceName(
+            options.getRemoteInstanceName(), digest, compressed, digestUtil.getDigestFunction());
     SettableFuture<Long> future = SettableFuture.create();
+    // Prevent misbehaving servers from sending more bytes than expected.
+    SizeLimitingOutputStream sizeLimitedOut = new SizeLimitingOutputStream(rawOut, digest);
+    OutputStream out;
+    try {
+      out = compressed ? new ZstdDecompressingOutputStream(sizeLimitedOut) : sizeLimitedOut;
+    } catch (IOException e) {
+      return Futures.immediateFailedFuture(e);
+    }
     bsAsyncStub(context, channel)
         .read(
             ReadRequest.newBuilder()
                 .setResourceName(resourceName)
-                .setReadOffset(offset.get())
+                .setReadOffset(rawOut.getCount())
                 .build(),
-            new StreamObserver<ReadResponse>() {
+            new ClientResponseObserver<ReadRequest, ReadResponse>() {
+              private volatile ClientCallStreamObserver<ReadRequest> requestStream;
+
+              @Override
+              public void beforeStart(ClientCallStreamObserver<ReadRequest> requestStream) {
+                this.requestStream = requestStream;
+                future.addListener(
+                    () -> {
+                      if (future.isCancelled()) {
+                        requestStream.cancel("canceled by user", null);
+                      }
+                    },
+                    MoreExecutors.directExecutor());
+              }
 
               @Override
               public void onNext(ReadResponse readResponse) {
                 ByteString data = readResponse.getData();
                 try {
                   data.writeTo(out);
-                  offset.set(out.getBytesWritten());
                 } catch (IOException e) {
-                  // Cancel the call.
-                  throw new RuntimeException(e);
+                  // The output stream either refused to accept more bytes than expected for the
+                  // digest or was closed due to cancellation (e.g. dynamic execution choosing the
+                  // local branch).
+                  if (requestStream != null) {
+                    requestStream.cancel(e.getMessage(), e);
+                  }
+                  future.setException(e);
+                  return;
                 }
                 // reset the stall backoff because we've made progress or been kept alive
                 progressiveBackoff.reset();
@@ -403,14 +591,16 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
 
               @Override
               public void onError(Throwable t) {
-                if (offset.get() == digest.getSizeBytes()) {
-                  // If the file was fully downloaded, it doesn't matter if there was an error at
+                if (rawOut.getCount() == digest.getSizeBytes()) {
+                  // If the file was fully downloaded, it doesn't matter if there was an
+                  // error at
                   // the end of the stream.
                   logger.atInfo().withCause(t).log(
                       "ignoring error because file was fully received");
                   onCompleted();
                   return;
                 }
+                releaseOut();
                 Status status = Status.fromThrowable(t);
                 if (status.getCode() == Status.Code.NOT_FOUND) {
                   future.setException(new CacheNotFoundException(digest));
@@ -422,16 +612,34 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
               @Override
               public void onCompleted() {
                 try {
+                  try {
+                    out.flush();
+                  } finally {
+                    releaseOut();
+                  }
                   if (digestSupplier != null) {
                     Utils.verifyBlobContents(digest, digestSupplier.get());
+                  } else if (rawOut.getCount() != digest.getSizeBytes()) {
+                    // Verifying the digest would also catch an incomplete download; with
+                    // verification disabled, at least verify the size.
+                    throw new OutputDigestMismatchException(digest, rawOut.getCount());
                   }
-                  out.flush();
-                  future.set(offset.get());
                 } catch (IOException e) {
                   future.setException(e);
                 } catch (RuntimeException e) {
                   logger.atWarning().withCause(e).log("Unexpected exception");
                   future.setException(e);
+                }
+                future.set(rawOut.getCount());
+              }
+
+              private void releaseOut() {
+                if (out instanceof ZstdDecompressingOutputStream) {
+                  try {
+                    ((ZstdDecompressingOutputStream) out).closeShallow();
+                  } catch (IOException e) {
+                    logger.atWarning().withCause(e).log("failed to cleanly close output stream");
+                  }
                 }
               }
             });
@@ -439,26 +647,63 @@ public class GrpcCacheClient implements RemoteCacheClient, MissingDigestsFinder 
   }
 
   @Override
-  public ListenableFuture<Void> uploadFile(
-      RemoteActionExecutionContext context, Digest digest, Path path) {
-    return uploader.uploadBlobAsync(
-        context,
-        digest,
-        Chunker.builder()
-            .setInput(digest.getSizeBytes(), path)
-            .setCompressed(options.cacheCompression)
-            .build());
+  public ListenableFuture<Void> uploadBlobImpl(
+      RemoteActionExecutionContext context, Digest digest, Blob blob) {
+    return Futures.catchingAsync(
+        uploadChunker(
+            context,
+            digest,
+            Chunker.builder()
+                .setInput(digest.getSizeBytes(), blob)
+                .setCompressed(shouldCompress(digest))
+                .build()),
+        IOException.class,
+        e -> {
+          var cause = e.getCause();
+          if (!(cause instanceof StatusRuntimeException sre)) {
+            return Futures.immediateFailedFuture(e);
+          }
+          var code = sre.getStatus().getCode();
+          String blobDescription = blob.description();
+          // INVALID_ARGUMENT is returned in case of a digest mismatch, which can hint at concurrent
+          // modifications to the blob's source. Print it to help the user debug such issues.
+          // https://github.com/bazelbuild/bazel/blob/ec36eacc31678ecf4b5c25f9ab7ab166330aff28/third_party/remoteapis/build/bazel/remote/execution/v2/remote_execution.proto#L283-L286
+          if (code == Code.INVALID_ARGUMENT && blobDescription != null) {
+            return Futures.immediateFailedFuture(
+                new IOException(
+                    "while uploading %s: %s".formatted(blobDescription, e.getMessage()), e));
+          }
+          return Futures.immediateFailedFuture(e);
+        },
+        MoreExecutors.directExecutor());
   }
 
-  @Override
-  public ListenableFuture<Void> uploadBlob(
-      RemoteActionExecutionContext context, Digest digest, ByteString data) {
-    return uploader.uploadBlobAsync(
-        context,
-        digest,
-        Chunker.builder()
-            .setInput(data.toByteArray())
-            .setCompressed(options.cacheCompression)
-            .build());
+  ListenableFuture<Void> uploadChunker(
+      RemoteActionExecutionContext context, Digest digest, Chunker chunker) {
+    ListenableFuture<Void> f = uploader.uploadBlobAsync(context, digest, chunker);
+    f.addListener(
+        () -> {
+          try {
+            chunker.close();
+          } catch (IOException e) {
+            logger.atWarning().withCause(e).log(
+                "failed to close chunker uploading %s/%d", digest.getHash(), digest.getSizeBytes());
+          }
+        },
+        MoreExecutors.directExecutor());
+    return f;
+  }
+
+  Retrier getRetrier() {
+    return this.retrier;
+  }
+
+  private boolean shouldCompress(Digest digest) {
+    return options.getCacheCompression()
+        && digest.getSizeBytes() >= options.getCacheCompressionThreshold();
+  }
+
+  public ReferenceCountedChannel getChannel() {
+    return channel;
   }
 }

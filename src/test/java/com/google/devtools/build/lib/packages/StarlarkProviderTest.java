@@ -15,24 +15,39 @@
 package com.google.devtools.build.lib.packages;
 
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.devtools.build.lib.collect.nestedset.Order.STABLE_ORDER;
+import static com.google.devtools.build.lib.skyframe.BzlLoadValue.keyForBuild;
 import static org.junit.Assert.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.when;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.testing.EqualsTester;
 import com.google.devtools.build.lib.cmdline.Label;
+import com.google.devtools.build.lib.collect.nestedset.Depset;
+import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
+import java.util.Optional;
 import net.starlark.java.eval.Dict;
 import net.starlark.java.eval.EvalException;
 import net.starlark.java.eval.Mutability;
 import net.starlark.java.eval.Starlark;
 import net.starlark.java.eval.StarlarkCallable;
 import net.starlark.java.eval.StarlarkInt;
+import net.starlark.java.eval.StarlarkList;
 import net.starlark.java.eval.StarlarkSemantics;
 import net.starlark.java.eval.StarlarkThread;
+import net.starlark.java.eval.SymbolGenerator;
 import net.starlark.java.eval.Tuple;
 import net.starlark.java.syntax.Location;
+import net.starlark.java.syntax.StarlarkType;
+import net.starlark.java.syntax.Types;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
@@ -40,10 +55,12 @@ import org.junit.runners.JUnit4;
 /** Tests for {@link StarlarkProvider}. */
 @RunWith(JUnit4.class)
 public final class StarlarkProviderTest {
+  private final SymbolGenerator<?> generator = SymbolGenerator.create("test");
 
   @Test
   public void unexportedProvider_accessors() {
-    StarlarkProvider provider = StarlarkProvider.builder(Location.BUILTIN).build();
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN).buildWithIdentityToken(generator.generate());
     assertThat(provider.isExported()).isFalse();
     assertThat(provider.getName()).isEqualTo("<no name>");
     assertThat(provider.getPrintableName()).isEqualTo("<no name>");
@@ -51,15 +68,15 @@ public final class StarlarkProviderTest {
     assertThat(provider.getErrorMessageForUnknownField("foo"))
         .isEqualTo("'struct' value has no field or method 'foo'");
     assertThat(provider.isImmutable()).isFalse();
-    assertThat(Starlark.repr(provider)).isEqualTo("<provider>");
+    assertThat(Starlark.repr(provider, StarlarkSemantics.DEFAULT)).isEqualTo("<provider>");
     assertThrows(IllegalStateException.class, provider::getKey);
   }
 
   @Test
   public void exportedProvider_accessors() throws Exception {
     StarlarkProvider.Key key =
-        new StarlarkProvider.Key(Label.parseAbsolute("//foo:bar.bzl", ImmutableMap.of()), "prov");
-    StarlarkProvider provider = StarlarkProvider.builder(Location.BUILTIN).setExported(key).build();
+        new StarlarkProvider.Key(keyForBuild(Label.parseCanonical("//foo:bar.bzl")), "prov");
+    StarlarkProvider provider = StarlarkProvider.builder(Location.BUILTIN).buildExported(key);
     assertThat(provider.isExported()).isTrue();
     assertThat(provider.getName()).isEqualTo("prov");
     assertThat(provider.getPrintableName()).isEqualTo("prov");
@@ -67,13 +84,14 @@ public final class StarlarkProviderTest {
     assertThat(provider.getErrorMessageForUnknownField("foo"))
         .isEqualTo("'prov' value has no field or method 'foo'");
     assertThat(provider.isImmutable()).isTrue();
-    assertThat(Starlark.repr(provider)).isEqualTo("<provider>");
+    assertThat(Starlark.repr(provider, StarlarkSemantics.DEFAULT)).isEqualTo("<provider>");
     assertThat(provider.getKey()).isEqualTo(key);
   }
 
   @Test
   public void basicInstantiation() throws Exception {
-    StarlarkProvider provider = StarlarkProvider.builder(Location.BUILTIN).build();
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN).buildWithIdentityToken(generator.generate());
     StarlarkInfo infoFromNormalConstructor = instantiateWithA1B2C3(provider);
     assertHasExactlyValuesA1B2C3(infoFromNormalConstructor);
     assertThat(infoFromNormalConstructor.getProvider()).isEqualTo(provider);
@@ -87,7 +105,10 @@ public final class StarlarkProviderTest {
 
   @Test
   public void instantiationWithInit() throws Exception {
-    StarlarkProvider provider = StarlarkProvider.builder(Location.BUILTIN).setInit(initBC).build();
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setInit(initBC)
+            .buildWithIdentityToken(generator.generate());
     StarlarkInfo infoFromNormalConstructor = instantiateWithA1(provider);
     assertHasExactlyValuesA1B2C3(infoFromNormalConstructor);
     assertThat(infoFromNormalConstructor.getProvider()).isEqualTo(provider);
@@ -95,7 +116,10 @@ public final class StarlarkProviderTest {
 
   @Test
   public void instantiationWithInitSignatureMismatch_fails() throws Exception {
-    StarlarkProvider provider = StarlarkProvider.builder(Location.BUILTIN).setInit(initBC).build();
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setInit(initBC)
+            .buildWithIdentityToken(generator.generate());
     EvalException e = assertThrows(EvalException.class, () -> instantiateWithA1B2C3(provider));
     assertThat(e).hasMessageThat().contains("expected a single `a` argument");
   }
@@ -118,10 +142,17 @@ public final class StarlarkProviderTest {
           public Location getLocation() {
             return Location.BUILTIN;
           }
+
+          @Override
+          public StarlarkType getStarlarkType(StarlarkSemantics semantics) {
+            return Types.ANY_CALLABLE;
+          }
         };
 
     StarlarkProvider provider =
-        StarlarkProvider.builder(Location.BUILTIN).setInit(initWithInvalidReturnType).build();
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setInit(initWithInvalidReturnType)
+            .buildWithIdentityToken(generator.generate());
     EvalException e = assertThrows(EvalException.class, () -> instantiateWithA1B2C3(provider));
     assertThat(e)
         .hasMessageThat()
@@ -147,10 +178,17 @@ public final class StarlarkProviderTest {
           public Location getLocation() {
             return Location.BUILTIN;
           }
+
+          @Override
+          public StarlarkType getStarlarkType(StarlarkSemantics semantics) {
+            return Types.ANY_CALLABLE;
+          }
         };
 
     StarlarkProvider provider =
-        StarlarkProvider.builder(Location.BUILTIN).setInit(failingInit).build();
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setInit(failingInit)
+            .buildWithIdentityToken(generator.generate());
     EvalException e = assertThrows(EvalException.class, () -> instantiateWithA1B2C3(provider));
     assertThat(e).hasMessageThat().contains("failingInit fails");
   }
@@ -158,11 +196,16 @@ public final class StarlarkProviderTest {
   @Test
   public void rawConstructorBypassesInit() throws Exception {
     StarlarkCallable init = mock(StarlarkCallable.class, "init");
-    StarlarkProvider provider = StarlarkProvider.builder(Location.BUILTIN).setInit(init).build();
+    when(init.getCallableType(any(), any())).thenReturn(Types.ANY_CALLABLE);
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setInit(init)
+            .buildWithIdentityToken(generator.generate());
+    verify(init).getCallableType(any(), any());
     StarlarkInfo infoFromRawConstructor = instantiateWithA1B2C3(provider.createRawConstructor());
     assertHasExactlyValuesA1B2C3(infoFromRawConstructor);
     assertThat(infoFromRawConstructor.getProvider()).isEqualTo(provider);
-    verifyNoInteractions(init);
+    verifyNoMoreInteractions(init);
   }
 
   @Test
@@ -170,7 +213,7 @@ public final class StarlarkProviderTest {
     StarlarkProvider provider =
         StarlarkProvider.builder(Location.BUILTIN)
             .setSchema(ImmutableList.of("a", "b", "c"))
-            .build();
+            .buildWithIdentityToken(generator.generate());
     StarlarkInfo infoFromNormalConstructor = instantiateWithA1(provider);
     assertHasExactlyValuesA1(infoFromNormalConstructor);
     StarlarkInfo infoFromRawConstructor = instantiateWithA1(provider.createRawConstructor());
@@ -182,7 +225,7 @@ public final class StarlarkProviderTest {
     StarlarkProvider provider =
         StarlarkProvider.builder(Location.BUILTIN)
             .setSchema(ImmutableList.of("a", "b", "c"))
-            .build();
+            .buildWithIdentityToken(generator.generate());
     StarlarkInfo infoFromNormalConstructor = instantiateWithA1B2C3(provider);
     assertHasExactlyValuesA1B2C3(infoFromNormalConstructor);
     StarlarkInfo infoFromRawConstructor = instantiateWithA1B2C3(provider.createRawConstructor());
@@ -190,9 +233,49 @@ public final class StarlarkProviderTest {
   }
 
   @Test
+  public void basicInstantiationWithDocumentedSchema() throws Exception {
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setSchema(ImmutableMap.of("a", "Parameter a", "b", "Parameter b", "c", "Parameter c"))
+            .buildWithIdentityToken(generator.generate());
+    StarlarkInfo infoFromNormalConstructor = instantiateWithA1(provider);
+    assertHasExactlyValuesA1(infoFromNormalConstructor);
+    StarlarkInfo infoFromRawConstructor = instantiateWithA1B2C3(provider.createRawConstructor());
+    assertHasExactlyValuesA1B2C3(infoFromRawConstructor);
+  }
+
+  @Test
+  public void hasInstance() throws Exception {
+    StarlarkProvider provider1 =
+        StarlarkProvider.builder(Location.BUILTIN).buildWithIdentityToken(generator.generate());
+    StarlarkInfo info1 = instantiateWithA1B2C3(provider1);
+    StarlarkProvider provider2 =
+        StarlarkProvider.builder(Location.BUILTIN).buildWithIdentityToken(generator.generate());
+    StarlarkInfo info2 = instantiateWithA1B2C3(provider2);
+    assertThat(provider1.hasInstance(info1)).isTrue();
+    assertThat(provider1.hasInstance(info2)).isFalse();
+    assertThat(provider2.hasInstance(info1)).isFalse();
+    assertThat(provider2.hasInstance(info2)).isTrue();
+  }
+
+  @Test
   public void schemaDisallowsUnexpectedFields() throws Exception {
     StarlarkProvider provider =
-        StarlarkProvider.builder(Location.BUILTIN).setSchema(ImmutableList.of("a", "b")).build();
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setSchema(ImmutableList.of("a", "b"))
+            .buildWithIdentityToken(generator.generate());
+    EvalException e = assertThrows(EvalException.class, () -> instantiateWithA1B2C3(provider));
+    assertThat(e)
+        .hasMessageThat()
+        .contains("got unexpected field 'c' in call to instantiate provider");
+  }
+
+  @Test
+  public void documentedSchemaDisallowsUnexpectedFields() throws Exception {
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setSchema(ImmutableMap.of("a", "Parameter a", "b", "Parameter b"))
+            .buildWithIdentityToken(generator.generate());
     EvalException e = assertThrows(EvalException.class, () -> instantiateWithA1B2C3(provider));
     assertThat(e)
         .hasMessageThat()
@@ -202,7 +285,9 @@ public final class StarlarkProviderTest {
   @Test
   public void schemaEnforcedOnRawConstructor() throws Exception {
     StarlarkProvider provider =
-        StarlarkProvider.builder(Location.BUILTIN).setSchema(ImmutableList.of("a", "b")).build();
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setSchema(ImmutableList.of("a", "b"))
+            .buildWithIdentityToken(generator.generate());
     EvalException e =
         assertThrows(
             EvalException.class, () -> instantiateWithA1B2C3(provider.createRawConstructor()));
@@ -217,7 +302,7 @@ public final class StarlarkProviderTest {
         StarlarkProvider.builder(Location.BUILTIN)
             .setSchema(ImmutableList.of("a", "b"))
             .setInit(initBC)
-            .build();
+            .buildWithIdentityToken(generator.generate());
     EvalException e = assertThrows(EvalException.class, () -> instantiateWithA1(provider));
     assertThat(e)
         .hasMessageThat()
@@ -225,45 +310,368 @@ public final class StarlarkProviderTest {
   }
 
   @Test
+  public void documentedProvider_getDocumentation() throws Exception {
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setDocumentation("My doc string")
+            .buildWithIdentityToken(generator.generate());
+    assertThat(provider.getDocumentation()).hasValue("My doc string");
+  }
+
+  @Test
+  public void undocumentedProvider_getDocumentation() throws Exception {
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN).buildWithIdentityToken(generator.generate());
+    assertThat(provider.getDocumentation()).isEmpty();
+  }
+
+  @Test
   public void schemalessProvider_getFields() throws Exception {
-    StarlarkProvider provider = StarlarkProvider.builder(Location.BUILTIN).build();
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN).buildWithIdentityToken(generator.generate());
     assertThat(provider.getFields()).isNull();
   }
 
   @Test
-  public void schemafulProvider_getFields() throws Exception {
+  public void schemalessProvider_getSchema() throws Exception {
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN).buildWithIdentityToken(generator.generate());
+    assertThat(provider.getSchema()).isNull();
+  }
+
+  @Test
+  public void providerWithUndocumentedSchema_getFields() throws Exception {
     StarlarkProvider provider =
         StarlarkProvider.builder(Location.BUILTIN)
-            .setSchema(ImmutableList.of("a", "b", "c"))
-            .build();
-    assertThat(provider.getFields()).containsExactly("a", "b", "c").inOrder();
+            // Note fields in setSchema() call below are not alphabetized to simulate
+            // non-alphabetized field order in a provider declaration in Starlark code.
+            .setSchema(ImmutableList.of("c", "a", "b"))
+            .buildWithIdentityToken(generator.generate());
+    assertThat(provider.getFields().keySet()).containsExactly("a", "b", "c").inOrder();
+  }
+
+  @Test
+  public void providerWithUndocumentedSchema_getSchema() throws Exception {
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            // Note fields in setSchema() call below are not alphabetized to simulate
+            // non-alphabetized field order in a provider declaration in Starlark code.
+            .setSchema(ImmutableList.of("c", "a", "b"))
+            .buildWithIdentityToken(generator.generate());
+    assertThat(provider.getSchema())
+        .containsExactly("c", Optional.empty(), "a", Optional.empty(), "b", Optional.empty())
+        .inOrder();
+  }
+
+  @Test
+  public void providerWithDocumentedSchema_getFields() throws Exception {
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            // Note fields in setSchema() call below are not alphabetized to simulate
+            // non-alphabetized field order in a provider declaration in Starlark code.
+            .setSchema(ImmutableMap.of("c", "Parameter c", "a", "Parameter a", "b", "Parameter b"))
+            .buildWithIdentityToken(generator.generate());
+    assertThat(provider.getFields().keySet()).containsExactly("a", "b", "c").inOrder();
+  }
+
+  @Test
+  public void providerWithDocumentedSchema_getSchema() throws Exception {
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            // Note fields in setSchema() call below are not alphabetized to simulate
+            // non-alphabetized field order in a provider declaration in Starlark code.
+            .setSchema(ImmutableMap.of("c", "Parameter c", "a", "Parameter a", "b", "Parameter b"))
+            .buildWithIdentityToken(generator.generate());
+    assertThat(provider.getSchema())
+        .containsExactly(
+            "c",
+            Optional.of("Parameter c"),
+            "a",
+            Optional.of("Parameter a"),
+            "b",
+            Optional.of("Parameter b"))
+        .inOrder();
+  }
+
+  /**
+   * Tests the safe storage and retrieval of depsets, which may be optimized to nested sets in the
+   * internal representation.
+   */
+  @Test
+  public void schemafulProvider_withDepset() throws Exception {
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setSchema(ImmutableList.of("field"))
+            .buildWithIdentityToken(generator.generate());
+    StarlarkInfo instance1;
+    StarlarkInfo instance2;
+    StarlarkInfo instance3;
+    StarlarkInfo instance4;
+    StarlarkInfo instance5;
+    StarlarkInfo instance6;
+    try (Mutability mu = Mutability.create()) {
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
+      // Instantiates provider with values of different types all in the same field.
+      // Instance with an empty depset of string
+      instance1 =
+          (StarlarkInfo)
+              Starlark.call(
+                  thread,
+                  provider,
+                  /* args= */ ImmutableList.of(),
+                  /* kwargs= */ ImmutableMap.of(
+                      "field", Depset.of(String.class, NestedSetBuilder.emptySet(STABLE_ORDER))));
+      // Instance with a non-empty depset of string
+      instance2 =
+          (StarlarkInfo)
+              Starlark.call(
+                  thread,
+                  provider,
+                  /* args= */ ImmutableList.of(),
+                  /* kwargs= */ ImmutableMap.of(
+                      "field",
+                      Depset.of(String.class, NestedSetBuilder.create(STABLE_ORDER, "foo"))));
+      // Instance with a non-empty depset of int
+      instance3 =
+          (StarlarkInfo)
+              Starlark.call(
+                  thread,
+                  provider,
+                  /* args= */ ImmutableList.of(),
+                  /* kwargs= */ ImmutableMap.of(
+                      "field",
+                      Depset.of(
+                          StarlarkInt.class,
+                          NestedSetBuilder.create(STABLE_ORDER, StarlarkInt.of(1)))));
+      // Instance with a string (not a depset)
+      instance4 =
+          (StarlarkInfo)
+              Starlark.call(
+                  thread,
+                  provider,
+                  /* args= */ ImmutableList.of(),
+                  /* kwargs= */ ImmutableMap.of("field", "foo"));
+      // Instance with a None
+      instance5 =
+          (StarlarkInfo)
+              Starlark.call(
+                  thread,
+                  provider,
+                  /* args= */ ImmutableList.of(),
+                  /* kwargs= */ ImmutableMap.of("field", Starlark.NONE));
+      // Instance with the field not set
+      instance6 =
+          (StarlarkInfo)
+              Starlark.call(
+                  thread,
+                  provider,
+                  /* args= */ ImmutableList.of(),
+                  /* kwargs= */ ImmutableMap.of());
+    }
+
+    assertThat(instance1.getValue("field")).isInstanceOf(Depset.class);
+    assertThat(((Depset) instance1.getValue("field")).isEmpty()).isTrue();
+    assertThat(instance2.getValue("field")).isInstanceOf(Depset.class);
+    assertThat(((Depset) instance2.getValue("field")).getElementClass()).isEqualTo(String.class);
+    assertThat(((Depset) instance2.getValue("field")).toList()).containsExactly("foo");
+    assertThat(instance3.getValue("field")).isInstanceOf(Depset.class);
+    assertThat(((Depset) instance3.getValue("field")).getElementClass())
+        .isEqualTo(StarlarkInt.class);
+    assertThat(((Depset) instance3.getValue("field")).toList()).containsExactly(StarlarkInt.of(1));
+    assertThat(instance4.getValue("field")).isEqualTo("foo");
+    assertThat(instance5.getValue("field")).isEqualTo(Starlark.NONE);
+    assertThat(instance6.getValue("field")).isNull();
+  }
+
+  @Test
+  public void schemafulProvider_maybeUnwrapDepset() {
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setSchema(ImmutableList.of("field"))
+            .buildWithIdentityToken(generator.generate());
+
+    // The first set is unwrapped and the type String is registered in the predictor.
+    Depset depset1 = Depset.of(String.class, NestedSetBuilder.create(STABLE_ORDER, "a", "b", "c"));
+    assertThat(provider.maybeUnwrapDepset(0, depset1)).isSameInstanceAs(depset1.getSet());
+
+    // A set with Integer type does not match and cannot be optimized.
+    Depset depset2 =
+        Depset.of(
+            StarlarkInt.class,
+            NestedSetBuilder.create(STABLE_ORDER, StarlarkInt.of(1), StarlarkInt.of(2)));
+    assertThat(provider.maybeUnwrapDepset(0, depset2)).isSameInstanceAs(depset2);
+
+    // A third, matching Depset is unwrapped.
+    Depset depset3 = Depset.of(String.class, NestedSetBuilder.create(STABLE_ORDER, "d", "e"));
+    assertThat(provider.maybeUnwrapDepset(0, depset3)).isSameInstanceAs(depset3.getSet());
+  }
+
+  @Test
+  public void schemafulProvider_mutable() throws Exception {
+    StarlarkProvider.Key key =
+        new StarlarkProvider.Key(keyForBuild(Label.parseCanonical("//foo:bar.bzl")), "prov");
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setSchema(ImmutableList.of("a"))
+            .buildExported(key);
+    StarlarkInfo instance;
+    try (Mutability mu = Mutability.create()) {
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
+      instance =
+          (StarlarkInfo)
+              Starlark.call(
+                  thread,
+                  provider,
+                  /* args= */ ImmutableList.of(),
+                  /* kwargs= */ ImmutableMap.of("a", StarlarkList.of(mu, "x")));
+      @SuppressWarnings("unchecked")
+      StarlarkList<String> list = (StarlarkList<String>) instance.getValue("a");
+
+      list.addElement("y"); // verifies the fields of the provider instance are mutable
+      assertThat(instance.isImmutable()).isFalse();
+    }
+
+    @SuppressWarnings("unchecked")
+    StarlarkList<String> list = (StarlarkList<String>) instance.getValue("a");
+    assertThat((Iterable<?>) list).containsExactly("x", "y");
+  }
+
+  @Test
+  public void schemafulProvider_immutable() throws Exception {
+    StarlarkProvider.Key key =
+        new StarlarkProvider.Key(keyForBuild(Label.parseCanonical("//foo:bar.bzl")), "prov");
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setSchema(ImmutableList.of("a"))
+            .buildExported(key);
+    StarlarkInfo instance;
+    try (Mutability mu = Mutability.create()) {
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
+      instance =
+          (StarlarkInfo)
+              Starlark.call(
+                  thread,
+                  provider,
+                  /* args= */ ImmutableList.of(),
+                  /* kwargs= */ ImmutableMap.of("a", StarlarkList.of(mu, "x")));
+    }
+
+    assertThat(instance.isImmutable()).isTrue();
+    @SuppressWarnings("unchecked")
+    StarlarkList<String> list = (StarlarkList<String>) instance.getValue("a");
+    assertThat((Iterable<?>) list).containsExactly("x");
+    // verifies the fields of the frozen provider instance are immutable
+    EvalException e = assertThrows(EvalException.class, () -> list.addElement("y"));
+    assertThat(e).hasMessageThat().contains("trying to mutate a frozen list value");
+  }
+
+  @Test
+  public void schemafulProviderWithDepset_isImmutable() throws Exception {
+    StarlarkProvider.Key key =
+        new StarlarkProvider.Key(keyForBuild(Label.parseCanonical("//foo:bar.bzl")), "prov");
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setSchema(ImmutableList.of("a"))
+            .buildExported(key);
+    StarlarkInfo instance;
+    try (Mutability mu = Mutability.create()) {
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
+      instance =
+          (StarlarkInfo)
+              Starlark.call(
+                  thread,
+                  provider,
+                  /* args= */ ImmutableList.of(),
+                  /* kwargs= */ ImmutableMap.of(
+                      "a", Depset.of(String.class, NestedSetBuilder.create(STABLE_ORDER, "foo"))));
+
+      assertThat(instance.isImmutable()).isTrue();
+    }
+  }
+
+  @Test
+  public void schemafulProviderWithDepset_becomesImmutable() throws Exception {
+    StarlarkProvider.Key key =
+        new StarlarkProvider.Key(keyForBuild(Label.parseCanonical("//foo:bar.bzl")), "prov");
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setSchema(ImmutableList.of("a", "b"))
+            .buildExported(key);
+    StarlarkInfo instance;
+    try (Mutability mu = Mutability.create()) {
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
+      instance =
+          (StarlarkInfo)
+              Starlark.call(
+                  thread,
+                  provider,
+                  /* args= */ ImmutableList.of(),
+                  /* kwargs= */ ImmutableMap.of(
+                      "a",
+                      Depset.of(String.class, NestedSetBuilder.create(STABLE_ORDER, "foo")),
+                      "b",
+                      StarlarkList.of(mu, "x")));
+
+      assertThat(instance.isImmutable()).isFalse();
+    }
+
+    assertThat(instance.isImmutable()).isTrue();
+  }
+
+  @Test
+  public void schemafulProvider_optimisedImmutable() throws Exception {
+    StarlarkProvider.Key key =
+        new StarlarkProvider.Key(keyForBuild(Label.parseCanonical("//foo:bar.bzl")), "prov");
+    StarlarkProvider provider =
+        StarlarkProvider.builder(Location.BUILTIN)
+            .setSchema(ImmutableList.of("a"))
+            .buildExported(key);
+    StarlarkInfo instance;
+    try (Mutability mu = Mutability.create()) {
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
+      instance =
+          (StarlarkInfo)
+              Starlark.call(
+                  thread,
+                  provider,
+                  /* args= */ ImmutableList.of(),
+                  /* kwargs= */ ImmutableMap.of("a", StarlarkList.of(mu, "x")));
+    }
+    instance = instance.unsafeOptimizeMemoryLayout();
+
+    assertThat(instance.isImmutable()).isTrue();
+    @SuppressWarnings("unchecked")
+    StarlarkList<String> list = (StarlarkList<String>) instance.getValue("a");
+    assertThat((Iterable<?>) list).containsExactly("x");
+
+    // verifies the fields of the frozen and optimised provider instance are immutable
+    EvalException e = assertThrows(EvalException.class, () -> list.addElement("y"));
+    assertThat(e).hasMessageThat().contains("trying to mutate a frozen list value");
   }
 
   @Test
   public void providerEquals() throws Exception {
     // All permutations of differing label and differing name.
     StarlarkProvider.Key keyFooA =
-        new StarlarkProvider.Key(Label.parseAbsolute("//foo.bzl", ImmutableMap.of()), "provA");
+        new StarlarkProvider.Key(keyForBuild(Label.parseCanonical("//foo.bzl")), "provA");
     StarlarkProvider.Key keyFooB =
-        new StarlarkProvider.Key(Label.parseAbsolute("//foo.bzl", ImmutableMap.of()), "provB");
+        new StarlarkProvider.Key(keyForBuild(Label.parseCanonical("//foo.bzl")), "provB");
     StarlarkProvider.Key keyBarA =
-        new StarlarkProvider.Key(Label.parseAbsolute("//bar.bzl", ImmutableMap.of()), "provA");
+        new StarlarkProvider.Key(keyForBuild(Label.parseCanonical("//bar.bzl")), "provA");
     StarlarkProvider.Key keyBarB =
-        new StarlarkProvider.Key(Label.parseAbsolute("//bar.bzl", ImmutableMap.of()), "provB");
+        new StarlarkProvider.Key(keyForBuild(Label.parseCanonical("//bar.bzl")), "provB");
 
     // 1 for each key, plus a duplicate for one of the keys, plus 2 that have no key.
-    StarlarkProvider provFooA1 =
-        StarlarkProvider.builder(Location.BUILTIN).setExported(keyFooA).build();
-    StarlarkProvider provFooA2 =
-        StarlarkProvider.builder(Location.BUILTIN).setExported(keyFooA).build();
-    StarlarkProvider provFooB =
-        StarlarkProvider.builder(Location.BUILTIN).setExported(keyFooB).build();
-    StarlarkProvider provBarA =
-        StarlarkProvider.builder(Location.BUILTIN).setExported(keyBarA).build();
-    StarlarkProvider provBarB =
-        StarlarkProvider.builder(Location.BUILTIN).setExported(keyBarB).build();
-    StarlarkProvider provUnexported1 = StarlarkProvider.builder(Location.BUILTIN).build();
-    StarlarkProvider provUnexported2 = StarlarkProvider.builder(Location.BUILTIN).build();
+    StarlarkProvider provFooA1 = StarlarkProvider.builder(Location.BUILTIN).buildExported(keyFooA);
+    StarlarkProvider provFooA2 = StarlarkProvider.builder(Location.BUILTIN).buildExported(keyFooA);
+    StarlarkProvider provFooB = StarlarkProvider.builder(Location.BUILTIN).buildExported(keyFooB);
+    StarlarkProvider provBarA = StarlarkProvider.builder(Location.BUILTIN).buildExported(keyBarA);
+    StarlarkProvider provBarB = StarlarkProvider.builder(Location.BUILTIN).buildExported(keyBarB);
+    SymbolGenerator<?> generator = SymbolGenerator.create("test");
+    StarlarkProvider provUnexported1 =
+        StarlarkProvider.builder(Location.BUILTIN).buildWithIdentityToken(generator.generate());
+    StarlarkProvider provUnexported2 =
+        StarlarkProvider.builder(Location.BUILTIN).buildWithIdentityToken(generator.generate());
 
     // For exported providers, different keys -> unequal, same key -> equal. For unexported
     // providers it comes down to object identity.
@@ -275,6 +683,36 @@ public final class StarlarkProviderTest {
         .addEqualityGroup(provUnexported1, provUnexported1) // reflexive equality (unexported)
         .addEqualityGroup(provUnexported2)
         .testEquals();
+  }
+
+  @Test
+  public void providerKeyEqualsAndHashCode() throws Exception {
+    StarlarkProvider.Key keyFooA1 =
+        new StarlarkProvider.Key(keyForBuild(Label.parseCanonical("//foo.bzl")), "provA");
+    StarlarkProvider.Key keyFooA2 =
+        new StarlarkProvider.Key(keyForBuild(Label.parseCanonical("//foo.bzl")), "provA");
+    StarlarkProvider.Key keyFooB =
+        new StarlarkProvider.Key(keyForBuild(Label.parseCanonical("//foo.bzl")), "provB");
+    StarlarkProvider.Key keyBarA =
+        new StarlarkProvider.Key(keyForBuild(Label.parseCanonical("//bar.bzl")), "provA");
+
+    // Simulate DynamicCodec deserialization where transient hashCode is initialized to 0.
+    StarlarkProvider.Key keyFooADeserialized =
+        new StarlarkProvider.Key(keyForBuild(Label.parseCanonical("//foo.bzl")), "provA");
+    Field hashCodeField = StarlarkProvider.Key.class.getDeclaredField("hashCode");
+    hashCodeField.setAccessible(true);
+    assertThat(Modifier.isTransient(hashCodeField.getModifiers())).isTrue();
+    hashCodeField.setInt(keyFooADeserialized, 0);
+
+    new EqualsTester()
+        .addEqualityGroup(keyFooA1, keyFooA2, keyFooADeserialized)
+        .addEqualityGroup(keyFooB)
+        .addEqualityGroup(keyBarA)
+        .testEquals();
+
+    StarlarkProvider exported = StarlarkProvider.builder(Location.BUILTIN).buildExported(keyFooA1);
+    assertThat(exported.hashCode()).isEqualTo(keyFooA1.hashCode());
+    assertThat(keyFooADeserialized.hashCode()).isEqualTo(keyFooA1.hashCode());
   }
 
   /** Custom init equivalent to `def initBC(a): return {a:a, b:a*2, c:a*3}` */
@@ -306,12 +744,25 @@ public final class StarlarkProviderTest {
         public Location getLocation() {
           return Location.BUILTIN;
         }
+
+        @Override
+        public StarlarkType getStarlarkType(StarlarkSemantics semantics) {
+          return Types.generalCallable(
+              ImmutableList.of("a"),
+              ImmutableList.of(Types.ANY),
+              0,
+              1,
+              ImmutableSet.of("a"),
+              null,
+              null,
+              Types.dict(Types.STR, Types.ANY));
+        }
       };
 
   /** Instantiates a {@link StarlarkInfo} with fields a=1 (and nothing else). */
   private static StarlarkInfo instantiateWithA1(StarlarkCallable provider) throws Exception {
     try (Mutability mu = Mutability.create()) {
-      StarlarkThread thread = new StarlarkThread(mu, StarlarkSemantics.DEFAULT);
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
       Object result =
           Starlark.call(
               thread,
@@ -326,7 +777,7 @@ public final class StarlarkProviderTest {
   /** Instantiates a {@link StarlarkInfo} with fields a=1, b=2, c=3 (and nothing else). */
   private static StarlarkInfo instantiateWithA1B2C3(StarlarkCallable provider) throws Exception {
     try (Mutability mu = Mutability.create()) {
-      StarlarkThread thread = new StarlarkThread(mu, StarlarkSemantics.DEFAULT);
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
       Object result =
           Starlark.call(
               thread,

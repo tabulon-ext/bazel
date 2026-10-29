@@ -14,38 +14,54 @@
 package com.google.devtools.build.lib.rules.cpp;
 
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.devtools.build.lib.actions.util.ActionsTestUtil.ensureMemoizedIsInitializedIsSet;
+import static com.google.devtools.build.lib.skyframe.serialization.testutils.Dumper.dumpStructureWithEquivalenceReduction;
 import static org.junit.Assert.assertThrows;
 
+import build.bazel.remote.execution.v2.Digest;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.actions.AbstractAction;
 import com.google.devtools.build.lib.actions.Action;
+import com.google.devtools.build.lib.actions.ActionEnvironment;
 import com.google.devtools.build.lib.actions.ActionExecutionContext;
 import com.google.devtools.build.lib.actions.ActionExecutionContext.LostInputsCheck;
 import com.google.devtools.build.lib.actions.ActionExecutionException;
 import com.google.devtools.build.lib.actions.ActionInputPrefetcher;
 import com.google.devtools.build.lib.actions.Artifact;
+import com.google.devtools.build.lib.actions.ArtifactRoot;
+import com.google.devtools.build.lib.actions.CommandLines;
 import com.google.devtools.build.lib.actions.DiscoveredModulesPruner;
 import com.google.devtools.build.lib.actions.Executor;
 import com.google.devtools.build.lib.actions.ThreadStateReceiver;
 import com.google.devtools.build.lib.actions.util.ActionsTestUtil;
-import com.google.devtools.build.lib.analysis.Runfiles;
-import com.google.devtools.build.lib.analysis.SingleRunfilesSupplier;
 import com.google.devtools.build.lib.analysis.actions.SpawnAction;
 import com.google.devtools.build.lib.analysis.util.ActionTester;
 import com.google.devtools.build.lib.analysis.util.ActionTester.ActionCombinationFactory;
 import com.google.devtools.build.lib.analysis.util.AnalysisTestUtil;
 import com.google.devtools.build.lib.analysis.util.BuildViewTestCase;
+import com.google.devtools.build.lib.collect.nestedset.NestedSet;
 import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
 import com.google.devtools.build.lib.collect.nestedset.Order;
 import com.google.devtools.build.lib.events.StoredEventHandler;
-import com.google.devtools.build.lib.exec.BinTools;
 import com.google.devtools.build.lib.exec.util.TestExecutorBuilder;
+import com.google.devtools.build.lib.remote.common.BulkTransferException;
+import com.google.devtools.build.lib.remote.common.CacheNotFoundException;
+import com.google.devtools.build.lib.skyframe.serialization.ArrayCodec;
+import com.google.devtools.build.lib.skyframe.serialization.testutils.SerializationDepsUtils;
+import com.google.devtools.build.lib.skyframe.serialization.testutils.SerializationTester;
+import com.google.devtools.build.lib.util.ExitCode;
 import com.google.devtools.build.lib.util.io.FileOutErr;
+import com.google.devtools.build.lib.vfs.DigestHashFunction;
+import com.google.devtools.build.lib.vfs.FileSystem;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.PathFragment;
+import com.google.devtools.build.lib.vfs.Root;
 import com.google.devtools.build.lib.vfs.SyscallCache;
-import java.util.Arrays;
+import com.google.devtools.build.lib.vfs.inmemoryfs.InMemoryFileSystem;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.HashMap;
 import java.util.Map;
 import org.junit.Before;
@@ -62,7 +78,7 @@ public class LtoBackendActionTest extends BuildViewTestCase {
   private Artifact index2Artifact;
   private Artifact imports1Artifact;
   private Artifact imports2Artifact;
-  private Artifact destinationArtifact;
+  private Artifact.DerivedArtifact destinationArtifact;
   private BitcodeFiles allBitcodeFiles;
   private AnalysisTestUtil.CollectingAnalysisEnvironment collectingAnalysisEnvironment;
   private ActionExecutionContext context;
@@ -87,24 +103,20 @@ public class LtoBackendActionTest extends BuildViewTestCase {
 
   @Before
   public final void createExecutorAndContext() throws Exception {
-    BinTools binTools = BinTools.forUnitTesting(directories, analysisMock.getEmbeddedTools());
-    Executor executor = new TestExecutorBuilder(fileSystem, directories, binTools).build();
+    Executor executor = new TestExecutorBuilder(fileSystem, directories).build();
     context =
         new ActionExecutionContext(
             executor,
-            /*actionInputFileCache=*/ null,
+            /* inputMetadataProvider= */ null,
             ActionInputPrefetcher.NONE,
             actionKeyContext,
-            /*metadataHandler=*/ null,
-            /*rewindingEnabled=*/ false,
+            /* outputMetadataStore= */ null,
+            /* rewindingEnabled= */ false,
             LostInputsCheck.NONE,
             new FileOutErr(),
             new StoredEventHandler(),
-            /*clientEnv=*/ ImmutableMap.of(),
-            /*topLevelFilesets=*/ ImmutableMap.of(),
-            /*artifactExpander=*/ null,
-            /*actionFileSystem=*/ null,
-            /*skyframeDepsResult=*/ null,
+            /* clientEnv= */ ImmutableMap.of(),
+            /* actionFileSystem= */ null,
             DiscoveredModulesPruner.DEFAULT,
             SyscallCache.NO_CACHE,
             ThreadStateReceiver.NULL_INSTANCE);
@@ -113,70 +125,92 @@ public class LtoBackendActionTest extends BuildViewTestCase {
   @Test
   public void testEmptyImports() throws Exception {
     LtoBackendAction action =
-        (LtoBackendAction)
-            new LtoBackendAction.Builder()
-                .addImportsInfo(allBitcodeFiles, imports1Artifact)
-                .addInput(bitcode1Artifact)
-                .addInput(index1Artifact)
-                .addOutput(destinationArtifact)
-                .setExecutable(scratch.file("/bin/clang").asFragment())
-                .setProgressMessage("Test")
-                .build(ActionsTestUtil.NULL_ACTION_OWNER, targetConfig);
+        LtoBackendAction.create(
+            ActionsTestUtil.NULL_ACTION_OWNER,
+            targetConfig,
+            NestedSetBuilder.create(Order.STABLE_ORDER, bitcode1Artifact, index1Artifact),
+            allBitcodeFiles,
+            imports1Artifact,
+            ImmutableSet.of(destinationArtifact),
+            CommandLines.builder()
+                .addSingleArgument(scratch.file("/bin/clang").asFragment())
+                .build(),
+            ActionEnvironment.create(ImmutableMap.of()));
+
     collectingAnalysisEnvironment.registerAction(action);
     assertThat(action.getOwner().getLabel())
         .isEqualTo(ActionsTestUtil.NULL_ACTION_OWNER.getLabel());
     assertThat(action.getInputs().toList()).containsExactly(bitcode1Artifact, index1Artifact);
     assertThat(action.getOutputs()).containsExactly(destinationArtifact);
-    assertThat(action.getSpawn().getLocalResources())
+    assertThat(action.getSpawnForTesting().getLocalResources())
         .isEqualTo(AbstractAction.DEFAULT_RESOURCE_SET);
     assertThat(action.getArguments()).containsExactly("/bin/clang");
-    assertThat(action.getProgressMessage()).isEqualTo("Test");
-    assertThat(action.inputsDiscovered()).isFalse();
+    assertThat(action.getProgressMessage()).isEqualTo("LTO Backend Compile output");
+    assertThat(action.inputsKnown()).isFalse();
 
     // Discover inputs, which should not add any inputs since bitcode1.imports is empty.
     action.discoverInputs(context);
-    assertThat(action.inputsDiscovered()).isTrue();
+    assertThat(action.inputsKnown()).isTrue();
     assertThat(action.getInputs().toList()).containsExactly(bitcode1Artifact, index1Artifact);
   }
 
   @Test
   public void testNonEmptyImports() throws Exception {
     LtoBackendAction action =
-        (LtoBackendAction)
-            new LtoBackendAction.Builder()
-                .addImportsInfo(allBitcodeFiles, imports2Artifact)
-                .addInput(bitcode2Artifact)
-                .addInput(index2Artifact)
-                .addOutput(destinationArtifact)
-                .setExecutable(scratch.file("/bin/clang").asFragment())
-                .setProgressMessage("Test")
-                .build(ActionsTestUtil.NULL_ACTION_OWNER, targetConfig);
+        LtoBackendAction.create(
+            ActionsTestUtil.NULL_ACTION_OWNER,
+            targetConfig,
+            NestedSetBuilder.create(Order.STABLE_ORDER, bitcode2Artifact, index2Artifact),
+            allBitcodeFiles,
+            imports2Artifact,
+            ImmutableSet.of(destinationArtifact),
+            CommandLines.builder()
+                .addSingleArgument(scratch.file("/bin/clang").asFragment())
+                .build(),
+            ActionEnvironment.create(ImmutableMap.of()));
     collectingAnalysisEnvironment.registerAction(action);
     assertThat(action.getOwner().getLabel())
         .isEqualTo(ActionsTestUtil.NULL_ACTION_OWNER.getLabel());
     assertThat(action.getInputs().toList()).containsExactly(bitcode2Artifact, index2Artifact);
     assertThat(action.getOutputs()).containsExactly(destinationArtifact);
-    assertThat(action.getSpawn().getLocalResources())
+    assertThat(action.getSpawnForTesting().getLocalResources())
         .isEqualTo(AbstractAction.DEFAULT_RESOURCE_SET);
     assertThat(action.getArguments()).containsExactly("/bin/clang");
-    assertThat(action.getProgressMessage()).isEqualTo("Test");
-    assertThat(action.inputsDiscovered()).isFalse();
+    assertThat(action.getProgressMessage()).isEqualTo("LTO Backend Compile output");
+    assertThat(action.inputsKnown()).isFalse();
 
     // Discover inputs, which should add bitcode1.o which is listed in bitcode2.imports.
     action.discoverInputs(context);
-    assertThat(action.inputsDiscovered()).isTrue();
+    assertThat(action.inputsKnown()).isTrue();
     assertThat(action.getInputs().toList())
         .containsExactly(bitcode1Artifact, bitcode2Artifact, index2Artifact);
+  }
+
+  @Test
+  public void testGetInputFilesForExtraAction() throws Exception {
+    LtoBackendAction action =
+        LtoBackendAction.create(
+            ActionsTestUtil.NULL_ACTION_OWNER,
+            targetConfig,
+            NestedSetBuilder.create(Order.STABLE_ORDER, bitcode2Artifact, index2Artifact),
+            allBitcodeFiles,
+            imports2Artifact,
+            ImmutableSet.of(destinationArtifact),
+            CommandLines.builder()
+                .addSingleArgument(scratch.file("/bin/clang").asFragment())
+                .build(),
+            ActionEnvironment.create(ImmutableMap.of()));
+    collectingAnalysisEnvironment.registerAction(action);
+
+    NestedSet<Artifact> extraActionInputs = action.getInputFilesForExtraAction(context);
+    assertThat(extraActionInputs.toList()).containsExactly(bitcode1Artifact);
   }
 
   private enum KeyAttributes {
     EXECUTABLE,
     IMPORTS_INFO,
-    MNEMONIC,
-    RUNFILES_SUPPLIER,
     INPUT,
-    FIXED_ENVIRONMENT,
-    VARIABLE_ENVIRONMENT
+    FIXED_ENVIRONMENT
   }
 
   @Test
@@ -191,61 +225,40 @@ public class LtoBackendActionTest extends BuildViewTestCase {
         new ActionCombinationFactory<KeyAttributes>() {
           @Override
           public Action generate(ImmutableSet<KeyAttributes> attributesToFlip) {
-            LtoBackendAction.Builder builder = new LtoBackendAction.Builder();
-            builder.addOutput(destinationArtifact);
-
             PathFragment executable =
                 attributesToFlip.contains(KeyAttributes.EXECUTABLE)
                     ? artifactA.getExecPath()
                     : artifactB.getExecPath();
-            builder.setExecutable(executable);
 
+            Artifact imports;
             if (attributesToFlip.contains(KeyAttributes.IMPORTS_INFO)) {
-              builder.addImportsInfo(
-                  new BitcodeFiles(NestedSetBuilder.emptySet(Order.STABLE_ORDER)),
-                  artifactAimports);
+              imports = artifactAimports;
             } else {
-              builder.addImportsInfo(
-                  new BitcodeFiles(NestedSetBuilder.emptySet(Order.STABLE_ORDER)),
-                  artifactBimports);
+              imports = artifactBimports;
             }
 
-            builder.setMnemonic(attributesToFlip.contains(KeyAttributes.MNEMONIC) ? "a" : "b");
-
-            if (attributesToFlip.contains(KeyAttributes.RUNFILES_SUPPLIER)) {
-              builder.addRunfilesSupplier(
-                  new SingleRunfilesSupplier(
-                      PathFragment.create("a"),
-                      Runfiles.EMPTY,
-                      artifactA,
-                      /* buildRunfileLinks= */ false,
-                      /* runfileLinksEnabled= */ false));
-            } else {
-              builder.addRunfilesSupplier(
-                  new SingleRunfilesSupplier(
-                      PathFragment.create("a"),
-                      Runfiles.EMPTY,
-                      artifactB,
-                      /* buildRunfileLinks= */ false,
-                      /* runfileLinksEnabled= */ false));
-            }
-
+            Artifact input;
             if (attributesToFlip.contains(KeyAttributes.INPUT)) {
-              builder.addInput(artifactA);
+              input = artifactA;
             } else {
-              builder.addInput(artifactB);
+              input = artifactB;
             }
 
             Map<String, String> env = new HashMap<>();
             if (attributesToFlip.contains(KeyAttributes.FIXED_ENVIRONMENT)) {
               env.put("foo", "bar");
             }
-            builder.setEnvironment(env);
-            if (attributesToFlip.contains(KeyAttributes.VARIABLE_ENVIRONMENT)) {
-              builder.setInheritedEnvironment(Arrays.asList("baz"));
-            }
 
-            SpawnAction action = builder.build(ActionsTestUtil.NULL_ACTION_OWNER, targetConfig);
+            SpawnAction action =
+                LtoBackendAction.create(
+                    ActionsTestUtil.NULL_ACTION_OWNER,
+                    targetConfig,
+                    NestedSetBuilder.create(Order.STABLE_ORDER, imports, input),
+                    new BitcodeFiles(NestedSetBuilder.create(Order.STABLE_ORDER)),
+                    imports,
+                    ImmutableSet.of(destinationArtifact),
+                    CommandLines.builder().addSingleArgument(executable).build(),
+                    ActionEnvironment.create(ImmutableMap.copyOf(env)));
             collectingAnalysisEnvironment.registerAction(action);
             return action;
           }
@@ -257,20 +270,130 @@ public class LtoBackendActionTest extends BuildViewTestCase {
   public void discoverInputs_missingInputErrorMessage() throws Exception {
     FileSystemUtils.writeIsoLatin1(imports1Artifact.getPath(), "file1.o", "file2.o", "file3.o");
 
-    SpawnAction action =
-        new LtoBackendAction.Builder()
-            .addImportsInfo(
-                new BitcodeFiles(
-                    new NestedSetBuilder<Artifact>(Order.STABLE_ORDER)
-                        .add(getSourceArtifact("file2.o"))
-                        .build()),
-                imports1Artifact)
-            .setExecutable(scratch.file("/bin/clang").asFragment())
-            .addOutput(destinationArtifact)
-            .build(ActionsTestUtil.NULL_ACTION_OWNER, targetConfig);
+    Artifact index1Artifact = getSourceArtifact("file2.o");
+    LtoBackendAction action =
+        LtoBackendAction.create(
+            ActionsTestUtil.NULL_ACTION_OWNER,
+            targetConfig,
+            NestedSetBuilder.create(Order.STABLE_ORDER, imports1Artifact, index1Artifact),
+            new BitcodeFiles(NestedSetBuilder.create(Order.STABLE_ORDER, index1Artifact)),
+            imports1Artifact,
+            ImmutableSet.of(destinationArtifact),
+            CommandLines.builder()
+                .addSingleArgument(scratch.file("/bin/clang").asFragment())
+                .build(),
+            ActionEnvironment.create(ImmutableMap.of()));
+
     ActionExecutionException e =
         assertThrows(ActionExecutionException.class, () -> action.discoverInputs(context));
 
     assertThat(e).hasMessageThat().endsWith("(first 10): file1.o, file3.o");
+  }
+
+  @Test
+  public void discoverInputs_cacheNotFoundException_throwsRemoteCacheEvictedCode()
+      throws Exception {
+    FileSystem customFs =
+        new InMemoryFileSystem(DigestHashFunction.SHA256) {
+          @Override
+          public synchronized InputStream getInputStream(PathFragment path) throws IOException {
+            if (path.getBaseName().endsWith(".imports")) {
+              throw new CacheNotFoundException(Digest.getDefaultInstance(), path);
+            }
+            return super.getInputStream(path);
+          }
+        };
+    ArtifactRoot root = ArtifactRoot.asSourceRoot(Root.fromPath(customFs.getPath("/")));
+    Artifact importsArtifact = ActionsTestUtil.createArtifact(root, "bitcode1.imports");
+    Artifact index1Artifact = getSourceArtifact("file2.o");
+    LtoBackendAction action =
+        LtoBackendAction.create(
+            ActionsTestUtil.NULL_ACTION_OWNER,
+            targetConfig,
+            NestedSetBuilder.create(Order.STABLE_ORDER, importsArtifact, index1Artifact),
+            new BitcodeFiles(NestedSetBuilder.create(Order.STABLE_ORDER, index1Artifact)),
+            importsArtifact,
+            ImmutableSet.of(destinationArtifact),
+            CommandLines.builder()
+                .addSingleArgument(scratch.file("/bin/clang").asFragment())
+                .build(),
+            ActionEnvironment.create(ImmutableMap.of()));
+
+    ActionExecutionException e =
+        assertThrows(ActionExecutionException.class, () -> action.discoverInputs(context));
+
+    assertThat(e.getExitCode()).isEqualTo(ExitCode.REMOTE_CACHE_EVICTED);
+  }
+
+  @Test
+  public void discoverInputs_bulkTransferException_throwsRemoteCacheEvictedCode() throws Exception {
+    FileSystem customFs =
+        new InMemoryFileSystem(DigestHashFunction.SHA256) {
+          @Override
+          public synchronized InputStream getInputStream(PathFragment path) throws IOException {
+            if (path.getBaseName().endsWith(".imports")) {
+              throw new BulkTransferException(
+                  new CacheNotFoundException(Digest.getDefaultInstance(), path));
+            }
+            return super.getInputStream(path);
+          }
+        };
+    ArtifactRoot root = ArtifactRoot.asSourceRoot(Root.fromPath(customFs.getPath("/")));
+    Artifact importsArtifact = ActionsTestUtil.createArtifact(root, "bitcode1.imports");
+    Artifact index1Artifact = getSourceArtifact("file2.o");
+    LtoBackendAction action =
+        LtoBackendAction.create(
+            ActionsTestUtil.NULL_ACTION_OWNER,
+            targetConfig,
+            NestedSetBuilder.create(Order.STABLE_ORDER, importsArtifact, index1Artifact),
+            new BitcodeFiles(NestedSetBuilder.create(Order.STABLE_ORDER, index1Artifact)),
+            importsArtifact,
+            ImmutableSet.of(destinationArtifact),
+            CommandLines.builder()
+                .addSingleArgument(scratch.file("/bin/clang").asFragment())
+                .build(),
+            ActionEnvironment.create(ImmutableMap.of()));
+
+    ActionExecutionException e =
+        assertThrows(ActionExecutionException.class, () -> action.discoverInputs(context));
+
+    assertThat(e.getExitCode()).isEqualTo(ExitCode.REMOTE_CACHE_EVICTED);
+  }
+
+  @Test
+  public void serializationRoundTrip_resetsInputs() throws Exception {
+    LtoBackendAction action =
+        LtoBackendAction.create(
+            ActionsTestUtil.NULL_ACTION_OWNER,
+            targetConfig,
+            NestedSetBuilder.create(
+                Order.STABLE_ORDER, bitcode2Artifact, index2Artifact, imports2Artifact),
+            allBitcodeFiles,
+            imports2Artifact,
+            ImmutableSet.of(destinationArtifact),
+            CommandLines.builder()
+                .addSingleArgument(scratch.file("/bin/clang").asFragment())
+                .build(),
+            ActionEnvironment.create(ImmutableMap.of()));
+
+    destinationArtifact.setGeneratingActionKey(ActionsTestUtil.NULL_ACTION_LOOKUP_DATA);
+    ensureMemoizedIsInitializedIsSet(action);
+
+    String originalStructure = dumpStructureWithEquivalenceReduction(action);
+
+    ImmutableList<Artifact> originalInputs = action.getInputs().toList();
+    var unused = action.discoverInputs(context);
+    assertThat(action.getInputs().toList()).isNotEqualTo(originalInputs);
+
+    new SerializationTester(action)
+        .makeMemoizingAndAllowFutureBlocking(/* allowFutureBlocking= */ true)
+        .addCodec(ArrayCodec.forComponentType(Artifact.class))
+        .setVerificationFunction(
+            (unusedInput, deserialized) ->
+                assertThat(dumpStructureWithEquivalenceReduction(deserialized))
+                    .isEqualTo(originalStructure))
+        .addDependencies(getCommonSerializationDependencies())
+        .addDependencies(SerializationDepsUtils.SERIALIZATION_DEPS_FOR_TEST)
+        .runTests();
   }
 }

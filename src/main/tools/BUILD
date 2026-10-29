@@ -1,8 +1,19 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
 package(default_visibility = ["//src:__subpackages__"])
 
 cc_binary(
     name = "daemonize",
-    srcs = ["daemonize.c"],
+    srcs = ["daemonize.cc"],
+    target_compatible_with = select({
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":logging",
+        ":process-tools",
+    ],
 )
 
 cc_library(
@@ -15,9 +26,14 @@ cc_library(
     name = "process-tools",
     srcs = ["process-tools.cc"] + select({
         "//src/conditions:darwin": ["process-tools-darwin.cc"],
+        "//src/conditions:openbsd": ["process-tools-darwin.cc"],
         "//conditions:default": ["process-tools-linux.cc"],
     }),
     hdrs = ["process-tools.h"],
+    target_compatible_with = select({
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
     deps = [
         ":logging",
         "//src/main/protobuf:execution_statistics_cc_proto",
@@ -38,8 +54,9 @@ cc_binary(
         ],
     }),
     linkopts = select({
-        "//src/conditions:windows": [],
         "//src/conditions:darwin": ["-lm"],
+        "//src/conditions:openbsd": [],
+        "//src/conditions:windows": [],
         "//conditions:default": [
             "-lm",
             "-lrt",
@@ -48,21 +65,9 @@ cc_binary(
     deps = select({
         "//src/conditions:windows": [],
         "//conditions:default": [
-            ":process-tools",
             ":logging",
+            ":process-tools",
         ],
-    }),
-)
-
-cc_binary(
-    name = "build-runfiles",
-    srcs = select({
-        "//src/conditions:windows": ["build-runfiles-windows.cc"],
-        "//conditions:default": ["build-runfiles.cc"],
-    }),
-    deps = ["//src/main/cpp/util:filesystem"] + select({
-        "//src/conditions:windows": ["//src/main/native/windows:lib-file"],
-        "//conditions:default": [],
     }),
 )
 

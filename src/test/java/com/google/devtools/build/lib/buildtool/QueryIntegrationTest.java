@@ -17,33 +17,39 @@ import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.junit.Assert.fail;
 
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
-import com.google.devtools.build.lib.actions.FileStateValue;
+import com.google.devtools.build.lib.analysis.BlazeDirectories;
 import com.google.devtools.build.lib.buildtool.util.BuildIntegrationTestCase;
 import com.google.devtools.build.lib.events.EventKind;
-import com.google.devtools.build.lib.events.util.EventCollectionApparatus;
 import com.google.devtools.build.lib.query2.proto.proto2api.Build;
 import com.google.devtools.build.lib.query2.proto.proto2api.Build.QueryResult;
 import com.google.devtools.build.lib.query2.query.output.QueryOptions;
 import com.google.devtools.build.lib.runtime.BlazeCommandResult;
 import com.google.devtools.build.lib.runtime.BlazeModule;
+import com.google.devtools.build.lib.runtime.BlazeRuntime;
 import com.google.devtools.build.lib.runtime.CommandEnvironment;
 import com.google.devtools.build.lib.runtime.GotOptionsEvent;
+import com.google.devtools.build.lib.runtime.WorkspaceBuilder;
 import com.google.devtools.build.lib.runtime.commands.QueryCommand;
 import com.google.devtools.build.lib.runtime.proto.InvocationPolicyOuterClass.InvocationPolicy;
 import com.google.devtools.build.lib.server.FailureDetails;
+import com.google.devtools.build.lib.skyframe.DefaultSyscallCache;
 import com.google.devtools.build.lib.skyframe.SkyFunctions;
-import com.google.devtools.build.lib.testutil.TestConstants;
+import com.google.devtools.build.lib.testutil.TestUtils;
+import com.google.devtools.build.lib.unix.NativePosixFilesServiceImpl;
 import com.google.devtools.build.lib.unix.UnixFileSystem;
 import com.google.devtools.build.lib.util.ExitCode;
 import com.google.devtools.build.lib.vfs.DigestHashFunction;
+import com.google.devtools.build.lib.vfs.FileStateKey;
 import com.google.devtools.build.lib.vfs.FileStatus;
 import com.google.devtools.build.lib.vfs.FileSystem;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.RootedPath;
+import com.google.devtools.build.lib.vfs.SyscallCache;
 import com.google.devtools.build.skyframe.NotifyingHelper;
 import com.google.devtools.build.skyframe.TrackingAwaiter;
 import com.google.devtools.common.options.OptionsParsingResult;
@@ -60,7 +66,10 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
 import javax.annotation.Nullable;
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.xpath.XPathConstants;
@@ -78,21 +87,37 @@ import org.w3c.dom.NodeList;
 @RunWith(TestParameterInjector.class)
 public class QueryIntegrationTest extends BuildIntegrationTestCase {
   private final CustomFileSystem fs = new CustomFileSystem();
+  private final SyscallCache syscallCache = DefaultSyscallCache.newBuilder().build();
+
   private final List<String> options = new ArrayList<>();
 
   @Override
-  protected EventCollectionApparatus createEvents() {
-    ImmutableSet.Builder<EventKind> eventsSet = ImmutableSet.builder();
-    eventsSet.addAll(EventKind.ERRORS_AND_WARNINGS_AND_OUTPUT);
-    eventsSet.add(EventKind.PROGRESS);
-    return new EventCollectionApparatus(eventsSet.build());
+  protected BlazeRuntime.Builder getRuntimeBuilder() throws Exception {
+    return super.getRuntimeBuilder()
+        .addBlazeModule(
+            new BlazeModule() {
+              @Override
+              public void workspaceInit(
+                  BlazeRuntime runtime, BlazeDirectories directories, WorkspaceBuilder builder) {
+                builder.setSyscallCache(syscallCache);
+              }
+            });
+  }
+
+  @Override
+  protected ImmutableSet<EventKind> additionalEventsToCollect() {
+    return ImmutableSet.of(EventKind.STDOUT, EventKind.STDERR, EventKind.PROGRESS);
   }
 
   private static class CustomFileSystem extends UnixFileSystem {
     final Map<PathFragment, FileStatus> stubbedStats = new HashMap<>();
+    final Map<PathFragment, Runnable> watchedPaths = new ConcurrentHashMap<>();
 
     CustomFileSystem() {
-      super(DigestHashFunction.SHA256, "");
+      super(
+          DigestHashFunction.SHA256,
+          /* hashAttributeName= */ "",
+          new NativePosixFilesServiceImpl());
     }
 
     void stubStat(Path path, @Nullable FileStatus stubbedResult) {
@@ -101,6 +126,10 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
 
     @Override
     public FileStatus statIfFound(PathFragment path, boolean followSymlinks) throws IOException {
+      Runnable runnable = watchedPaths.get(path);
+      if (runnable != null) {
+        runnable.run();
+      }
       if (stubbedStats.containsKey(path)) {
         return stubbedStats.get(path);
       }
@@ -179,20 +208,40 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
     return results;
   }
 
+  private void writeLargeQueryFixture() throws Exception {
+    StringBuilder targets = new StringBuilder();
+    StringBuilder deps = new StringBuilder();
+    for (int i = 0; i < NUM_DEPS; i++) {
+      deps.append("'").append(i).append("', ");
+      targets.append("foo_library(name = '").append(i).append("')\n");
+    }
+    write(
+        "foo/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'a', deps = [" + deps + "])",
+        targets.toString());
+  }
+
+  private static List<Build.Target> parseStreamedProtoTargets(byte[] output) throws IOException {
+    ByteArrayInputStream input = new ByteArrayInputStream(output);
+    List<Build.Target> targets = new ArrayList<>();
+    Build.Target target;
+    while ((target = Build.Target.parseDelimitedFrom(input)) != null) {
+      targets.add(target);
+    }
+    return targets;
+  }
+
   @Test
   public void testProtoUnorderedAndOrdered() throws Exception {
     List<String> expected = new ArrayList<>(NUM_DEPS + 1);
-    String targets = "";
-    String depString = "";
     for (int i = 0; i < NUM_DEPS; i++) {
       String dep = Integer.toString(i);
-      depString += "'" + dep + "', ";
       expected.add("//foo:" + dep);
-      targets += "sh_library(name = '" + dep + "')\n";
     }
     expected.add("//foo:a");
     Collections.sort(expected, Collections.reverseOrder());
-    write("foo/BUILD", "sh_library(name = 'a', deps = [" + depString + "])", targets);
+    writeLargeQueryFixture();
     ProtoQueryOutput result = getProtoQueryResult("deps(//foo:a)");
     assertSameElementsDifferentOrder(getTargetNames(result.getQueryResult()), expected);
     options.add("--order_output=full");
@@ -202,6 +251,67 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
         .inOrder();
   }
 
+  @Test
+  public void testParallelStreamedProtoMatchesSerialOrdered(
+      @TestParameter({"auto", "deps", "full"}) String orderOutput) throws Exception {
+    writeLargeQueryFixture();
+    QueryOutput serial =
+        getQueryResult("deps(//foo:a)", "--output=streamed_proto", "--order_output=" + orderOutput);
+    QueryOutput parallel =
+        getQueryResult(
+            "deps(//foo:a)",
+            "--output=streamed_proto",
+            "--order_output=" + orderOutput,
+            "--experimental_parallel_streamed_proto_output");
+
+    assertSuccessfulExitCode(serial);
+    assertSuccessfulExitCode(parallel);
+    assertThat(parallel.getStdout()).isEqualTo(serial.getStdout());
+  }
+
+  @Test
+  public void testParallelStreamedProtoMatchesSerialForSomePath() throws Exception {
+    writeLargeQueryFixture();
+    QueryOutput serial =
+        getQueryResult(
+            "somepath(//foo:a, //foo:0)", "--output=streamed_proto", "--order_output=auto");
+    QueryOutput parallel =
+        getQueryResult(
+            "somepath(//foo:a, //foo:0)",
+            "--output=streamed_proto",
+            "--order_output=auto",
+            "--experimental_parallel_streamed_proto_output");
+
+    assertSuccessfulExitCode(serial);
+    assertSuccessfulExitCode(parallel);
+    assertThat(parallel.getStdout()).isEqualTo(serial.getStdout());
+  }
+
+  @Test
+  public void testParallelStreamedProtoMatchesSerialUnordered(@TestParameter boolean graphless)
+      throws Exception {
+    writeLargeQueryFixture();
+    String queryModeFlag =
+        graphless ? "--experimental_graphless_query=true" : "--universe_scope=//foo:*";
+    QueryOutput serial =
+        getQueryResult(
+            "deps(//foo:a)", "--output=streamed_proto", "--order_output=no", queryModeFlag);
+    QueryOutput parallel =
+        getQueryResult(
+            "deps(//foo:a)",
+            "--output=streamed_proto",
+            "--order_output=no",
+            queryModeFlag,
+            "--experimental_parallel_streamed_proto_output");
+
+    assertSuccessfulExitCode(serial);
+    assertSuccessfulExitCode(parallel);
+    List<Build.Target> serialTargets = parseStreamedProtoTargets(serial.getStdout());
+    List<Build.Target> parallelTargets = parseStreamedProtoTargets(parallel.getStdout());
+    assertThat(parallelTargets).hasSize(serialTargets.size());
+    assertThat(parallelTargets).containsExactlyElementsIn(serialTargets);
+  }
+
   /**
    * Test that {min,max}rank work as expected with ordering. Since minrank and maxrank have special
    * handling for cycles in the graph, we put a cycle in to exercise that code.
@@ -209,14 +319,14 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
   private void assertRankUnorderedAndOrdered(boolean minRank) throws Exception {
     List<String> expected = new ArrayList<>(2 * NUM_DEPS + 1);
     // The build file looks like:
-    // sh_library(name = 'a', deps = ['cycle1', '1', '2', ..., ]
-    // sh_library(name = '1')
+    // foo_library(name = 'a', deps = ['cycle1', '1', '2', ..., ]
+    // foo_library(name = '1')
     // ...
-    // sh_library(name = 'n')
-    // sh_library(name = 'cycle0', deps = ['cyclen'])
-    // sh_library(name = 'cycle1', deps = ['cycle0'])
+    // foo_library(name = 'n')
+    // foo_library(name = 'cycle0', deps = ['cyclen'])
+    // foo_library(name = 'cycle1', deps = ['cycle0'])
     // ...
-    // sh_library(name = 'cyclen', deps = ['cycle{n-1}'])
+    // foo_library(name = 'cyclen', deps = ['cycle{n-1}'])
     String targets = "";
     String depString = "";
     for (int i = 0; i < NUM_DEPS; i++) {
@@ -224,8 +334,8 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
       depString += "'" + dep + "', ";
       expected.add("1 //foo:" + dep);
       expected.add("1 //foo:cycle" + dep);
-      targets += "sh_library(name = '" + dep + "')\n";
-      targets += "sh_library(name = 'cycle" + dep + "', deps = ['cycle";
+      targets += "foo_library(name = '" + dep + "')\n";
+      targets += "foo_library(name = 'cycle" + dep + "', deps = ['cycle";
       if (i > 0) {
         targets += i - 1;
       } else {
@@ -237,7 +347,11 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
     expected.add(0, "0 //foo:a");
     options.add("--output=" + (minRank ? "minrank" : "maxrank"));
     options.add("--keep_going");
-    write("foo/BUILD", "sh_library(name = 'a', deps = ['cycle0', " + depString + "])", targets);
+    write(
+        "foo/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'a', deps = ['cycle0', " + depString + "])",
+        targets);
     List<String> result = getStringQueryResult("deps(//foo:a)");
     assertWithMessage(result.toString()).that(result.get(0)).isEqualTo("0 //foo:a");
     assertSameElementsDifferentOrder(result, expected);
@@ -266,11 +380,15 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
       String dep = Integer.toString(i);
       depString += "'" + dep + "', ";
       expected.add("//foo:" + dep);
-      targets += "sh_library(name = '" + dep + "')\n";
+      targets += "foo_library(name = '" + dep + "')\n";
     }
     expected.add("//foo:a");
     Collections.sort(expected);
-    write("foo/BUILD", "sh_library(name = 'a', deps = [" + depString + "])", targets);
+    write(
+        "foo/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'a', deps = [" + depString + "])",
+        targets);
     List<String> result = getStringQueryResult("deps(//foo:a)");
     assertThat(result).containsExactlyElementsIn(expected).inOrder();
     options.add("--order_output=deps");
@@ -282,8 +400,17 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
   public void testInputFileElementContainsPackageGroups() throws Exception {
     write(
         "fruit/BUILD",
-        "package_group(name='coconut', packages=['//fruit/walnut'])",
-        "exports_files(['chestnut'], visibility=[':coconut'])");
+        """
+        package_group(
+            name = "coconut",
+            packages = ["//fruit/walnut"],
+        )
+
+        exports_files(
+            ["chestnut"],
+            visibility = [":coconut"],
+        )
+        """);
 
     Document result = getXmlQueryResult("//fruit:chestnut");
     Element resultNode = getResultNode(result, "//fruit:chestnut");
@@ -294,13 +421,80 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
         .isNotNull();
   }
 
+  private void writePackageWithBuildBazelFile() throws Exception {
+    write("bar/BUILD.bazel", "");
+    write("bar/bar.bzl", "sym = 0");
+    // BUILD.bazel takes precedence over BUILD, so //foo:BUILD is a plain source file here.
+    write(
+        "foo/BUILD.bazel",
+        """
+        load("//bar:bar.bzl", "sym")
+
+        exports_files(["BUILD"])
+        """);
+    write("foo/BUILD", "# not a BUILD file");
+  }
+
+  @Test
+  public void testProtoOutputRecognizesBuildBazelFile() throws Exception {
+    writePackageWithBuildBazelFile();
+
+    ProtoQueryOutput result = getProtoQueryResult("//foo:BUILD.bazel + //foo:BUILD");
+
+    Build.Target buildFile = getProtoTarget(result, "//foo:BUILD.bazel");
+    assertThat(buildFile.getType()).isEqualTo(Build.Target.Discriminator.SOURCE_FILE);
+    assertThat(buildFile.getSourceFile().getSubincludeList()).containsExactly("//bar:bar.bzl");
+    assertThat(buildFile.getSourceFile().hasPackageContainsErrors()).isTrue();
+    assertThat(buildFile.getSourceFile().getPackageContainsErrors()).isFalse();
+
+    Build.Target plainFile = getProtoTarget(result, "//foo:BUILD");
+    assertThat(plainFile.getType()).isEqualTo(Build.Target.Discriminator.SOURCE_FILE);
+    assertThat(plainFile.getSourceFile().getSubincludeList()).isEmpty();
+    assertThat(plainFile.getSourceFile().hasPackageContainsErrors()).isFalse();
+  }
+
+  @Test
+  public void testXmlOutputRecognizesBuildBazelFile() throws Exception {
+    writePackageWithBuildBazelFile();
+
+    Document result = getXmlQueryResult("//foo:BUILD.bazel + //foo:BUILD");
+
+    Element buildFile = getResultNode(result, "//foo:BUILD.bazel");
+    assertThat(buildFile.getTagName()).isEqualTo("source-file");
+    assertThat(xpathSelect(buildFile, "load[@name='//bar:bar.bzl']")).hasSize(1);
+    assertThat(buildFile.getAttribute("package_contains_errors")).isEqualTo("false");
+
+    Element plainFile = getResultNode(result, "//foo:BUILD");
+    assertThat(plainFile.getTagName()).isEqualTo("source-file");
+    assertThat(xpathSelect(plainFile, "load")).isEmpty();
+    assertThat(plainFile.hasAttribute("package_contains_errors")).isFalse();
+  }
+
   @Test
   public void testNonStrictTests() throws Exception {
     write(
         "donut/BUILD",
-        "sh_binary(name = 'thief', srcs = ['thief.sh'])",
-        "cc_test(name = 'shop', srcs = ['shop.cc'])",
-        "test_suite(name = 'cop', tests = [':thief', ':shop'])");
+        """
+        load('//test_defs:foo_binary.bzl', 'foo_binary')
+        load('//test_defs:foo_test.bzl', 'foo_test')
+        foo_binary(
+            name = "thief",
+            srcs = ["thief.sh"],
+        )
+
+        foo_test(
+            name = "shop",
+            srcs = ["shop.cc"],
+        )
+
+        test_suite(
+            name = "cop",
+            tests = [
+                ":shop",
+                ":thief",
+            ],
+        )
+        """);
 
     // This should not throw an exception, and return 0 targets.
     ProtoQueryOutput result = getProtoQueryResult("tests(//donut:cop)");
@@ -314,8 +508,18 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
     options.add("--strict_test_suite=true");
     write(
         "donut/BUILD",
-        "sh_binary(name = 'thief', srcs = ['thief.sh'])",
-        "test_suite(name = 'cop', tests = [':thief'])");
+        """
+        load('//test_defs:foo_binary.bzl', 'foo_binary')
+        foo_binary(
+            name = "thief",
+            srcs = ["thief.sh"],
+        )
+
+        test_suite(
+            name = "cop",
+            tests = [":thief"],
+        )
+        """);
 
     ProtoQueryOutput result = getProtoQueryResult("tests(//donut:cop)");
     BlazeCommandResult blazeCommandResult = result.getQueryOutput().getBlazeCommandResult();
@@ -327,7 +531,11 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
   }
 
   private void createBadBarBuild() throws IOException {
-    Path barBuildFile = write("bar/BUILD", "sh_library(name = 'bar/baz')");
+    Path barBuildFile =
+        write(
+            "bar/BUILD",
+            "load('//test_defs:foo_library.bzl', 'foo_library')",
+            "foo_library(name = 'bar/baz')");
     FileStatus inconsistentFileStatus =
         new FileStatus() {
           @Override
@@ -395,8 +603,12 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
     runInconsistentFileSystem(/*keepGoing=*/ false);
   }
 
-  private void runDepInconsistentFileSystem(boolean keepGoing) throws Exception {
-    write("foo/BUILD", "sh_library(name = 'foo', deps = ['//bar:baz'])");
+  @Test
+  public void depInconsistentFileSystem(@TestParameter boolean keepGoing) throws Exception {
+    write(
+        "foo/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'foo', deps = ['//bar:baz'])");
     createBadBarBuild();
     if (keepGoing) {
       options.add("--keep_going");
@@ -407,21 +619,16 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
     assertExitCode(result, expectedExitcode);
     events.assertContainsError("Inconsistent filesystem operations");
     events.assertContainsError("and referenced by '//foo:foo'");
-    events.assertContainsError("Evaluation of query \"deps(//foo:foo)\" failed: errors were ");
+    if (keepGoing) {
+      events.assertContainsError("Evaluation of query \"deps(//foo:foo)\" failed: errors were ");
+    } else {
+      events.assertContainsError(
+          "Evaluation of query \"deps(//foo:foo)\" failed: preloading transitive closure failed: ");
+    }
     // TODO(janakr): We emit duplicate events: in the ErrorPrintingTargetEdgeErrorObserver and in
     //  TransitiveTargetFunction. Should be able to remove one of them, most likely
     //  TransitiveTargetFunction.
-    assertThat(events.errors()).hasSize(3);
-  }
-
-  @Test
-  public void depInconsistentFileSystemKeepGoing() throws Exception {
-    runDepInconsistentFileSystem(/*keepGoing=*/ true);
-  }
-
-  @Test
-  public void depInconsistentFileSystemNoKeepGoing() throws Exception {
-    runDepInconsistentFileSystem(/*keepGoing=*/ false);
+    assertThat(events.errors()).hasSize(keepGoing ? 3 : 2);
   }
 
   @Test
@@ -437,11 +644,19 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
   public void siblingsFunction() throws Exception {
     write(
         "foo/BUILD",
-        "sh_library(name='t1')",
-        "sh_library(name='t2')",
-        "sh_library(name='t3')",
-        "sh_library(name='t4')",
-        "sh_library(name='t5')");
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+
+        foo_library(name = "t1")
+
+        foo_library(name = "t2")
+
+        foo_library(name = "t3")
+
+        foo_library(name = "t4")
+
+        foo_library(name = "t5")
+        """);
 
     QueryOutput result = getQueryResult("siblings(//foo:t1)");
     assertSuccessfulExitCode(result);
@@ -452,9 +667,24 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
   public void samePackageDirectRDepsFunction() throws Exception {
     write(
         "foo/BUILD",
-        "sh_library(name='t1', srcs=['t1.sh'])",
-        "sh_library(name='t2', srcs=['t2.sh'])",
-        "sh_library(name='t3', srcs=['t2.sh'])");
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+
+        foo_library(
+            name = "t1",
+            srcs = ["t1.sh"],
+        )
+
+        foo_library(
+            name = "t2",
+            srcs = ["t2.sh"],
+        )
+
+        foo_library(
+            name = "t3",
+            srcs = ["t2.sh"],
+        )
+        """);
 
     QueryOutput result = getQueryResult("same_pkg_direct_rdeps(//foo:t1.sh)");
     assertSuccessfulExitCode(result);
@@ -465,7 +695,10 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
 
   @Test
   public void graphlessQuery() throws Exception {
-    write("foo/BUILD", "sh_library(name='foo', srcs=['foo.sh'])");
+    write(
+        "foo/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name='foo', srcs=['foo.sh'])");
 
     QueryOutput result =
         getQueryResult("//foo", "--experimental_graphless_query", "--order_output=no");
@@ -475,7 +708,10 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
 
   @Test
   public void graphlessQueryRequiresUnorderedOutput() throws Exception {
-    write("foo/BUILD", "sh_library(name='foo', srcs=['foo.sh'])");
+    write(
+        "foo/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name='foo', srcs=['foo.sh'])");
 
     QueryOutput result =
         getQueryResult("//foo", "--experimental_graphless_query", "--order_output=deps");
@@ -486,22 +722,11 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
   }
 
   @Test
-  public void graphlessQueryWithLexicographicalOutput() throws Exception {
-    write("foo/BUILD", "sh_library(name='foo', srcs=['foo.sh'])");
-
-    QueryOutput result =
-        getQueryResult(
-            "//foo",
-            "--experimental_graphless_query",
-            "--order_output=auto",
-            "--incompatible_lexicographical_output");
-    assertSuccessfulExitCode(result);
-    assertThat(result.getStdout()).isNotEmpty();
-  }
-
-  @Test
   public void graphlessQueryRequiresStreamedFormatter() throws Exception {
-    write("foo/BUILD", "sh_library(name='foo', srcs=['foo.sh'])");
+    write(
+        "foo/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name='foo', srcs=['foo.sh'])");
 
     QueryOutput result =
         getQueryResult(
@@ -523,12 +748,14 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
 
     write(
         "package/inc.bzl",
-        "def _impl(ctx): pass",
-        "myrule = rule(implementation = _impl)",
-        "def f():",
-        "  g()",
-        "def g():",
-        "  myrule(name='a')");
+        """
+        def _impl(ctx): pass
+        myrule = rule(implementation = _impl)
+        def f():
+          g()
+        def g():
+          myrule(name='a')
+        """);
 
     write("package/BUILD", "load('inc.bzl', 'f')\n" + "f()");
 
@@ -576,14 +803,21 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
   public void ruleStackInProtoOutput() throws Exception {
     write(
         "p/inc.bzl",
-        "def _impl(ctx): pass",
-        "myrule = rule(implementation = _impl)",
-        "def f():",
-        "  g()",
-        "def g():",
-        "  myrule(name='a')");
+        """
+        def _impl(ctx): pass
+        myrule = rule(implementation = _impl)
+        def f():
+          g()
+        def g():
+          myrule(name='a')
+        """);
 
-    write("p/BUILD", "load('inc.bzl', 'f')", "f()");
+    write(
+        "p/BUILD",
+        """
+        load('inc.bzl', 'f')
+        f()
+        """);
     ProtoQueryOutput result =
         getProtoQueryResult("//p:a", "--output=proto", "--proto:instantiation_stack=true");
     assertSuccessfulExitCode(result.getQueryOutput());
@@ -609,13 +843,21 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
 
     write(
         "package/inc.bzl",
-        "def g(name):",
-        "    native.cc_library(name = name)",
-        "",
-        "def f(name):",
-        "    g(name)");
+        """
+        def g(name):
+            native.filegroup(name = name)
 
-    write("package/BUILD", "load(\"inc.bzl\", \"f\")", "f(name = \"a\")", "f(name = \"b\")");
+        def f(name):
+            g(name)
+        """);
+
+    write(
+        "package/BUILD",
+        """
+        load("inc.bzl", "f")
+        f(name = "a")
+        f(name = "b")
+        """);
     QueryOutput result = getQueryResult("//package:all", "--output=build");
     assertSuccessfulExitCode(result);
 
@@ -624,7 +866,7 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
         "# "
             + workspaceDir
             + "/package/BUILD:2:2\n"
-            + "cc_library(\n"
+            + "filegroup(\n"
             + "  name = \"a\",\n"
             + "  generator_name = \"a\",\n"
             + "  generator_function = \"f\",\n"
@@ -640,12 +882,12 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
             + "/package/inc.bzl:5:6  in f\n"
             + "#   "
             + workspaceDir
-            + "/package/inc.bzl:2:22 in g\n"
+            + "/package/inc.bzl:2:21 in g\n"
             + "\n"
             + "# "
             + workspaceDir
             + "/package/BUILD:3:2\n"
-            + "cc_library(\n"
+            + "filegroup(\n"
             + "  name = \"b\",\n"
             + "  generator_name = \"b\",\n"
             + "  generator_function = \"f\",\n"
@@ -661,7 +903,7 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
             + "/package/inc.bzl:5:6  in f\n"
             + "#   "
             + workspaceDir
-            + "/package/inc.bzl:2:22 in g\n\n";
+            + "/package/inc.bzl:2:21 in g\n\n";
 
     String out = new String(result.getStdout(), UTF_8);
     assertThat(out).isEqualTo(expectedOut);
@@ -678,15 +920,56 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
 
     write(
         "depth/BUILD",
-        "sh_binary(name = 'one', srcs = ['one.sh'], deps = [':two'])",
-        "sh_library(name = 'two', srcs = ['two.sh'],",
-        "           deps = [':div2', ':three', '//depth2:three'])",
-        "sh_library(name = 'three', srcs = ['three.sh'], deps = [':four'])",
-        "sh_library(name = 'four', srcs = ['four.sh'], deps = [':div2', ':five'])",
-        "sh_library(name = 'five', srcs = ['five.sh'])",
-        "sh_library(name = 'div2', srcs = ['two.sh'])");
+        """
+        load('//test_defs:foo_binary.bzl', 'foo_binary')
+        load('//test_defs:foo_library.bzl', 'foo_library')
 
-    write("depth2/BUILD", "sh_library(name = 'three', srcs = ['three.sh'])");
+        foo_binary(
+            name = "one",
+            srcs = ["one.sh"],
+            deps = [":two"],
+        )
+
+        foo_library(
+            name = "two",
+            srcs = ["two.sh"],
+            deps = [
+                ":div2",
+                ":three",
+                "//depth2:three",
+            ],
+        )
+
+        foo_library(
+            name = "three",
+            srcs = ["three.sh"],
+            deps = [":four"],
+        )
+
+        foo_library(
+            name = "four",
+            srcs = ["four.sh"],
+            deps = [
+                ":div2",
+                ":five",
+            ],
+        )
+
+        foo_library(
+            name = "five",
+            srcs = ["five.sh"],
+        )
+
+        foo_library(
+            name = "div2",
+            srcs = ["two.sh"],
+        )
+        """);
+
+    write(
+        "depth2/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'three', srcs = ['three.sh'])");
     write("depth/one.sh", "");
     write("depth/two.sh", "");
     write("depth/three.sh", "");
@@ -696,7 +979,7 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
     write("depth2/three.sh", "");
 
     QueryOutput oneDep = getQueryResult("deps(//depth:one, 1)");
-    assertQueryOutputContains(oneDep, "//depth:one.sh", "//depth:two", TestConstants.LAUNCHER_PATH);
+    assertQueryOutputContains(oneDep, "//depth:one.sh", "//depth:two");
     assertQueryOutputDoesNotContain(oneDep, "//depth2");
 
     // Ensure that the whole transitive closure wasn't pulled in earlier if not pre-loading.
@@ -704,7 +987,7 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
         getQueryResult("deps(//depth:one, 3)", "--experimental_ui_debug_all_events");
 
     if (orderResults) {
-      events.assertContainsEvent(EventKind.PROGRESS, "Loading package: depth2");
+      assertContainsEvent(EventKind.PROGRESS, "Loading package: depth2");
     }
 
     assertQueryOutputContains(
@@ -718,8 +1001,7 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
         "//depth:three.sh",
         "//depth:four",
         "//depth2:three",
-        "//depth2:three.sh",
-        TestConstants.LAUNCHER_PATH);
+        "//depth2:three.sh");
 
     QueryOutput oneDepNonExperimental = getQueryResult("deps(//depth:one, 3)");
 
@@ -739,15 +1021,15 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
         "//depth:three.sh",
         "//depth:four",
         "//depth2:three",
-        "//depth2:three.sh",
-        TestConstants.LAUNCHER_PATH);
+        "//depth2:three.sh");
+
+    events.clear();
 
     QueryOutput twoDep =
         getQueryResult("deps(//depth:one, 2)", "--experimental_ui_debug_all_events");
 
-    events.clear();
     // Restricting the query, however, should not cause reloading.
-    events.assertDoesNotContainEvent("Loading package:");
+    assertDoesNotContainEvent("Loading package:");
 
     assertQueryOutputContains(
         twoDep,
@@ -757,8 +1039,7 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
         "//depth:two.sh",
         "//depth:three",
         "//depth:div2",
-        "//depth2:three",
-        TestConstants.LAUNCHER_PATH);
+        "//depth2:three");
 
     // Same as above
     QueryOutput twoDepNonExperimental = getQueryResult("deps(//depth:one, 2)");
@@ -771,8 +1052,7 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
         "//depth:two.sh",
         "//depth:three",
         "//depth:div2",
-        "//depth2:three",
-        TestConstants.LAUNCHER_PATH);
+        "//depth2:three");
   }
 
   @Test
@@ -789,7 +1069,7 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
             NotifyingHelper.makeNotifyingTransformer(
                 (key, type, order, context) -> {
                   if (NotifyingHelper.EventType.IS_READY.equals(type)
-                      && FileStateValue.FILE_STATE.equals(key.functionName())
+                      && FileStateKey.FILE_STATE.equals(key.functionName())
                       && barFile.equals(((RootedPath) key.argument()).getRootRelativePath())) {
                     TrackingAwaiter.INSTANCE.awaitLatchAndTrackExceptions(
                         directoryListingLatch, "Directory never listed");
@@ -812,6 +1092,138 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
         .isEqualTo(FailureDetails.PackageLoading.Code.TRANSIENT_INCONSISTENT_FILESYSTEM_ERROR);
     assertThat(directoryListingLatch.await(0, SECONDS)).isTrue();
     TrackingAwaiter.INSTANCE.assertNoErrors();
+  }
+
+  @Test
+  public void skyQueryStatExtensionPackage() throws Exception {
+    write("foo/BUILD", "load('//foo/bar:bar.bzl', 'sym')");
+    write("foo/bar/bar.bzl", "sym = 0");
+    Path barBuild = write("foo/bar/BUILD");
+    AtomicInteger barBuildCount = new AtomicInteger(0);
+    fs.watchedPaths.put(barBuild.asFragment(), barBuildCount::incrementAndGet);
+    QueryOutput queryResult =
+        getQueryResult("buildfiles(//foo:*)", "--universe_scope=//foo/...", "--order_output=no");
+    assertQueryOutputContains(queryResult, "//foo:BUILD", "//foo/bar:BUILD", "//foo/bar:bar.bzl");
+    assertThat(barBuildCount.get()).isEqualTo(1);
+  }
+
+  @Test
+  public void skyQueryExtensionPackageBuildFileDeletedAfterStat() throws Exception {
+    write("foo/BUILD", "load('//foo/bar:bar.bzl', 'sym')");
+    Path barBzl = write("foo/bar/bar.bzl", "sym = 0");
+    Path barBuild = write("foo/bar/BUILD");
+    AtomicInteger barBuildCount = new AtomicInteger(0);
+    fs.watchedPaths.put(barBuild.asFragment(), barBuildCount::incrementAndGet);
+    fs.watchedPaths.put(
+        barBzl.asFragment(),
+        () -> {
+          syscallCache.clear();
+          try {
+            barBuild.delete();
+          } catch (IOException e) {
+            throw new IllegalStateException(e);
+          }
+        });
+    QueryOutput queryResult =
+        getQueryResult("buildfiles(//foo:*)", "--universe_scope=//foo/...", "--order_output=no");
+    assertQueryOutputContains(queryResult, "//foo:BUILD", "//foo/bar:BUILD", "//foo/bar:bar.bzl");
+    assertThat(barBuildCount.get()).isEqualTo(1);
+  }
+
+  @Test
+  public void skyQueryExtensionPackageBuildFileNotInUniverseHasError() throws Exception {
+    write("foo/BUILD", "load('//foo/bar:bar.bzl', 'sym')");
+    Path barBzl = write("foo/bar/bar.bzl", "sym = 0");
+    Path barBuild = write("foo/bar/BUILD", "bad syntax won't matter");
+    AtomicInteger barBuildCount = new AtomicInteger(0);
+    fs.watchedPaths.put(barBuild.asFragment(), barBuildCount::incrementAndGet);
+    fs.watchedPaths.put(
+        barBzl.asFragment(),
+        () -> {
+          syscallCache.clear();
+          try {
+            barBuild.delete();
+          } catch (IOException e) {
+            throw new IllegalStateException(e);
+          }
+        });
+    QueryOutput queryResult =
+        getQueryResult("buildfiles(//foo:*)", "--universe_scope=//foo:*", "--order_output=no");
+    assertQueryOutputContains(queryResult, "//foo:BUILD", "//foo/bar:BUILD", "//foo/bar:bar.bzl");
+    assertThat(barBuildCount.get()).isEqualTo(1);
+  }
+
+  @Test
+  public void nokeepGoingStopsLoadingPackages() throws Exception {
+    Path fooBuild =
+        write(
+            "foo/BUILD",
+            "load('//test_defs:foo_library.bzl', 'foo_library')",
+            "foo_library(name = 'foo', deps = ['//deppackage'])");
+    write(
+        "bar/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'bar', deps= ['//missing'])");
+    fs.watchedPaths.put(
+        fooBuild.getParentDirectory().getChild("deppackage").asFragment(),
+        () -> fail("deppackage should not have been statted"));
+    PathFragment depPackageBuild = PathFragment.create("deppackage/BUILD");
+    getSkyframeExecutor()
+        .getEvaluator()
+        .injectGraphTransformerForTesting(
+            NotifyingHelper.makeNotifyingTransformer(
+                (key, type, order, context) -> {
+                  if (order == NotifyingHelper.Order.BEFORE
+                      && Objects.equals(key.functionName(), SkyFunctions.FILE)) {
+                    if (!((RootedPath) key.argument())
+                        .getRootRelativePath()
+                        .endsWith(depPackageBuild)) {
+                      return;
+                    }
+                    try {
+                      Thread.sleep(TestUtils.WAIT_TIMEOUT_MILLISECONDS);
+                      fail("Should have been interrupted");
+                    } catch (InterruptedException e) {
+                      // Expected.
+                      Thread.currentThread().interrupt();
+                    }
+                  }
+                }));
+    QueryOutput queryResult = getQueryResult("deps(//foo:all + //bar:all)", "--nokeep_going");
+    assertExitCode(queryResult, ExitCode.ANALYSIS_FAILURE);
+    assertDoesNotContainEvent("deppackage");
+  }
+
+  // Regression test for b/454393488.
+  @Test
+  public void crossPackageWithValidOutputFile() throws Exception {
+    write("package/subpkg/BUILD");
+
+    // Add a rule with an implicit output file with a name which has a prefix. This facilitates a
+    // target with name "subpkg/foo", which incorrectly crosses package boundary "subpkg/", but its
+    // output file is "prefixsubpkg/foo", which is a valid name.
+    write(
+        "package/rule.bzl",
+        """
+        def _impl(ctx): pass
+        my_rule = rule(implementation = _impl,
+                      outputs = {"o": "prefix%{name}.out"})
+        """);
+    write(
+        "package/BUILD",
+        """
+        load("//package:rule.bzl", "my_rule")
+        my_rule(name = "valid_lib")
+        my_rule(name = "subpkg/invalid_lib")
+        """);
+
+    QueryOutput result =
+        getQueryResult("visible(//package:valid_lib, //package:prefixsubpkg/invalid_lib.out)");
+    // Expect an analysis failure and not a complete crash.
+    assertExitCode(result, ExitCode.ANALYSIS_FAILURE);
+    assertThat(result.getBlazeCommandResult().getFailureDetail().getMessage())
+        .contains(
+            "'//package:subpkg/invalid_lib' is invalid because 'package/subpkg' is a subpackage");
   }
 
   private void assertExitCode(QueryOutput result, ExitCode expected) {
@@ -842,7 +1254,7 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
 
   private QueryOutput getQueryResult(String queryString, String... flags) throws Exception {
     Collections.addAll(options, flags);
-    runtimeWrapper.resetOptions();
+    setupOptions();
     runtimeWrapper.addOptions(options);
     runtimeWrapper.addOptions(queryString);
     CommandEnvironment env = runtimeWrapper.newCommand(QueryCommand.class);
@@ -884,6 +1296,9 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
               }
             });
     BlazeCommandResult lastBlazeCommandResult = new QueryCommand().exec(env, options);
+    for (BlazeModule module : getRuntime().getBlazeModules()) {
+      module.afterCommand();
+    }
     return new QueryOutput(lastBlazeCommandResult, stdout.toByteArray());
   }
 
@@ -919,6 +1334,23 @@ public class QueryIntegrationTest extends BuildIntegrationTestCase {
     QueryResult queryResult = QueryResult.parseFrom(stdout, ExtensionRegistry.getEmptyRegistry());
 
     return new ProtoQueryOutput(result, queryResult);
+  }
+
+  private static Build.Target getProtoTarget(ProtoQueryOutput result, String name) {
+    for (Build.Target target : result.getQueryResult().getTargetList()) {
+      String targetName =
+          switch (target.getType()) {
+            case RULE -> target.getRule().getName();
+            case SOURCE_FILE -> target.getSourceFile().getName();
+            case GENERATED_FILE -> target.getGeneratedFile().getName();
+            case PACKAGE_GROUP -> target.getPackageGroup().getName();
+            case ENVIRONMENT_GROUP -> target.getEnvironmentGroup().getName();
+          };
+      if (targetName.equals(name)) {
+        return target;
+      }
+    }
+    throw new AssertionError("No target named " + name + " in " + result.getQueryResult());
   }
 
   Element getResultNode(Document xml, String ruleName) throws Exception {

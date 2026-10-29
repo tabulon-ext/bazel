@@ -18,45 +18,123 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterables;
 import java.util.Collection;
 import java.util.Iterator;
+import java.util.Locale;
+import javax.annotation.Nullable;
 
-/**
- * Various utility methods operating on strings.
- */
+/** Various utility methods operating on strings. */
 public class StringUtil {
+
+  /**
+   * Formats a hierarchical error message by indenting {@code childMessage} under {@code prefix}.
+   *
+   * <p>If {@code childMessage} is null or blank, returns {@code prefix}. Otherwise, returns:
+   *
+   * <pre>
+   * prefix:
+   *   [childMessage indented by 2 spaces per line]
+   * </pre>
+   */
+  public static String formatNested(String prefix, @Nullable String childMessage) {
+    if (childMessage == null || childMessage.isBlank()) {
+      return prefix;
+    }
+    String normalizedPrefix = prefix.stripTrailing();
+    if (normalizedPrefix.endsWith(":")) {
+      normalizedPrefix = normalizedPrefix.substring(0, normalizedPrefix.length() - 1);
+    }
+    return normalizedPrefix + ":\n" + childMessage.strip().indent(2).stripTrailing();
+  }
+
+  /**
+   * IEEE-style threshold for using thousands separators. Numbers with 5+ digits (>= 10,000) get
+   * comma formatting for readability.
+   */
+  private static final int IEEE_THOUSANDS_SEPARATOR_THRESHOLD = 10000;
+
+  /**
+   * Formats a count using IEEE-style thousands separators. Numbers >= 10,000 (5+ digits) are
+   * formatted with commas; smaller numbers are returned as plain strings.
+   *
+   * <p>Examples:
+   *
+   * <ul>
+   *   <li>999 → "999"
+   *   <li>9999 → "9999"
+   *   <li>10000 → "10,000"
+   *   <li>12345 → "12,345"
+   * </ul>
+   */
+  public static String formatCount(long count) {
+    if (count >= IEEE_THOUSANDS_SEPARATOR_THRESHOLD) {
+      return String.format(Locale.ENGLISH, "%,d", count);
+    }
+    return String.valueOf(count);
+  }
+
   /**
    * Creates a comma-separated list of words as in English.
    *
-   * <p>Example: ["a", "b", "c"] -&gt; "a, b or c".
+   * <p>Examples:
+   *
+   * <ul>
+   *   <li>["a"] → "a"
+   *   <li>["a", "b"] → "a or b"
+   *   <li>["a", "b", "c"] → "a, b, or c"
+   * </ul>
    */
   public static String joinEnglishList(Iterable<?> choices) {
-    return joinEnglishList(choices, "or", "");
+    return joinEnglishList(choices, "or", "", /* oxfordComma= */ true);
   }
 
   /**
    * Creates a comma-separated list of words as in English with the given last-separator.
    *
-   * <p>Example with lastSeparator="then": ["a", "b", "c"] -&gt; "a, b then c".
+   * <p>Example with lastSeparator="and": ["a", "b", "c"] → "a, b, and c".
    */
   public static String joinEnglishList(Iterable<?> choices, String lastSeparator) {
-    return joinEnglishList(choices, lastSeparator, "");
+    return joinEnglishList(choices, lastSeparator, "", /* oxfordComma= */ true);
   }
 
   /**
    * Creates a comma-separated list of words as in English with the given last-separator and quotes.
    *
-   * <p>Example with lastSeparator="then", quote="'": ["a", "b", "c"] -&gt; "'a', 'b' then 'c'".
+   * <p>Example with lastSeparator="then", quote="'", oxfordComma=false: ["a", "b", "c"] → "'a', 'b'
+   * then 'c'".
    */
-  public static String joinEnglishList(Iterable<?> choices, String lastSeparator, String quote) {
+  public static String joinEnglishList(
+      Iterable<?> choices, String lastSeparator, String quote, boolean oxfordComma) {
     StringBuilder buf = new StringBuilder();
+    int numChoicesSeen = 0;
     for (Iterator<?> ii = choices.iterator(); ii.hasNext(); ) {
       Object choice = ii.next();
       if (buf.length() > 0) {
-        buf.append(ii.hasNext() ? "," : " " + lastSeparator);
+        if (ii.hasNext() || (oxfordComma && numChoicesSeen >= 2)) {
+          buf.append(",");
+        }
+        if (!ii.hasNext()) {
+          buf.append(" ").append(lastSeparator);
+        }
         buf.append(" ");
       }
       buf.append(quote).append(choice).append(quote);
+      numChoicesSeen++;
     }
     return buf.length() == 0 ? "nothing" : buf.toString();
+  }
+
+  /**
+   * Creates a comma-separated list of singe-quoted words as in English.
+   *
+   * <p>Examples:
+   *
+   * <ul>
+   *   <li>["a"] → "'a'""
+   *   <li>["a", "b"] → "'a' or 'b'"
+   *   <li>["a", "b", "c"] → "'a', 'b', or 'c'"
+   * </ul>
+   */
+  public static String joinEnglishListSingleQuoted(Iterable<?> choices) {
+    return joinEnglishList(choices, "or", "'", /* oxfordComma= */ true);
   }
 
   /**
@@ -89,4 +167,6 @@ public class StringUtil {
         return number + "th";
     }
   }
+
+  private StringUtil() {}
 }

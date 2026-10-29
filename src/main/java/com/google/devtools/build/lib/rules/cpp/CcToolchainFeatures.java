@@ -14,33 +14,34 @@
 
 package com.google.devtools.build.lib.rules.cpp;
 
-import com.github.benmanes.caffeine.cache.CacheLoader;
+import static com.google.devtools.build.lib.rules.cpp.CcToolchainVariables.getSequenceValue;
+
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Joiner;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableMultimap;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.ImmutableSortedMap;
 import com.google.common.collect.Interner;
 import com.google.common.collect.Iterables;
-import com.google.common.collect.Maps;
-import com.google.devtools.build.lib.actions.Artifact.ArtifactExpander;
+import com.google.devtools.build.lib.actions.InputMetadataProvider;
+import com.google.devtools.build.lib.actions.PathMapper;
 import com.google.devtools.build.lib.concurrent.BlazeInterners;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.Immutable;
 import com.google.devtools.build.lib.rules.cpp.CcToolchainVariables.Expandable;
 import com.google.devtools.build.lib.rules.cpp.CcToolchainVariables.SingleVariables;
 import com.google.devtools.build.lib.rules.cpp.CcToolchainVariables.StringChunk;
-import com.google.devtools.build.lib.rules.cpp.CcToolchainVariables.StringValueParser;
+import com.google.devtools.build.lib.skyframe.serialization.VisibleForSerialization;
 import com.google.devtools.build.lib.skyframe.serialization.autocodec.AutoCodec;
-import com.google.devtools.build.lib.skyframe.serialization.autocodec.AutoCodec.VisibleForSerialization;
+import com.google.devtools.build.lib.skyframe.serialization.autocodec.SerializationConstant;
 import com.google.devtools.build.lib.util.Pair;
 import com.google.devtools.build.lib.vfs.PathFragment;
-import com.google.devtools.build.lib.view.config.crosstool.CrosstoolConfig.CToolchain;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -48,13 +49,19 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletionException;
 import java.util.function.Function;
 import javax.annotation.Nullable;
+import net.starlark.java.annot.Param;
+import net.starlark.java.annot.StarlarkBuiltin;
+import net.starlark.java.annot.StarlarkMethod;
 import net.starlark.java.eval.EvalException;
+import net.starlark.java.eval.Sequence;
 import net.starlark.java.eval.Starlark;
+import net.starlark.java.eval.StarlarkList;
+import net.starlark.java.eval.StarlarkThread;
+import net.starlark.java.eval.StarlarkValue;
 
 /**
  * Provides access to features supported by a specific toolchain.
@@ -73,7 +80,8 @@ import net.starlark.java.eval.Starlark;
  * them from build variables).
  */
 @Immutable
-public class CcToolchainFeatures {
+@StarlarkBuiltin(name = "cc_toolchain_features", documented = false)
+public class CcToolchainFeatures implements StarlarkValue {
 
   /**
    * Thrown when a flag value cannot be expanded under a set of build variables.
@@ -84,6 +92,10 @@ public class CcToolchainFeatures {
   public static class ExpansionException extends EvalException {
     ExpansionException(String message) {
       super(message);
+    }
+
+    ExpansionException(String message, @Nullable Throwable cause) {
+      super(message, cause);
     }
   }
 
@@ -100,54 +112,25 @@ public class CcToolchainFeatures {
 
   /** A single flag to be expanded under a set of variables. */
   @Immutable
-  public static class Flag implements Expandable {
-    private final ImmutableList<StringChunk> chunks;
-
-    public Flag(ImmutableList<StringChunk> chunks) {
-      this.chunks = chunks;
-    }
-
-    String getString() {
-      return Joiner.on("")
-          .join(
-              chunks.stream()
-                  .map(chunk -> chunk.getString())
-                  .collect(ImmutableList.toImmutableList()));
-    }
-
+  @AutoCodec
+  record Flag(ImmutableList<StringChunk> chunks) implements Expandable {
     /** Expand this flag into a single new entry in {@code commandLine}. */
     @Override
     public void expand(
         CcToolchainVariables variables,
-        @Nullable ArtifactExpander expander,
+        @Nullable InputMetadataProvider inputMetadataProvider,
+        PathMapper pathMapper,
         List<String> commandLine)
         throws ExpansionException {
       StringBuilder flag = new StringBuilder();
       for (StringChunk chunk : chunks) {
-        flag.append(chunk.expand(variables));
+        flag.append(chunk.expand(variables, pathMapper));
       }
       commandLine.add(flag.toString().intern());
     }
 
-    @Override
-    public boolean equals(@Nullable Object object) {
-      if (this == object) {
-        return true;
-      }
-      if (object instanceof Flag) {
-        Flag that = (Flag) object;
-        return Iterables.elementsEqual(chunks, that.chunks);
-      }
-      return false;
-    }
-
-    @Override
-    public int hashCode() {
-      return Objects.hash(chunks);
-    }
-
     /** A single environment key/value pair to be expanded under a set of variables. */
-    public static Expandable create(ImmutableList<StringChunk> chunks) {
+    static Expandable create(ImmutableList<StringChunk> chunks) {
       if (chunks.size() == 1) {
         return new SingleChunkFlag(chunks.get(0));
       }
@@ -156,73 +139,36 @@ public class CcToolchainFeatures {
 
     /** Optimization for single-chunk case */
     @Immutable
-    static class SingleChunkFlag implements Expandable {
-      private final StringChunk chunk;
-
-      @VisibleForSerialization
-      SingleChunkFlag(StringChunk chunk) {
-        this.chunk = chunk;
-      }
+    @AutoCodec
+    record SingleChunkFlag(StringChunk chunk) implements Expandable {
 
       @Override
       public void expand(
           CcToolchainVariables variables,
-          @Nullable ArtifactExpander artifactExpander,
+          @Nullable InputMetadataProvider inputMetadataProvider,
+          PathMapper pathMapper,
           List<String> commandLine)
           throws ExpansionException {
-        commandLine.add(chunk.expand(variables));
-      }
-
-      @Override
-      public boolean equals(Object o) {
-        if (this == o) {
-          return true;
-        }
-        if (o == null || getClass() != o.getClass()) {
-          return false;
-        }
-        SingleChunkFlag that = (SingleChunkFlag) o;
-        return chunk.equals(that.chunk);
-      }
-
-      String getString() {
-        return chunk.getString();
-      }
-
-      @Override
-      public int hashCode() {
-        return chunk.hashCode();
+        commandLine.add(chunk.expand(variables, pathMapper));
       }
     }
   }
 
   /** A single environment key/value pair to be expanded under a set of variables. */
   @Immutable
-  public static class EnvEntry {
-    private final String key;
-    private final ImmutableList<StringChunk> valueChunks;
+  @AutoCodec
+  public record EnvEntry(
+      String key,
+      ImmutableList<StringChunk> valueChunks,
+      ImmutableSet<String> expandIfAllAvailable) {
 
-    private EnvEntry(CToolchain.EnvEntry envEntry) throws EvalException {
-      this.key = envEntry.getKey();
-      StringValueParser parser = new StringValueParser(envEntry.getValue());
-      this.valueChunks = parser.getChunks();
-    }
-
-    EnvEntry(String key, ImmutableList<StringChunk> valueChunks) {
-      this.key = key;
-      this.valueChunks = valueChunks;
-    }
-
-    String getKey() {
-      return key;
-    }
-
-    String getValue() {
-      return Joiner.on("")
-          .join(
-              valueChunks.stream()
-                  .map(stringChunk -> stringChunk.getString())
-                  .collect(ImmutableList.toImmutableList()));
+    private boolean canBeExpanded(CcToolchainVariables variables) {
+      for (String variable : expandIfAllAvailable) {
+        if (!variables.isAvailable(variable)) {
+          return false;
+        }
+      }
+      return true;
     }
 
     /**
@@ -230,173 +176,100 @@ public class CcToolchainFeatures {
      * value of the entry is expanded with the given {@code variables}.
      */
     public void addEnvEntry(
-        CcToolchainVariables variables, ImmutableMap.Builder<String, String> envBuilder)
+        CcToolchainVariables variables,
+        ImmutableMap.Builder<String, String> envBuilder,
+        PathMapper pathMapper)
         throws ExpansionException {
+      if (!canBeExpanded(variables)) {
+        return;
+      }
       StringBuilder value = new StringBuilder();
       for (StringChunk chunk : valueChunks) {
-        value.append(chunk.expand(variables));
+        value.append(chunk.expand(variables, pathMapper));
       }
       envBuilder.put(key, value.toString());
-    }
-
-    @Override
-    public boolean equals(@Nullable Object object) {
-      if (this == object) {
-        return true;
-      }
-      if (object instanceof EnvEntry) {
-        EnvEntry that = (EnvEntry) object;
-        return Objects.equals(key, that.key)
-            && Iterables.elementsEqual(valueChunks, that.valueChunks);
-      }
-      return false;
-    }
-
-    @Override
-    public int hashCode() {
-      return Objects.hash(key, valueChunks);
     }
   }
 
   /** Used for equality check between a variable and a specific value. */
   @Immutable
-  static class VariableWithValue {
-    public final String variable;
-    public final String value;
-
-    public VariableWithValue(String variable, String value) {
-      this.variable = variable;
-      this.value = value;
-    }
-
-    String getVariable() {
-      return variable;
-    }
-
-    String getValue() {
-      return value;
-    }
-  }
+  @AutoCodec
+  record VariableWithValue(String variable, String value) {}
 
   /**
    * A group of flags. When iterateOverVariable is specified, we assume the variable is a sequence
    * and the flag_group will be expanded repeatedly for every value in the sequence.
    */
   @Immutable
-  static class FlagGroup implements Expandable {
-    private final ImmutableList<Expandable> expandables;
-    private String iterateOverVariable;
-    private final ImmutableSet<String> expandIfAllAvailable;
-    private final ImmutableSet<String> expandIfNoneAvailable;
-    private final String expandIfTrue;
-    private final String expandIfFalse;
-    private final VariableWithValue expandIfEqual;
-
-    private FlagGroup(CToolchain.FlagGroup flagGroup) throws EvalException {
-      ImmutableList.Builder<Expandable> expandables = ImmutableList.builder();
-      Collection<String> flags = flagGroup.getFlagList();
-      Collection<CToolchain.FlagGroup> groups = flagGroup.getFlagGroupList();
-      if (!flags.isEmpty() && !groups.isEmpty()) {
-        // If both flags and flag_groups are available, the original order is not preservable.
-        throw new ExpansionException(
-            "Invalid toolchain configuration: a flag_group must not contain both a flag "
-                + "and another flag_group.");
-      }
-      for (String flag : flags) {
-        StringValueParser parser = new StringValueParser(flag);
-        expandables.add(Flag.create(parser.getChunks()));
-      }
-      for (CToolchain.FlagGroup group : groups) {
-        FlagGroup subgroup = new FlagGroup(group);
-        expandables.add(subgroup);
-      }
-      if (flagGroup.hasIterateOver()) {
-        this.iterateOverVariable = flagGroup.getIterateOver();
-      }
-      this.expandables = expandables.build();
-      this.expandIfAllAvailable = ImmutableSet.copyOf(flagGroup.getExpandIfAllAvailableList());
-      this.expandIfNoneAvailable = ImmutableSet.copyOf(flagGroup.getExpandIfNoneAvailableList());
-      this.expandIfTrue = Strings.emptyToNull(flagGroup.getExpandIfTrue());
-      this.expandIfFalse = Strings.emptyToNull(flagGroup.getExpandIfFalse());
-      if (flagGroup.hasExpandIfEqual()) {
-        this.expandIfEqual = new VariableWithValue(
-            flagGroup.getExpandIfEqual().getVariable(),
-            flagGroup.getExpandIfEqual().getValue());
-      } else {
-        this.expandIfEqual = null;
-      }
-    }
-
-    FlagGroup(
-        ImmutableList<Expandable> expandables,
-        String iterateOverVariable,
-        ImmutableSet<String> expandIfAllAvailable,
-        ImmutableSet<String> expandIfNoneAvailable,
-        String expandIfTrue,
-        String expandIfFalse,
-        VariableWithValue expandIfEqual) {
-      this.expandables = expandables;
-      this.iterateOverVariable = iterateOverVariable;
-      this.expandIfAllAvailable = expandIfAllAvailable;
-      this.expandIfNoneAvailable = expandIfNoneAvailable;
-      this.expandIfTrue = expandIfTrue;
-      this.expandIfFalse = expandIfFalse;
-      this.expandIfEqual = expandIfEqual;
-    }
+  @AutoCodec
+  record FlagGroup(
+      ImmutableList<Expandable> expandables,
+      String iterateOverVariable,
+      ImmutableSet<String> expandIfAllAvailable,
+      ImmutableSet<String> expandIfNoneAvailable,
+      String expandIfTrue,
+      String expandIfFalse,
+      VariableWithValue expandIfEqual)
+      implements Expandable {
 
     @Override
     public void expand(
         CcToolchainVariables variables,
-        @Nullable ArtifactExpander expander,
+        @Nullable InputMetadataProvider inputMetadataProvider,
+        PathMapper pathMapper,
         final List<String> commandLine)
         throws ExpansionException {
-      if (!canBeExpanded(variables, expander)) {
+      if (!canBeExpanded(variables, inputMetadataProvider, pathMapper)) {
         return;
       }
       if (iterateOverVariable != null) {
         for (CcToolchainVariables.VariableValue variableValue :
-            variables.getSequenceVariable(iterateOverVariable, expander)) {
+            getSequenceValue(
+                iterateOverVariable,
+                variables.getVariable(iterateOverVariable, inputMetadataProvider, pathMapper))) {
           CcToolchainVariables nestedVariables =
               new SingleVariables(variables, iterateOverVariable, variableValue);
           for (Expandable expandable : expandables) {
-            expandable.expand(nestedVariables, expander, commandLine);
+            expandable.expand(nestedVariables, inputMetadataProvider, pathMapper, commandLine);
           }
         }
       } else {
         for (Expandable expandable : expandables) {
-          expandable.expand(variables, expander, commandLine);
+          expandable.expand(variables, inputMetadataProvider, pathMapper, commandLine);
         }
       }
     }
 
     private boolean canBeExpanded(
-        CcToolchainVariables variables, @Nullable ArtifactExpander expander)
+        CcToolchainVariables variables,
+        @Nullable InputMetadataProvider inputMetadataProvider,
+        PathMapper pathMapper)
         throws ExpansionException {
       for (String variable : expandIfAllAvailable) {
-        if (!variables.isAvailable(variable, expander)) {
+        if (!variables.isAvailable(variable, inputMetadataProvider)) {
           return false;
         }
       }
       for (String variable : expandIfNoneAvailable) {
-        if (variables.isAvailable(variable, expander)) {
+        if (variables.isAvailable(variable, inputMetadataProvider)) {
           return false;
         }
       }
       if (expandIfTrue != null
-          && (!variables.isAvailable(expandIfTrue, expander)
-              || !variables.getVariable(expandIfTrue).isTruthy())) {
+          && (!variables.isAvailable(expandIfTrue, inputMetadataProvider)
+              || !variables.getVariable(expandIfTrue, pathMapper).isTruthy())) {
         return false;
       }
       if (expandIfFalse != null
-          && (!variables.isAvailable(expandIfFalse, expander)
-              || variables.getVariable(expandIfFalse).isTruthy())) {
+          && (!variables.isAvailable(expandIfFalse, inputMetadataProvider)
+              || variables.getVariable(expandIfFalse, pathMapper).isTruthy())) {
         return false;
       }
       if (expandIfEqual != null
-          && (!variables.isAvailable(expandIfEqual.variable, expander)
+          && (!variables.isAvailable(expandIfEqual.variable, inputMetadataProvider)
               || !variables
-                  .getVariable(expandIfEqual.variable)
-                  .getStringValue(expandIfEqual.variable)
+                  .getVariable(expandIfEqual.variable, pathMapper)
+                  .getStringValue(expandIfEqual.variable, pathMapper)
                   .equals(expandIfEqual.value))) {
         return false;
       }
@@ -420,68 +293,11 @@ public class CcToolchainFeatures {
      */
     private void expandCommandLine(
         CcToolchainVariables variables,
-        @Nullable ArtifactExpander expander,
+        @Nullable InputMetadataProvider inputMetadataProvider,
+        PathMapper pathMapper,
         final List<String> commandLine)
         throws ExpansionException {
-      expand(variables, expander, commandLine);
-    }
-
-    @Override
-    public boolean equals(@Nullable Object object) {
-      if (this == object) {
-        return true;
-      }
-      if (object instanceof FlagGroup) {
-        FlagGroup that = (FlagGroup) object;
-        return Iterables.elementsEqual(expandables, that.expandables)
-            && Objects.equals(iterateOverVariable, that.iterateOverVariable)
-            && Iterables.elementsEqual(expandIfAllAvailable, that.expandIfAllAvailable)
-            && Iterables.elementsEqual(expandIfNoneAvailable, that.expandIfNoneAvailable)
-            && Objects.equals(expandIfTrue, that.expandIfTrue)
-            && Objects.equals(expandIfFalse, that.expandIfFalse)
-            && Objects.equals(expandIfEqual, that.expandIfEqual);
-      }
-      return false;
-    }
-
-    @Override
-    public int hashCode() {
-      return Objects.hash(
-          expandables,
-          iterateOverVariable,
-          expandIfAllAvailable,
-          expandIfNoneAvailable,
-          expandIfTrue,
-          expandIfFalse,
-          expandIfEqual);
-    }
-
-    ImmutableList<Expandable> getExpandables() {
-      return expandables;
-    }
-
-    String getIterateOverVariable() {
-      return iterateOverVariable;
-    }
-
-    ImmutableSet<String> getExpandIfAllAvailable() {
-      return expandIfAllAvailable;
-    }
-
-    ImmutableSet<String> getExpandIfNoneAvailable() {
-      return expandIfNoneAvailable;
-    }
-
-    String getExpandIfTrue() {
-      return expandIfTrue;
-    }
-
-    String getExpandIfFalse() {
-      return expandIfFalse;
-    }
-
-    VariableWithValue getExpandIfEqual() {
-      return expandIfEqual;
+      expand(variables, inputMetadataProvider, pathMapper, commandLine);
     }
   }
 
@@ -491,8 +307,8 @@ public class CcToolchainFeatures {
       return true;
     }
     for (WithFeatureSet featureSet : withFeatureSets) {
-      if (enabledFeatureNames.containsAll(featureSet.getFeatures())
-          && featureSet.getNotFeatures().stream().noneMatch(enabledFeatureNames::contains)) {
+      if (enabledFeatureNames.containsAll(featureSet.features())
+          && featureSet.notFeatures().stream().noneMatch(enabledFeatureNames::contains)) {
         return true;
       }
     }
@@ -501,53 +317,24 @@ public class CcToolchainFeatures {
 
   /** Groups a set of flags to apply for certain actions. */
   @Immutable
-  public static class FlagSet {
-    private final ImmutableSet<String> actions;
-    private final ImmutableSet<String> expandIfAllAvailable;
-    private final ImmutableSet<WithFeatureSet> withFeatureSets;
-    private final ImmutableList<FlagGroup> flagGroups;
-
-    private FlagSet(CToolchain.FlagSet flagSet) throws EvalException {
-      this(flagSet, ImmutableSet.copyOf(flagSet.getActionList()));
-    }
-
-    /** Constructs a FlagSet for the given set of actions. */
-    private FlagSet(CToolchain.FlagSet flagSet, ImmutableSet<String> actions) throws EvalException {
-      this.actions = actions;
-      this.expandIfAllAvailable = ImmutableSet.copyOf(flagSet.getExpandIfAllAvailableList());
-      ImmutableSet.Builder<WithFeatureSet> featureSetBuilder = ImmutableSet.builder();
-      for (CToolchain.WithFeatureSet withFeatureSet : flagSet.getWithFeatureList()) {
-        featureSetBuilder.add(new WithFeatureSet(withFeatureSet));
-      }
-      this.withFeatureSets = featureSetBuilder.build();
-      ImmutableList.Builder<FlagGroup> builder = ImmutableList.builder();
-      for (CToolchain.FlagGroup flagGroup : flagSet.getFlagGroupList()) {
-        builder.add(new FlagGroup(flagGroup));
-      }
-      this.flagGroups = builder.build();
-    }
-
-    FlagSet(
-        ImmutableSet<String> actions,
-        ImmutableSet<String> expandIfAllAvailable,
-        ImmutableSet<WithFeatureSet> withFeatureSets,
-        ImmutableList<FlagGroup> flagGroups) {
-      this.actions = actions;
-      this.expandIfAllAvailable = expandIfAllAvailable;
-      this.withFeatureSets = withFeatureSets;
-      this.flagGroups = flagGroups;
-    }
+  @AutoCodec
+  public record FlagSet(
+      ImmutableSet<String> actions,
+      ImmutableSet<String> expandIfAllAvailable,
+      ImmutableSet<WithFeatureSet> withFeatureSets,
+      ImmutableList<FlagGroup> flagGroups) {
 
     /** Adds the flags that apply to the given {@code action} to {@code commandLine}. */
     private void expandCommandLine(
         String action,
         CcToolchainVariables variables,
         Set<String> enabledFeatureNames,
-        @Nullable ArtifactExpander expander,
+        @Nullable InputMetadataProvider inputMetadataProvider,
+        PathMapper pathMapper,
         List<String> commandLine)
         throws ExpansionException {
       for (String variable : expandIfAllAvailable) {
-        if (!variables.isAvailable(variable, expander)) {
+        if (!variables.isAvailable(variable, inputMetadataProvider)) {
           return;
         }
       }
@@ -558,41 +345,8 @@ public class CcToolchainFeatures {
         return;
       }
       for (FlagGroup flagGroup : flagGroups) {
-        flagGroup.expandCommandLine(variables, expander, commandLine);
+        flagGroup.expandCommandLine(variables, inputMetadataProvider, pathMapper, commandLine);
       }
-    }
-
-    @Override
-    public boolean equals(@Nullable Object object) {
-      if (object instanceof FlagSet) {
-        FlagSet that = (FlagSet) object;
-        return Iterables.elementsEqual(actions, that.actions)
-            && Iterables.elementsEqual(expandIfAllAvailable, that.expandIfAllAvailable)
-            && Iterables.elementsEqual(withFeatureSets, that.withFeatureSets)
-            && Iterables.elementsEqual(flagGroups, that.flagGroups);
-      }
-      return false;
-    }
-
-    @Override
-    public int hashCode() {
-      return Objects.hash(actions, expandIfAllAvailable, withFeatureSets, flagGroups);
-    }
-
-    ImmutableSet<String> getActions() {
-      return actions;
-    }
-
-    ImmutableSet<String> getExpandIfAllAvailable() {
-      return expandIfAllAvailable;
-    }
-
-    ImmutableSet<WithFeatureSet> getWithFeatureSets() {
-      return withFeatureSets;
-    }
-
-    ImmutableList<FlagGroup> getFlagGroups() {
-      return flagGroups;
     }
   }
 
@@ -601,89 +355,16 @@ public class CcToolchainFeatures {
    * is enabled, and every 'not_feature' is not enabled.
    */
   @Immutable
-  public static class WithFeatureSet {
-    private final ImmutableSet<String> features;
-    private final ImmutableSet<String> notFeatures;
-
-    private WithFeatureSet(CToolchain.WithFeatureSet withFeatureSet) {
-      this.features = ImmutableSet.copyOf(withFeatureSet.getFeatureList());
-      this.notFeatures = ImmutableSet.copyOf(withFeatureSet.getNotFeatureList());
-    }
-
-    WithFeatureSet(ImmutableSet<String> features, ImmutableSet<String> notFeatures) {
-      this.features = features;
-      this.notFeatures = notFeatures;
-    }
-
-    public ImmutableSet<String> getFeatures() {
-      return features;
-    }
-
-    public ImmutableSet<String> getNotFeatures() {
-      return notFeatures;
-    }
-
-    @Override
-    public boolean equals(@Nullable Object object) {
-      if (this == object) {
-        return true;
-      }
-      if (object instanceof WithFeatureSet) {
-        WithFeatureSet that = (WithFeatureSet) object;
-        return Iterables.elementsEqual(features, that.features)
-            && Iterables.elementsEqual(notFeatures, that.notFeatures);
-      }
-      return false;
-    }
-
-    @Override
-    public int hashCode() {
-      return Objects.hash(features, notFeatures);
-    }
-  }
+  @AutoCodec
+  public record WithFeatureSet(ImmutableSet<String> features, ImmutableSet<String> notFeatures) {}
 
   /** Groups a set of environment variables to apply for certain actions. */
   @Immutable
-  public static class EnvSet {
-    private final ImmutableSet<String> actions;
-    private final ImmutableList<EnvEntry> envEntries;
-    private final ImmutableSet<WithFeatureSet> withFeatureSets;
-
-    private EnvSet(CToolchain.EnvSet envSet) throws EvalException {
-      this.actions = ImmutableSet.copyOf(envSet.getActionList());
-      ImmutableList.Builder<EnvEntry> builder = ImmutableList.builder();
-      for (CToolchain.EnvEntry envEntry : envSet.getEnvEntryList()) {
-        builder.add(new EnvEntry(envEntry));
-      }
-      ImmutableSet.Builder<WithFeatureSet> withFeatureSetsBuilder = ImmutableSet.builder();
-      for (CToolchain.WithFeatureSet withFeatureSet : envSet.getWithFeatureList()) {
-        withFeatureSetsBuilder.add(new WithFeatureSet(withFeatureSet));
-      }
-
-      this.envEntries = builder.build();
-      this.withFeatureSets = withFeatureSetsBuilder.build();
-    }
-
-    EnvSet(
-        ImmutableSet<String> actions,
-        ImmutableList<EnvEntry> envEntries,
-        ImmutableSet<WithFeatureSet> withFeatureSets) {
-      this.actions = actions;
-      this.envEntries = envEntries;
-      this.withFeatureSets = withFeatureSets;
-    }
-
-    ImmutableSet<String> getActions() {
-      return actions;
-    }
-
-    ImmutableList<EnvEntry> getEnvEntries() {
-      return envEntries;
-    }
-
-    ImmutableSet<WithFeatureSet> getWithFeatureSets() {
-      return withFeatureSets;
-    }
+  @AutoCodec
+  public record EnvSet(
+      ImmutableSet<String> actions,
+      ImmutableList<EnvEntry> envEntries,
+      ImmutableSet<WithFeatureSet> withFeatureSets) {
 
     /**
      * Adds the environment key/value pairs that apply to the given {@code action} to {@code
@@ -692,6 +373,7 @@ public class CcToolchainFeatures {
     private void expandEnvironment(
         String action,
         CcToolchainVariables variables,
+        PathMapper pathMapper,
         Set<String> enabledFeatureNames,
         ImmutableMap.Builder<String, String> envBuilder)
         throws ExpansionException {
@@ -702,27 +384,8 @@ public class CcToolchainFeatures {
         return;
       }
       for (EnvEntry envEntry : envEntries) {
-        envEntry.addEnvEntry(variables, envBuilder);
+        envEntry.addEnvEntry(variables, envBuilder, pathMapper);
       }
-    }
-
-    @Override
-    public boolean equals(@Nullable Object object) {
-      if (this == object) {
-        return true;
-      }
-      if (object instanceof EnvSet) {
-        EnvSet that = (EnvSet) object;
-        return Iterables.elementsEqual(actions, that.actions)
-            && Iterables.elementsEqual(envEntries, that.envEntries)
-            && Iterables.elementsEqual(withFeatureSets, that.withFeatureSets);
-      }
-      return false;
-    }
-
-    @Override
-    public int hashCode() {
-      return Objects.hash(actions, envEntries, withFeatureSets);
     }
   }
 
@@ -734,9 +397,7 @@ public class CcToolchainFeatures {
    */
   interface CrosstoolSelectable {
 
-    /**
-     * Returns the name of this selectable.
-     */
+    /** Returns the name of this selectable. */
     String getName();
   }
 
@@ -755,31 +416,6 @@ public class CcToolchainFeatures {
     private final ImmutableList<String> implies;
     private final ImmutableList<String> provides;
 
-    Feature(CToolchain.Feature feature) throws EvalException {
-      this.name = feature.getName();
-      ImmutableList.Builder<FlagSet> flagSetBuilder = ImmutableList.builder();
-      for (CToolchain.FlagSet flagSet : feature.getFlagSetList()) {
-        flagSetBuilder.add(new FlagSet(flagSet));
-      }
-      this.flagSets = flagSetBuilder.build();
-
-      ImmutableList.Builder<EnvSet> envSetBuilder = ImmutableList.builder();
-      for (CToolchain.EnvSet flagSet : feature.getEnvSetList()) {
-        envSetBuilder.add(new EnvSet(flagSet));
-      }
-      this.envSets = envSetBuilder.build();
-      this.enabled = feature.getEnabled();
-
-      ImmutableList.Builder<ImmutableSet<String>> requiresBuilder = ImmutableList.builder();
-      for (CToolchain.FeatureSet requiresFeatureSet : feature.getRequiresList()) {
-        ImmutableSet<String> featureSet = ImmutableSet.copyOf(requiresFeatureSet.getFeatureList());
-        requiresBuilder.add(featureSet);
-      }
-      this.requires = requiresBuilder.build();
-      this.implies = ImmutableList.copyOf(feature.getImpliesList());
-      this.provides = ImmutableList.copyOf(feature.getProvidesList());
-    }
-
     public Feature(
         String name,
         ImmutableList<FlagSet> flagSets,
@@ -797,18 +433,10 @@ public class CcToolchainFeatures {
       this.provides = provides;
     }
 
-    @AutoCodec.Instantiator
     @VisibleForSerialization
-    static Feature createFeatureForSerialization(
-        String name,
-        ImmutableList<FlagSet> flagSets,
-        ImmutableList<EnvSet> envSets,
-        boolean enabled,
-        ImmutableList<ImmutableSet<String>> requires,
-        ImmutableList<String> implies,
-        ImmutableList<String> provides) {
-      return FEATURE_INTERNER.intern(
-          new Feature(name, flagSets, envSets, enabled, requires, implies, provides));
+    @AutoCodec.Interner
+    static Feature intern(Feature feature) {
+      return FEATURE_INTERNER.intern(feature);
     }
 
     @Override
@@ -816,15 +444,21 @@ public class CcToolchainFeatures {
       return name;
     }
 
+    @Override
+    public String toString() {
+      return MoreObjects.toStringHelper(this).add("name", name).add("enabled", enabled).toString();
+    }
+
     /** Adds environment variables for the given action to the provided builder. */
     private void expandEnvironment(
         String action,
         CcToolchainVariables variables,
+        PathMapper pathMapper,
         Set<String> enabledFeatureNames,
         ImmutableMap.Builder<String, String> envBuilder)
         throws ExpansionException {
       for (EnvSet envSet : envSets) {
-        envSet.expandEnvironment(action, variables, enabledFeatureNames, envBuilder);
+        envSet.expandEnvironment(action, variables, pathMapper, enabledFeatureNames, envBuilder);
       }
     }
 
@@ -833,11 +467,13 @@ public class CcToolchainFeatures {
         String action,
         CcToolchainVariables variables,
         Set<String> enabledFeatureNames,
-        @Nullable ArtifactExpander expander,
+        @Nullable InputMetadataProvider inputMetadataProvider,
+        PathMapper pathMapper,
         List<String> commandLine)
         throws ExpansionException {
       for (FlagSet flagSet : flagSets) {
-        flagSet.expandCommandLine(action, variables, enabledFeatureNames, expander, commandLine);
+        flagSet.expandCommandLine(
+            action, variables, enabledFeatureNames, inputMetadataProvider, pathMapper, commandLine);
       }
     }
 
@@ -854,8 +490,7 @@ public class CcToolchainFeatures {
       if (this == object) {
         return true;
       }
-      if (object instanceof Feature) {
-        Feature that = (Feature) object;
+      if (object instanceof Feature that) {
         return name.equals(that.name)
             && Iterables.elementsEqual(flagSets, that.flagSets)
             && Iterables.elementsEqual(envSets, that.envSets)
@@ -895,24 +530,24 @@ public class CcToolchainFeatures {
    */
   @Immutable
   public static class Tool {
+    enum PathOrigin {
+      CROSSTOOL_PACKAGE,
+      FILESYSTEM_ROOT,
+      WORKSPACE_ROOT
+    }
+
     private final PathFragment toolPathFragment;
-    private final CToolchain.Tool.PathOrigin toolPathOrigin;
+    private final PathOrigin toolPathOrigin;
     private final ImmutableSet<String> executionRequirements;
     private final ImmutableSet<WithFeatureSet> withFeatureSetSets;
 
-    private Tool(CToolchain.Tool tool, ImmutableSet<WithFeatureSet> withFeatureSetSets)
-        throws EvalException {
-      this(
-          PathFragment.create(tool.getToolPath()),
-          tool.getToolPathOrigin(),
-          ImmutableSet.copyOf(tool.getExecutionRequirementList()),
-          withFeatureSetSets);
-    }
+    // Caching tool path string.
+    @Nullable private transient String toolPathString = null;
 
     @VisibleForTesting
     public Tool(
         PathFragment toolPathFragment,
-        CToolchain.Tool.PathOrigin toolPathOrigin,
+        PathOrigin toolPathOrigin,
         ImmutableSet<String> executionRequirements,
         ImmutableSet<WithFeatureSet> withFeatureSetSets)
         throws EvalException {
@@ -923,21 +558,7 @@ public class CcToolchainFeatures {
       this.withFeatureSetSets = withFeatureSetSets;
     }
 
-    @Deprecated
-    @VisibleForTesting
-    public Tool(
-        PathFragment toolPathFragment,
-        ImmutableSet<String> executionRequirements,
-        ImmutableSet<WithFeatureSet> withFeatureSetSets)
-        throws EvalException {
-      this(
-          toolPathFragment,
-          CToolchain.Tool.PathOrigin.CROSSTOOL_PACKAGE,
-          executionRequirements,
-          withFeatureSetSets);
-    }
-
-    private static void checkToolPath(PathFragment toolPath, CToolchain.Tool.PathOrigin origin)
+    private static void checkToolPath(PathFragment toolPath, PathOrigin origin)
         throws EvalException {
       switch (origin) {
         case CROSSTOOL_PACKAGE:
@@ -967,23 +588,19 @@ public class CcToolchainFeatures {
 
     /** Returns the path to this action's tool relative to the provided crosstool path. */
     String getToolPathString(PathFragment ccToolchainPath) {
-      switch (toolPathOrigin) {
-        case CROSSTOOL_PACKAGE:
+      return switch (toolPathOrigin) {
+        case CROSSTOOL_PACKAGE -> {
           // Legacy behavior.
-          return ccToolchainPath.getRelative(toolPathFragment).getSafePathString();
-
-        case FILESYSTEM_ROOT: // fallthrough.
-        case WORKSPACE_ROOT:
-          return toolPathFragment.getSafePathString();
-      }
-
-      // Unreached.
-      throw new IllegalStateException();
+          if (toolPathString == null) {
+            toolPathString = ccToolchainPath.getRelative(toolPathFragment).getSafePathString();
+          }
+          yield toolPathString;
+        }
+        case FILESYSTEM_ROOT, WORKSPACE_ROOT -> toolPathFragment.getSafePathString();
+      };
     }
 
-    /**
-     * Returns a list of requirement hints that apply to the execution of this tool.
-     */
+    /** Returns a list of requirement hints that apply to the execution of this tool. */
     ImmutableSet<String> getExecutionRequirements() {
       return executionRequirements;
     }
@@ -994,14 +611,6 @@ public class CcToolchainFeatures {
      */
     ImmutableSet<WithFeatureSet> getWithFeatureSetSets() {
       return withFeatureSetSets;
-    }
-
-    PathFragment getToolPathFragment() {
-      return toolPathFragment;
-    }
-
-    CToolchain.Tool.PathOrigin getToolPathOrigin() {
-      return toolPathOrigin;
     }
   }
 
@@ -1042,34 +651,6 @@ public class CcToolchainFeatures {
     private final boolean enabled;
     private final ImmutableList<String> implies;
 
-    ActionConfig(CToolchain.ActionConfig actionConfig) throws EvalException {
-      this.configName = actionConfig.getConfigName();
-      this.actionName = actionConfig.getActionName();
-
-      ImmutableList.Builder<Tool> tools = ImmutableList.builder();
-      for (CToolchain.Tool tool : actionConfig.getToolList()) {
-        ImmutableSet<WithFeatureSet> withFeatureSetSets =
-            tool.getWithFeatureList().stream()
-                .map(f -> new WithFeatureSet(f))
-                .collect(ImmutableSet.toImmutableSet());
-        tools.add(new Tool(tool, withFeatureSetSets));
-      }
-      this.tools = tools.build();
-
-      ImmutableList.Builder<FlagSet> flagSetBuilder = ImmutableList.builder();
-      for (CToolchain.FlagSet flagSet : actionConfig.getFlagSetList()) {
-        if (!flagSet.getActionList().isEmpty()) {
-          throw Starlark.errorf(FLAG_SET_WITH_ACTION_ERROR, configName);
-        }
-
-        flagSetBuilder.add(new FlagSet(flagSet, ImmutableSet.of(actionName)));
-      }
-      this.flagSets = flagSetBuilder.build();
-
-      this.enabled = actionConfig.getEnabled();
-      this.implies = ImmutableList.copyOf(actionConfig.getImpliesList());
-    }
-
     public ActionConfig(
         String configName,
         String actionName,
@@ -1085,17 +666,10 @@ public class CcToolchainFeatures {
       this.implies = implies;
     }
 
-    @AutoCodec.Instantiator
     @VisibleForSerialization
-    static ActionConfig createForSerialization(
-        String configName,
-        String actionName,
-        ImmutableList<Tool> tools,
-        ImmutableList<FlagSet> flagSets,
-        boolean enabled,
-        ImmutableList<String> implies) {
-      return ACTION_CONFIG_INTERNER.intern(
-          new ActionConfig(configName, actionName, tools, flagSets, enabled, implies));
+    @AutoCodec.Interner
+    static ActionConfig intern(ActionConfig actionConfig) {
+      return ACTION_CONFIG_INTERNER.intern(actionConfig);
     }
 
     @Override
@@ -1103,44 +677,42 @@ public class CcToolchainFeatures {
       return configName;
     }
 
-    /**
-     * Returns the name of the blaze action this action config applies to.
-     */
+    /** Returns the name of the blaze action this action config applies to. */
     String getActionName() {
       return actionName;
     }
 
     /**
-     * Returns the path to this action's tool relative to the provided crosstool path given a set
-     * of enabled features.
+     * Returns the path to this action's tool relative to the provided crosstool path given a set of
+     * enabled features.
      */
     private Tool getTool(final Set<String> enabledFeatureNames) {
-      Optional<Tool> tool =
-          tools
-              .stream()
-              .filter(t -> isWithFeaturesSatisfied(t.getWithFeatureSetSets(), enabledFeatureNames))
-              .findFirst();
-      if (tool.isPresent()) {
-        return tool.get();
-      } else {
-        throw new IllegalArgumentException(
-            "Matching tool for action "
-                + getActionName()
-                + " not "
-                + "found for given feature configuration");
-      }
+      return tools.stream()
+          .filter(t -> isWithFeaturesSatisfied(t.getWithFeatureSetSets(), enabledFeatureNames))
+          .findFirst()
+          .orElseThrow(
+              () ->
+                  new IllegalArgumentException(
+                      "Matching tool for action %s not found for given feature configuration"
+                          .formatted(getActionName())));
     }
 
     /** Adds the flags that apply to this action to {@code commandLine}. */
     private void expandCommandLine(
         CcToolchainVariables variables,
         Set<String> enabledFeatureNames,
-        @Nullable ArtifactExpander expander,
+        @Nullable InputMetadataProvider inputMetadataProvider,
+        PathMapper pathMapper,
         List<String> commandLine)
         throws ExpansionException {
       for (FlagSet flagSet : flagSets) {
         flagSet.expandCommandLine(
-            actionName, variables, enabledFeatureNames, expander, commandLine);
+            actionName,
+            variables,
+            enabledFeatureNames,
+            inputMetadataProvider,
+            pathMapper,
+            commandLine);
       }
     }
 
@@ -1157,10 +729,9 @@ public class CcToolchainFeatures {
       if (other == this) {
         return true;
       }
-      if (!(other instanceof ActionConfig)) {
+      if (!(other instanceof ActionConfig that)) {
         return false;
       }
-      ActionConfig that = (ActionConfig) other;
 
       return Objects.equals(configName, that.configName)
           && Objects.equals(actionName, that.actionName)
@@ -1186,22 +757,8 @@ public class CcToolchainFeatures {
 
   /** A description of how artifacts of a certain type are named. */
   @Immutable
-  static class ArtifactNamePattern {
-    private final String prefix;
-    private final String extension;
-
-    private ArtifactNamePattern(String prefix, String extension) {
-      this.prefix = prefix;
-      this.extension = extension;
-    }
-
-    String getPrefix() {
-      return this.prefix;
-    }
-
-    String getExtension() {
-      return this.extension;
-    }
+  @AutoCodec
+  record ArtifactNamePattern(String prefix, String extension) {
 
     /** Returns the artifact name that this pattern selects. */
     private String getArtifactName(String baseName) {
@@ -1229,19 +786,11 @@ public class CcToolchainFeatures {
       return result != null ? result : DEFAULT_PATTERNS.get(category);
     }
 
-    public ImmutableMap<ArtifactCategory, ArtifactNamePattern> asImmutableMap() {
-      // Don't have ImmutableMap.Builder#buildKeepingLast in open-source yet.
-      return ImmutableMap.<ArtifactCategory, ArtifactNamePattern>builderWithExpectedSize(
-              DEFAULT_PATTERNS.size())
-          .putAll(prefixExtensionOverrides)
-          .putAll(Maps.filterKeys(DEFAULT_PATTERNS, k -> !prefixExtensionOverrides.containsKey(k)))
-          .buildOrThrow();
-    }
-
     static class Builder {
       private final ImmutableMap.Builder<ArtifactCategory, ArtifactNamePattern> overrides =
           ImmutableMap.builder();
 
+      @CanIgnoreReturnValue
       Builder addOverride(ArtifactCategory category, String prefix, String extension) {
         if (!category.getDefaultPrefix().equals(prefix)
             || !category.getDefaultExtension().equals(extension)) {
@@ -1278,6 +827,7 @@ public class CcToolchainFeatures {
      * used when creation of the real {@link FeatureConfiguration} failed, the rule error was
      * reported, but the analysis continues to collect more rule errors.
      */
+    @SerializationConstant
     public static final FeatureConfiguration EMPTY =
         FEATURE_CONFIGURATION_INTERNER.intern(new FeatureConfiguration());
 
@@ -1290,6 +840,30 @@ public class CcToolchainFeatures {
           /* ccToolchainPath= */ PathFragment.EMPTY_FRAGMENT);
     }
 
+    FeatureConfiguration(
+        ImmutableSet<String> requestedFeatures,
+        ImmutableList<Feature> enabledFeatures,
+        ImmutableSet<String> enabledActionConfigActionNames,
+        ImmutableMap<String, ActionConfig> actionConfigByActionName,
+        PathFragment ccToolchainPath) {
+      // The order of elements in requestFeatures does not matter for equality of any behavior, but
+      // coupled with interning, it makes serialization non-deterministic because it'd depend on
+      // the order in which two objects that are equal but have the different order are first
+      // encountered. Sorting prevents this issue.
+      this.requestedFeatures = ImmutableSet.copyOf(ImmutableList.sortedCopyOf(requestedFeatures));
+      this.enabledFeatures = enabledFeatures;
+
+      this.actionConfigByActionName = ImmutableSortedMap.copyOf(actionConfigByActionName);
+      ImmutableSet.Builder<String> featureBuilder = ImmutableSet.builder();
+      for (Feature feature : enabledFeatures) {
+        featureBuilder.add(feature.getName());
+      }
+      this.enabledFeatureNames = featureBuilder.build();
+      this.enabledActionConfigActionNames = enabledActionConfigActionNames;
+      this.ccToolchainPath = ccToolchainPath;
+    }
+
+    @VisibleForSerialization
     @AutoCodec.Instantiator
     static FeatureConfiguration createForSerialization(
         ImmutableSet<String> requestedFeatures,
@@ -1297,7 +871,7 @@ public class CcToolchainFeatures {
         ImmutableSet<String> enabledActionConfigActionNames,
         ImmutableMap<String, ActionConfig> actionConfigByActionName,
         PathFragment ccToolchainPath) {
-      return FEATURE_CONFIGURATION_INTERNER.intern(
+      return intern(
           new FeatureConfiguration(
               requestedFeatures,
               enabledFeatures,
@@ -1306,23 +880,9 @@ public class CcToolchainFeatures {
               ccToolchainPath));
     }
 
-    FeatureConfiguration(
-        ImmutableSet<String> requestedFeatures,
-        ImmutableList<Feature> enabledFeatures,
-        ImmutableSet<String> enabledActionConfigActionNames,
-        ImmutableMap<String, ActionConfig> actionConfigByActionName,
-        PathFragment ccToolchainPath) {
-      this.requestedFeatures = requestedFeatures;
-      this.enabledFeatures = enabledFeatures;
-
-      this.actionConfigByActionName = actionConfigByActionName;
-      ImmutableSet.Builder<String> featureBuilder = ImmutableSet.builder();
-      for (Feature feature : enabledFeatures) {
-        featureBuilder.add(feature.getName());
-      }
-      this.enabledFeatureNames = featureBuilder.build();
-      this.enabledActionConfigActionNames = enabledActionConfigActionNames;
-      this.ccToolchainPath = ccToolchainPath;
+    @VisibleForTesting
+    static FeatureConfiguration intern(FeatureConfiguration featureConfiguration) {
+      return FEATURE_CONFIGURATION_INTERNER.intern(featureConfiguration);
     }
 
     /**
@@ -1337,72 +897,87 @@ public class CcToolchainFeatures {
       return requestedFeatures;
     }
 
-    /** @return true if tool_path in action_config points to a real tool, not a dummy placeholder */
-    public boolean hasConfiguredLinkerPathInActionConfig() {
-      return isEnabled("has_configured_linker_path");
-    }
-
-    /** @return whether an action config for the blaze action with the given name is enabled. */
+    /**
+     * @return whether an action config for the blaze action with the given name is enabled.
+     */
     boolean actionIsConfigured(String actionName) {
       return enabledActionConfigActionNames.contains(actionName);
     }
 
-    /** @return the command line for the given {@code action}. */
+    /**
+     * @return the command line for the given {@code action}.
+     */
     public List<String> getCommandLine(String action, CcToolchainVariables variables)
         throws ExpansionException {
-      return getCommandLine(action, variables, /* expander= */ null);
+      return getCommandLine(action, variables, /* inputMetadataProvider= */ null, PathMapper.NOOP);
     }
 
     public List<String> getCommandLine(
-        String action, CcToolchainVariables variables, @Nullable ArtifactExpander expander)
+        String action,
+        CcToolchainVariables variables,
+        @Nullable InputMetadataProvider inputMetadataProvider,
+        PathMapper pathMapper)
         throws ExpansionException {
       List<String> commandLine = new ArrayList<>();
       if (actionIsConfigured(action)) {
         actionConfigByActionName
             .get(action)
-            .expandCommandLine(variables, enabledFeatureNames, expander, commandLine);
+            .expandCommandLine(
+                variables, enabledFeatureNames, inputMetadataProvider, pathMapper, commandLine);
       }
 
       for (Feature feature : enabledFeatures) {
-        feature.expandCommandLine(action, variables, enabledFeatureNames, expander, commandLine);
+        feature.expandCommandLine(
+            action, variables, enabledFeatureNames, inputMetadataProvider, pathMapper, commandLine);
       }
 
       return commandLine;
     }
 
-    /** @return the flags expanded for the given {@code action} in per-feature buckets. */
+    /**
+     * @return the flags expanded for the given {@code action} in per-feature buckets.
+     */
     public ImmutableList<Pair<String, List<String>>> getPerFeatureExpansions(
-        String action, CcToolchainVariables variables) throws ExpansionException {
-      return getPerFeatureExpansions(action, variables, null);
+        String action, CcToolchainVariables variables, PathMapper pathMapper)
+        throws ExpansionException {
+      return getPerFeatureExpansions(action, variables, null, pathMapper);
     }
 
     public ImmutableList<Pair<String, List<String>>> getPerFeatureExpansions(
-        String action, CcToolchainVariables variables, @Nullable ArtifactExpander expander)
+        String action,
+        CcToolchainVariables variables,
+        @Nullable InputMetadataProvider inputMetadataProvider,
+        PathMapper pathMapper)
         throws ExpansionException {
       ImmutableList.Builder<Pair<String, List<String>>> perFeatureExpansions =
           ImmutableList.builder();
       if (actionIsConfigured(action)) {
         List<String> commandLine = new ArrayList<>();
         ActionConfig actionConfig = actionConfigByActionName.get(action);
-        actionConfig.expandCommandLine(variables, enabledFeatureNames, expander, commandLine);
+        actionConfig.expandCommandLine(
+            variables, enabledFeatureNames, inputMetadataProvider, pathMapper, commandLine);
         perFeatureExpansions.add(Pair.of(actionConfig.getName(), commandLine));
       }
 
       for (Feature feature : enabledFeatures) {
         List<String> commandLine = new ArrayList<>();
-        feature.expandCommandLine(action, variables, enabledFeatureNames, expander, commandLine);
+        feature.expandCommandLine(
+            action, variables, enabledFeatureNames, inputMetadataProvider, pathMapper, commandLine);
         perFeatureExpansions.add(Pair.of(feature.getName(), commandLine));
       }
 
       return perFeatureExpansions.build();
     }
 
-    /** @return the environment variables (key/value pairs) for the given {@code action}. */
+    /**
+     * @return the environment variables (key/value pairs) for the given {@code action}.
+     */
     public ImmutableMap<String, String> getEnvironmentVariables(
-        String action, CcToolchainVariables variables) throws ExpansionException {
+        String action, CcToolchainVariables variables, PathMapper pathMapper)
+        throws ExpansionException {
       ImmutableMap.Builder<String, String> envBuilder = ImmutableMap.builder();
       for (Feature feature : enabledFeatures) {
-        feature.expandEnvironment(action, variables, enabledFeatureNames, envBuilder);
+        feature.expandEnvironment(action, variables, pathMapper, enabledFeatureNames, envBuilder);
       }
       return envBuilder.buildOrThrow();
     }
@@ -1430,8 +1005,7 @@ public class CcToolchainFeatures {
       if (object == this) {
         return true;
       }
-      if (object instanceof FeatureConfiguration) {
-        FeatureConfiguration that = (FeatureConfiguration) object;
+      if (object instanceof FeatureConfiguration that) {
         // Only compare actionConfigByActionName, enabledActionConfigActionnames and enabledFeatures
         // because enabledFeatureNames is based on the list of Features.
         return Objects.equals(actionConfigByActionName, that.actionConfigByActionName)
@@ -1466,42 +1040,33 @@ public class CcToolchainFeatures {
    */
   private final ImmutableList<CrosstoolSelectable> selectables;
 
-  /**
-   * Maps the selectables's name to the selectable.
-   */
+  /** Maps the selectables's name to the selectable. */
   private final ImmutableMap<String, CrosstoolSelectable> selectablesByName;
 
-  /**
-   * Maps an action's name to the ActionConfig.
-   */
+  /** Maps an action's name to the ActionConfig. */
   private final ImmutableMap<String, ActionConfig> actionConfigsByActionName;
 
-  /**
-   * Maps from a selectable to a set of all the selectables it has a direct 'implies' edge to.
-   */
+  /** Maps from a selectable to a set of all the selectables it has a direct 'implies' edge to. */
   private final ImmutableMultimap<CrosstoolSelectable, CrosstoolSelectable> implies;
 
   /**
-   * Maps from a selectable to all features that have an direct 'implies' edge to this
-   * selectable.
+   * Maps from a selectable to all features that have an direct 'implies' edge to this selectable.
    */
   private final ImmutableMultimap<CrosstoolSelectable, CrosstoolSelectable> impliedBy;
 
   /**
    * Maps from a selectable to a set of selecatable sets, where:
+   *
    * <ul>
-   * <li>a selectable set satisfies the 'requires' condition, if all selectables in the
-   *        selectable set are enabled</li>
-   * <li>the 'requires' condition is satisfied, if at least one of the selectable sets satisfies
-   *        the 'requires' condition.</li>
+   *   <li>a selectable set satisfies the 'requires' condition, if all selectables in the selectable
+   *       set are enabled
+   *   <li>the 'requires' condition is satisfied, if at least one of the selectable sets satisfies
+   *       the 'requires' condition.
    * </ul>
    */
-  private final ImmutableMultimap<CrosstoolSelectable, ImmutableSet<CrosstoolSelectable>>
-      requires;
+  private final ImmutableMultimap<CrosstoolSelectable, ImmutableSet<CrosstoolSelectable>> requires;
 
-  /**
-   * Maps from a string to the set of selectables that 'provide' it.
-   */
+  /** Maps from a string to the set of selectables that 'provide' it. */
   private final ImmutableMultimap<String, CrosstoolSelectable> provides;
 
   /**
@@ -1521,7 +1086,7 @@ public class CcToolchainFeatures {
   private transient LoadingCache<ImmutableSet<String>, FeatureConfiguration> configurationCache =
       buildConfigurationCache();
 
-  private PathFragment ccToolchainPath;
+  private final PathFragment ccToolchainPath;
 
   /**
    * Constructs the feature configuration from a {@link CcToolchainConfigInfo}.
@@ -1530,9 +1095,7 @@ public class CcToolchainFeatures {
    * @param ccToolchainPath location of the cc_toolchain.
    * @throws EvalException if the configuration has logical errors.
    */
-  @VisibleForTesting
-  public CcToolchainFeatures(
-      CcToolchainConfigInfo ccToolchainConfigInfo, PathFragment ccToolchainPath)
+  CcToolchainFeatures(CcToolchainConfigInfo ccToolchainConfigInfo, PathFragment ccToolchainPath)
       throws EvalException {
     // Build up the feature/action config graph.  We refer to features/action configs as
     // 'selectables'.
@@ -1545,7 +1108,8 @@ public class CcToolchainFeatures {
     ImmutableMap.Builder<String, ActionConfig> actionConfigsByActionName = ImmutableMap.builder();
 
     ImmutableList.Builder<String> defaultSelectablesBuilder = ImmutableList.builder();
-    for (Feature feature : ccToolchainConfigInfo.getFeatures()) {
+    ImmutableList<Feature> features = ccToolchainConfigInfo.getFeatures();
+    for (Feature feature : features) {
       selectablesBuilder.add(feature);
       selectablesByName.put(feature.getName(), feature);
       if (feature.isEnabled()) {
@@ -1553,7 +1117,8 @@ public class CcToolchainFeatures {
       }
     }
 
-    for (ActionConfig actionConfig : ccToolchainConfigInfo.getActionConfigs()) {
+    ImmutableList<ActionConfig> actionConfigs = ccToolchainConfigInfo.getActionConfigs();
+    for (ActionConfig actionConfig : actionConfigs) {
       selectablesBuilder.add(actionConfig);
       selectablesByName.put(actionConfig.getName(), actionConfig);
       actionConfigsByActionName.put(actionConfig.getActionName(), actionConfig);
@@ -1564,9 +1129,9 @@ public class CcToolchainFeatures {
     this.defaultSelectables = defaultSelectablesBuilder.build();
 
     this.selectables = selectablesBuilder.build();
-    this.selectablesByName = ImmutableMap.copyOf(selectablesByName);
+    this.selectablesByName = ImmutableSortedMap.copyOf(selectablesByName);
 
-    checkForActionNameDups(ccToolchainConfigInfo.getActionConfigs());
+    checkForActionNameDups(actionConfigs);
     checkForActivatableDups(this.selectables);
 
     this.actionConfigsByActionName = actionConfigsByActionName.buildOrThrow();
@@ -1585,7 +1150,7 @@ public class CcToolchainFeatures {
     ImmutableMultimap.Builder<CrosstoolSelectable, CrosstoolSelectable> requiredBy =
         ImmutableMultimap.builder();
 
-    for (Feature feature : ccToolchainConfigInfo.getFeatures()) {
+    for (Feature feature : features) {
       String name = feature.getName();
       CrosstoolSelectable selectable = selectablesByName.get(name);
       for (ImmutableSet<String> requiredFeatures : feature.getRequires()) {
@@ -1607,7 +1172,7 @@ public class CcToolchainFeatures {
       }
     }
 
-    for (ActionConfig actionConfig : ccToolchainConfigInfo.getActionConfigs()) {
+    for (ActionConfig actionConfig : actionConfigs) {
       String name = actionConfig.getName();
       CrosstoolSelectable selectable = selectablesByName.get(name);
       for (String impliedName : actionConfig.getImplies()) {
@@ -1650,19 +1215,32 @@ public class CcToolchainFeatures {
     }
   }
 
-  /** @return an empty {@code FeatureConfiguration} cache. */
+  /**
+   * @return an empty {@code FeatureConfiguration} cache.
+   */
   private LoadingCache<ImmutableSet<String>, FeatureConfiguration> buildConfigurationCache() {
     return Caffeine.newBuilder()
         // TODO(klimek): Benchmark and tweak once we support a larger configuration.
         .maximumSize(10000)
-        .build(
-            new CacheLoader<ImmutableSet<String>, FeatureConfiguration>() {
-              @Override
-              public FeatureConfiguration load(ImmutableSet<String> requestedFeatures)
-                  throws CollidingProvidesException {
-                return computeFeatureConfiguration(requestedFeatures);
-              }
-            });
+        .build(requestedFeatures -> computeFeatureConfiguration(requestedFeatures));
+  }
+
+  @StarlarkMethod(
+      name = "configure_features",
+      documented = false,
+      parameters = {@Param(name = "requested_features", named = true)},
+      useStarlarkThread = true)
+  public FeatureConfigurationForStarlark configureFeatures(
+      StarlarkList<?> requestedFeatures, StarlarkThread thread) throws EvalException {
+    try {
+      CcModule.checkPrivateStarlarkificationAllowlist(thread);
+      return FeatureConfigurationForStarlark.from(
+          getFeatureConfiguration(
+              ImmutableSet.copyOf(
+                  Sequence.cast(requestedFeatures, String.class, "requested_features"))));
+    } catch (CollidingProvidesException ex) {
+      throw new EvalException(ex);
+    }
   }
 
   /**
@@ -1719,6 +1297,16 @@ public class CcToolchainFeatures {
         .run();
   }
 
+  @StarlarkMethod(
+      name = "default_features_and_action_configs",
+      documented = false,
+      useStarlarkThread = true)
+  public StarlarkList<String> getDefaultFeaturesAndActionConfigsForStarlark(StarlarkThread thread)
+      throws EvalException {
+    CcModule.checkPrivateStarlarkificationAllowlist(thread);
+    return StarlarkList.immutableCopyOf(defaultSelectables);
+  }
+
   public ImmutableList<String> getDefaultFeaturesAndActionConfigs() {
     return defaultSelectables;
   }
@@ -1758,6 +1346,6 @@ public class CcToolchainFeatures {
    * Returns the artifact name extension selected by the toolchain for the given artifact category.
    */
   String getArtifactNameExtensionForCategory(ArtifactCategory artifactCategory) {
-    return artifactNamePatterns.get(artifactCategory).getExtension();
+    return artifactNamePatterns.get(artifactCategory).extension();
   }
 }

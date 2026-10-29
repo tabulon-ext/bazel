@@ -17,333 +17,528 @@ package com.google.devtools.build.lib.actions.cache;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
+import static java.util.Objects.requireNonNull;
 
-import com.google.auto.value.AutoValue;
+import com.google.common.base.MoreObjects;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Lists;
 import com.google.common.io.BaseEncoding;
 import com.google.devtools.build.lib.actions.Artifact;
-import com.google.devtools.build.lib.actions.Artifact.SpecialArtifact;
+import com.google.devtools.build.lib.actions.Artifact.TreeArtifact;
 import com.google.devtools.build.lib.actions.FileArtifactValue;
-import com.google.devtools.build.lib.actions.FileArtifactValue.RemoteFileArtifactValue;
+import com.google.devtools.build.lib.actions.FileArtifactValue.ProxyFileArtifactValue;
+import com.google.devtools.build.lib.actions.MetadataDigestUtils;
 import com.google.devtools.build.lib.actions.cache.Protos.ActionCacheStatistics;
 import com.google.devtools.build.lib.actions.cache.Protos.ActionCacheStatistics.MissReason;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadCompatible;
 import com.google.devtools.build.lib.skyframe.TreeArtifactValue;
+import com.google.devtools.build.lib.skyframe.TreeArtifactValue.ArchivedRepresentation;
+import com.google.devtools.build.lib.util.Fingerprint;
+import com.google.devtools.build.lib.vfs.DigestUtils;
+import com.google.devtools.build.lib.vfs.OutputPermissions;
 import com.google.devtools.build.lib.vfs.PathFragment;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.io.IOException;
 import java.io.PrintStream;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
+import java.time.Duration;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Predicate;
 import javax.annotation.Nullable;
 
 /**
  * An interface defining a cache of already-executed Actions.
  *
- * <p>This class' naming is misleading; it doesn't cache the actual actions, but it stores a
- * fingerprint of the action state (ie. a hash of the input and output files on disk), so
- * we can tell if we need to rerun an action given the state of the file system.
+ * <p>The name of this class is misleading; it doesn't cache the actual actions, only a fingerprint
+ * of all action properties that matter for cache invalidation (action key, path and contents of
+ * input and outputs files, environment variables, execution properties, and certain flags), so we
+ * can tell if we need to rerun an action given the current state of the file system.
  *
- * <p>Each action entry uses one of its output paths as a key (after conversion
- * to the string).
+ * <p>Each action entry uses the path of the action's primary output as the key.
  */
 @ThreadCompatible
 public interface ActionCache {
 
-  /**
-   * Updates the cache entry for the specified key.
-   */
+  /** Updates the cache entry for the specified key. */
   void put(String key, ActionCache.Entry entry);
 
   /**
-   * Returns the corresponding cache entry for the specified key, if any, or
-   * null if not found.
+   * Returns the cache entry for the specified key, or null if not found.
+   *
+   * <p>If an entry exists but is corrupted, returns {@link ActionCache.Entry#CORRUPTED}. Callers
+   * should check {@link ActionCache.Entry#isCorrupted()} before inspecting anything else on the
+   * entry.
    */
+  @Nullable
   ActionCache.Entry get(String key);
 
-  /**
-   * Removes entry from cache
-   */
+  /** Removes entry from cache */
   void remove(String key);
 
-  /**
-   * An entry in the ActionCache that contains all action input and output
-   * artifact paths and their metadata plus action key itself.
-   *
-   * Cache entry operates under assumption that once it is fully initialized
-   * and getFileDigest() method is called, it becomes logically immutable (all methods
-   * will continue to return same result regardless of internal data transformations).
-   */
-  final class Entry {
-    /** Unique instance to represent a corrupted cache entry. */
-    public static final ActionCache.Entry CORRUPTED =
-        new ActionCache.Entry(null, ImmutableMap.<String, String>of(), false);
+  /** Removes entry from cache that matches the predicate. */
+  void removeIf(Predicate<ActionCache.Entry> predicate);
 
-    private final String actionKey;
-    @Nullable
-    // Null iff the corresponding action does not do input discovery.
-    private final List<String> files;
-    // If null, digest is non-null and the entry is immutable.
-    private Map<String, FileArtifactValue> mdMap;
-    private byte[] digest;
-    private final byte[] usedClientEnvDigest;
-    private final Map<String, RemoteFileArtifactValue> outputFileMetadata;
-    private final Map<String, SerializableTreeArtifactValue> outputTreeMetadata;
+  /** An action cache entry. */
+  final class Entry {
+    /** Unique instance standing for a corrupted cache entry. */
+    public static final ActionCache.Entry CORRUPTED =
+        new Entry(null, null, false, ImmutableMap.of(), ImmutableMap.of(), ImmutableList.of());
+
+    private static final byte[] EMPTY_DIGEST = new byte[1];
+
+    // Digest of all relevant properties of the action for cache invalidation purposes.
+    // Null if the entry is corrupted.
+    @Nullable private final byte[] digest;
+
+    // List of input paths discovered by the action.
+    // Null if the action does not discover inputs.
+    @Nullable private final ImmutableList<String> discoveredInputPaths;
+
+    private final boolean prunedInputs;
+
+    // Output metadata.
+    // Only present when building without the bytes, and even then, only for remotely stored files.
+    private final ImmutableMap<String, FileArtifactValue> outputFileMetadata;
+    private final ImmutableMap<String, SerializableTreeArtifactValue> outputTreeMetadata;
+    private final ImmutableList<String> proxyOutputs;
+
+    Entry(
+        @Nullable byte[] digest,
+        @Nullable ImmutableList<String> discoveredInputPaths,
+        boolean prunedInputs,
+        ImmutableMap<String, FileArtifactValue> outputFileMetadata,
+        ImmutableMap<String, SerializableTreeArtifactValue> outputTreeMetadata,
+        ImmutableList<String> proxyOutputs) {
+      checkArgument(
+          !prunedInputs || discoveredInputPaths != null,
+          "Action had unused inputs but no discovered inputs");
+      this.digest = digest;
+      this.discoveredInputPaths = discoveredInputPaths;
+      this.prunedInputs = prunedInputs;
+      this.outputFileMetadata = outputFileMetadata;
+      this.outputTreeMetadata = outputTreeMetadata;
+      this.proxyOutputs = proxyOutputs;
+    }
+
+    /** Returns whether this cache entry is corrupted and should be ignored. */
+    public boolean isCorrupted() {
+      return digest == null;
+    }
 
     /**
-     * The metadata for output tree that can be serialized.
-     *
-     * <p>We can't serialize {@link TreeArtifactValue} directly as it contains some objects that we
-     * don't want to serialize, e.g. {@link SpecialArtifact}.
+     * Returns a digest encoding all relevant properties of the action for cache invalidation
+     * purposes.
      */
-    @AutoValue
-    public abstract static class SerializableTreeArtifactValue {
-      public static SerializableTreeArtifactValue create(
-          ImmutableMap<String, RemoteFileArtifactValue> childValues,
-          Optional<RemoteFileArtifactValue> archivedFileValue) {
-        return new AutoValue_ActionCache_Entry_SerializableTreeArtifactValue(
-            childValues, archivedFileValue);
+    public byte[] getDigest() {
+      checkState(!isCorrupted());
+      return digest;
+    }
+
+    /** Returns whether the action discovers inputs. */
+    public boolean discoversInputs() {
+      checkState(!isCorrupted());
+      return discoveredInputPaths != null;
+    }
+
+    /**
+     * Whether the action detected unused inputs.
+     *
+     * <p>If true, implies {@link #discoversInputs()}, and {@link #getDiscoveredInputPaths()}
+     * returns the used inputs.
+     */
+    public boolean prunedInputs() {
+      checkState(!isCorrupted());
+      return prunedInputs;
+    }
+
+    /**
+     * Returns the list of discovered input paths, or null if the action does not discover inputs.
+     */
+    @Nullable
+    public ImmutableList<String> getDiscoveredInputPaths() {
+      checkState(!isCorrupted());
+      return discoveredInputPaths;
+    }
+
+    /** Gets the metadata of an output file. */
+    @Nullable
+    public FileArtifactValue getOutputFile(Artifact output) {
+      checkState(!isCorrupted());
+      return outputFileMetadata.get(output.getExecPathString());
+    }
+
+    /** Gets the metadata of all output files. */
+    public ImmutableMap<String, FileArtifactValue> getOutputFiles() {
+      checkState(!isCorrupted());
+      return outputFileMetadata;
+    }
+
+    /** Gets the metadata of an output tree. */
+    @Nullable
+    public SerializableTreeArtifactValue getOutputTree(TreeArtifact output) {
+      checkState(!isCorrupted());
+      return outputTreeMetadata.get(output.getExecPathString());
+    }
+
+    /** Gets the metadata of all output trees. */
+    public ImmutableMap<String, SerializableTreeArtifactValue> getOutputTrees() {
+      checkState(!isCorrupted());
+      return outputTreeMetadata;
+    }
+
+    /**
+     * Returns a list of exec path strings for {@linkplain ProxyFileArtifactValue proxied} outputs.
+     */
+    public ImmutableList<String> getProxyOutputs() {
+      checkState(!isCorrupted());
+      return proxyOutputs;
+    }
+
+    /** Returns whether this entry stores any output metadata. */
+    public boolean hasOutputMetadata() {
+      checkState(!isCorrupted());
+      return !outputFileMetadata.isEmpty()
+          || !outputTreeMetadata.isEmpty()
+          || !proxyOutputs.isEmpty();
+    }
+
+    @Override
+    public String toString() {
+      return MoreObjects.toStringHelper(this)
+          .add("digest", digest)
+          .add("discoveredInputPaths", discoveredInputPaths)
+          .add("outputFileMetadata", outputFileMetadata)
+          .add("outputTreeMetadata", outputTreeMetadata)
+          .add("proxyOutputs", proxyOutputs)
+          .toString();
+    }
+
+    void dump(PrintStream out) {
+      if (isCorrupted()) {
+        out.println("  CORRUPTED");
+        return;
+      }
+      out.format("  digest = %s\n", formatDigest(digest));
+      if (discoveredInputPaths != null) {
+        out.println("  discoveredInputPaths =");
+        for (String path : ImmutableList.sortedCopyOf(discoveredInputPaths)) {
+          out.format("    %s\n", path);
+        }
+      }
+
+      if (!outputFileMetadata.isEmpty()) {
+        out.println("  outputFileMetadata =");
+        for (String path : ImmutableList.sortedCopyOf(outputFileMetadata.keySet())) {
+          out.format("    %s = %s\n", path, outputFileMetadata.get(path));
+        }
+      }
+
+      if (!outputTreeMetadata.isEmpty()) {
+        out.println("  outputTreeMetadata =");
+        for (String path : ImmutableList.sortedCopyOf(outputTreeMetadata.keySet())) {
+          out.format("    %s = %s\n", path, outputTreeMetadata.get(path));
+        }
+      }
+    }
+
+    private static String formatDigest(byte[] digest) {
+      return BaseEncoding.base16().lowerCase().encode(digest);
+    }
+
+    /** Serializable representation of {@link TreeArtifactValue}. */
+    public record SerializableTreeArtifactValue(
+        ImmutableMap<String, FileArtifactValue> childValues,
+        Optional<FileArtifactValue> archivedFileValue,
+        Optional<PathFragment> resolvedPath) {
+      public SerializableTreeArtifactValue {
+        requireNonNull(childValues, "childValues");
+        requireNonNull(archivedFileValue, "archivedFileValue");
+        requireNonNull(resolvedPath, "resolvedPath");
       }
 
       /**
        * Creates {@link SerializableTreeArtifactValue} from {@link TreeArtifactValue} by collecting
        * children and archived artifact which are remote.
-       *
-       * <p>If no remote value, {@link Optional#empty} is returned.
        */
-      public static Optional<SerializableTreeArtifactValue> createSerializable(
-          TreeArtifactValue treeMetadata) {
-        ImmutableMap<String, RemoteFileArtifactValue> childValues =
+      public static SerializableTreeArtifactValue create(TreeArtifactValue treeMetadata) {
+        ImmutableMap<String, FileArtifactValue> childValues =
             treeMetadata.getChildValues().entrySet().stream()
                 // Only save remote tree file
                 .filter(e -> e.getValue().isRemote())
                 .collect(
                     toImmutableMap(
-                        e -> e.getKey().getTreeRelativePathString(),
-                        e -> (RemoteFileArtifactValue) e.getValue()));
+                        e -> e.getKey().getTreeRelativePathString(), Map.Entry::getValue));
 
         // Only save remote archived artifact
-        Optional<RemoteFileArtifactValue> archivedFileValue =
+        Optional<FileArtifactValue> archivedFileValue =
             treeMetadata
                 .getArchivedRepresentation()
                 .filter(ar -> ar.archivedFileValue().isRemote())
-                .map(ar -> (RemoteFileArtifactValue) ar.archivedFileValue());
+                .map(ArchivedRepresentation::archivedFileValue);
 
-        if (childValues.isEmpty() && !archivedFileValue.isPresent()) {
-          return Optional.empty();
+        Optional<PathFragment> resolvedPath = treeMetadata.getResolvedPath();
+
+        return new SerializableTreeArtifactValue(childValues, archivedFileValue, resolvedPath);
+      }
+    }
+
+    /** A builder for an action cache entry. */
+    public static final class Builder {
+      private final String actionKey;
+
+      // Input and output metadata are digested separately so that the input digest can be computed
+      // once during the action cache check and reused when writing the entry (see
+      // ActionCacheChecker.Token#getInputDigest). Because MetadataDigestUtils.fromMetadata is an
+      // unordered sum, digesting the two maps separately and combining the results is bit-identical
+      // to digesting a single combined map -- but only as long as their exec paths are disjoint,
+      // which holds because an action cannot have an output among its own inputs. Note that the
+      // per-map deduplication by exec path is load-bearing: an action's input set may contain
+      // distinct Artifact objects sharing an exec path (see b/148692668).
+      private final HashMap<String, FileArtifactValue> outputMetadataMap = new HashMap<>();
+      @Nullable private HashMap<String, FileArtifactValue> inputMetadataMap;
+      @Nullable private byte[] inputDigest;
+
+      private final ImmutableMap<String, String> clientEnv;
+
+      private final String actionExecutionSalt;
+
+      // Discovered inputs.
+      // Null if the action does not discover inputs.
+      @Nullable private final ImmutableList.Builder<String> discoveredInputPaths;
+      private boolean prunedInputs = false;
+
+      private final ImmutableMap.Builder<String, FileArtifactValue> outputFileMetadata =
+          ImmutableMap.builder();
+      private final ImmutableMap.Builder<String, SerializableTreeArtifactValue> outputTreeMetadata =
+          ImmutableMap.builder();
+
+      private final ImmutableList.Builder<String> proxyOutputs = ImmutableList.builder();
+
+      // Settings that affect the outcome of an action but aren't captured in the file metadata.
+      private final OutputPermissions outputPermissions;
+      private final boolean useArchivedTreeArtifacts;
+
+      /**
+       * Creates a new builder.
+       *
+       * @param discoversInputs whether the action discovers inputs.
+       * @param outputPermissions the requested output permissions.
+       * @param useArchivedTreeArtifacts whether archived tree artifacts are enabled.
+       */
+      public Builder(
+          String actionKey,
+          boolean discoversInputs,
+          ImmutableMap<String, String> clientEnv,
+          String actionExecutionSalt,
+          OutputPermissions outputPermissions,
+          boolean useArchivedTreeArtifacts) {
+        this.actionKey = actionKey;
+        this.clientEnv = clientEnv;
+        this.actionExecutionSalt = actionExecutionSalt;
+        this.discoveredInputPaths = discoversInputs ? ImmutableList.builder() : null;
+        this.outputPermissions = outputPermissions;
+        this.useArchivedTreeArtifacts = useArchivedTreeArtifacts;
+      }
+
+      /** Adds metadata of an input file. */
+      @CanIgnoreReturnValue
+      public Builder addInputFile(Artifact artifact, FileArtifactValue metadata) {
+        addInputFile(artifact, metadata, /* saveExecPath= */ false);
+        return this;
+      }
+
+      /** Adds metadata of an input file. */
+      @CanIgnoreReturnValue
+      public Builder addInputFile(
+          Artifact artifact, FileArtifactValue metadata, boolean saveExecPath) {
+        checkState(
+            inputDigest == null,
+            "Cannot add input files when input digest is already set or computed");
+        if (inputMetadataMap == null) {
+          inputMetadataMap = new HashMap<>();
         }
-
-        return Optional.of(SerializableTreeArtifactValue.create(childValues, archivedFileValue));
-      }
-
-      // A map from parentRelativePath to the file metadata
-      public abstract ImmutableMap<String, RemoteFileArtifactValue> childValues();
-
-      public abstract Optional<RemoteFileArtifactValue> archivedFileValue();
-    }
-
-    public Entry(String key, Map<String, String> usedClientEnv, boolean discoversInputs) {
-      actionKey = key;
-      this.usedClientEnvDigest = MetadataDigestUtils.fromEnv(usedClientEnv);
-      files = discoversInputs ? new ArrayList<String>() : null;
-      mdMap = new HashMap<>();
-      outputFileMetadata = new HashMap<>();
-      outputTreeMetadata = new HashMap<>();
-    }
-
-    public Entry(
-        String key,
-        byte[] usedClientEnvDigest,
-        @Nullable List<String> files,
-        byte[] digest,
-        Map<String, RemoteFileArtifactValue> outputFileMetadata,
-        Map<String, SerializableTreeArtifactValue> outputTreeMetadata) {
-      actionKey = key;
-      this.usedClientEnvDigest = usedClientEnvDigest;
-      this.files = files;
-      this.digest = digest;
-      mdMap = null;
-      this.outputFileMetadata = outputFileMetadata;
-      this.outputTreeMetadata = outputTreeMetadata;
-    }
-
-    /** Adds metadata of an output file */
-    public void addOutputFile(Artifact output, FileArtifactValue value, boolean saveFileMetadata) {
-      checkArgument(
-          !output.isTreeArtifact() && !output.isChildOfDeclaredDirectory(),
-          "Must use addOutputTree to save tree artifacts and their children: %s",
-          output);
-      checkState(mdMap != null);
-      checkState(!isCorrupted());
-      checkState(digest == null);
-
-      String execPath = output.getExecPathString();
-      // Only save remote file metadata
-      if (saveFileMetadata && value.isRemote()) {
-        outputFileMetadata.put(execPath, (RemoteFileArtifactValue) value);
-      }
-      mdMap.put(execPath, value);
-    }
-
-    /** Gets metadata of an output file */
-    @Nullable
-    public RemoteFileArtifactValue getOutputFile(Artifact output) {
-      checkState(!isCorrupted());
-      return outputFileMetadata.get(output.getExecPathString());
-    }
-
-    Map<String, RemoteFileArtifactValue> getOutputFiles() {
-      return outputFileMetadata;
-    }
-
-    /** Adds metadata of an output tree */
-    public void addOutputTree(
-        SpecialArtifact output, TreeArtifactValue metadata, boolean saveTreeMetadata) {
-      checkArgument(output.isTreeArtifact(), "artifact must be a tree artifact: %s", output);
-      checkState(mdMap != null);
-      checkState(!isCorrupted());
-      checkState(digest == null);
-
-      String execPath = output.getExecPathString();
-      if (saveTreeMetadata) {
-        SerializableTreeArtifactValue.createSerializable(metadata)
-            .ifPresent(value -> outputTreeMetadata.put(execPath, value));
-      }
-      mdMap.put(execPath, metadata.getMetadata());
-    }
-
-    /** Gets metadata of an output tree */
-    @Nullable
-    public SerializableTreeArtifactValue getOutputTree(SpecialArtifact output) {
-      checkState(!isCorrupted());
-      return outputTreeMetadata.get(output.getExecPathString());
-    }
-
-    Map<String, SerializableTreeArtifactValue> getOutputTrees() {
-      return outputTreeMetadata;
-    }
-
-    /** Adds metadata of an input file */
-    public void addInputFile(
-        PathFragment relativePath, FileArtifactValue md, boolean saveExecPath) {
-      checkState(mdMap != null);
-      checkState(!isCorrupted());
-      checkState(digest == null);
-
-      String execPath = relativePath.getPathString();
-      if (discoversInputs() && saveExecPath) {
-        files.add(execPath);
-      }
-      mdMap.put(execPath, md);
-    }
-
-    public void addInputFile(PathFragment relativePath, FileArtifactValue md) {
-      addInputFile(relativePath, md, /*saveExecPath=*/ true);
-    }
-
-    /**
-     * @return action key string.
-     */
-    public String getActionKey() {
-      return actionKey;
-    }
-
-    /** @return the effectively used client environment */
-    public byte[] getUsedClientEnvDigest() {
-      return usedClientEnvDigest;
-    }
-
-    /**
-     * Returns the combined digest of the action's inputs and outputs.
-     *
-     * <p>This may compress the data into a more compact representation, and makes the object
-     * immutable.
-     */
-    public byte[] getFileDigest() {
-      if (digest == null) {
-        digest = MetadataDigestUtils.fromMetadata(mdMap);
-        mdMap = null;
-      }
-      return digest;
-    }
-
-    /**
-     * Returns true if this cache entry is corrupted and should be ignored.
-     */
-    public boolean isCorrupted() {
-      return this == CORRUPTED;
-    }
-
-    /**
-     * @return stored path strings, or null if the corresponding action does not discover inputs.
-     */
-    public Collection<String> getPaths() {
-      return discoversInputs() ? files : ImmutableList.<String>of();
-    }
-
-    /**
-     * @return whether the corresponding action discovers input files dynamically.
-     */
-    public boolean discoversInputs() {
-      return files != null;
-    }
-
-    private static final String formatDigest(byte[] digest) {
-      return BaseEncoding.base16().lowerCase().encode(digest);
-    }
-
-    @Override
-    public String toString() {
-      StringBuilder builder = new StringBuilder();
-      builder.append("      actionKey = ").append(actionKey).append("\n");
-      builder
-          .append("      usedClientEnvKey = ")
-          .append(formatDigest(usedClientEnvDigest))
-          .append("\n");
-      builder.append("      digestKey = ");
-      if (digest == null) {
-        builder
-            .append(formatDigest(MetadataDigestUtils.fromMetadata(mdMap)))
-            .append(" (from mdMap)\n");
-      } else {
-        builder.append(formatDigest(digest)).append("\n");
-      }
-
-      if (discoversInputs()) {
-        List<String> fileInfo = Lists.newArrayListWithCapacity(files.size());
-        fileInfo.addAll(files);
-        Collections.sort(fileInfo);
-        for (String info : fileInfo) {
-          builder.append("      ").append(info).append("\n");
+        String execPath = artifact.getExecPathString();
+        if (discoveredInputPaths != null && saveExecPath) {
+          discoveredInputPaths.add(execPath);
         }
+        inputMetadataMap.put(execPath, metadata);
+        return this;
       }
 
-      for (Map.Entry<String, RemoteFileArtifactValue> entry : outputFileMetadata.entrySet()) {
-        builder
-            .append("      ")
-            .append(entry.getKey())
-            .append(" = ")
-            .append(entry.getValue())
-            .append("\n");
+      /**
+       * Sets a precomputed digest of the action's input metadata, as returned by {@link
+       * #getInputDigest} on an equivalent builder.
+       *
+       * <p>The array is defensively copied, so the caller may retain and reuse it.
+       */
+      @CanIgnoreReturnValue
+      public Builder setInputDigest(byte[] inputDigest) {
+        requireNonNull(inputDigest, "inputDigest");
+        checkState(
+            discoveredInputPaths == null,
+            "Cannot set input digest for an action that discovers inputs");
+        checkState(
+            this.inputDigest == null && (inputMetadataMap == null || inputMetadataMap.isEmpty()),
+            "Input digest already set or input files already added");
+        this.inputDigest = inputDigest.clone();
+        return this;
       }
 
-      for (Map.Entry<String, SerializableTreeArtifactValue> entry : outputTreeMetadata.entrySet()) {
-        SerializableTreeArtifactValue metadata = entry.getValue();
-        builder.append("      ").append(entry.getKey()).append(" = ").append(metadata).append("\n");
+      /**
+       * Returns the digest of the input metadata added so far, computing and caching it if
+       * necessary.
+       *
+       * <p>Calling this freezes the input side of the builder: subsequent calls to {@link
+       * #addInputFile} will fail. The returned array is a copy and is safe to retain.
+       */
+      public byte[] getInputDigest() {
+        return inputDigest().clone();
       }
 
-      return builder.toString();
+      /**
+       * Returns the cached input digest, computing it on first use.
+       *
+       * <p>The returned array is owned by this builder. Callers must not mutate it, and must not
+       * let {@link DigestUtils#combineUnordered} clobber it.
+       */
+      private byte[] inputDigest() {
+        if (inputDigest == null) {
+          inputDigest =
+              MetadataDigestUtils.fromMetadata(
+                  inputMetadataMap != null ? inputMetadataMap : ImmutableMap.of());
+        }
+        return inputDigest;
+      }
+
+      /** Adds an output file. */
+      @CanIgnoreReturnValue
+      public Builder addOutputFile(Artifact output, FileArtifactValue metadata) {
+        return addOutputFile(output, metadata, /* saveFileMetadata= */ false);
+      }
+
+      /** Adds an output file. */
+      @CanIgnoreReturnValue
+      public Builder addOutputFile(
+          Artifact output, FileArtifactValue metadata, boolean saveFileMetadata) {
+        checkArgument(
+            !output.isTreeArtifact() && !output.isChildOfDeclaredDirectory(),
+            "Must use addOutputTree to save tree artifacts and their children: %s",
+            output);
+        String execPath = output.getExecPathString();
+        // Only save remote and proxy file metadata.
+        if (saveFileMetadata) {
+          if (metadata.isRemote()) {
+            outputFileMetadata.put(execPath, metadata);
+          } else if (metadata instanceof ProxyFileArtifactValue) {
+            proxyOutputs.add(execPath);
+          }
+        }
+        outputMetadataMap.put(execPath, metadata);
+        return this;
+      }
+
+      /** Adds an output tree. */
+      @CanIgnoreReturnValue
+      public Builder addOutputTree(TreeArtifact output, TreeArtifactValue metadata) {
+        return addOutputTree(output, metadata, /* saveTreeMetadata= */ false);
+      }
+
+      /** Adds an output tree. */
+      @CanIgnoreReturnValue
+      public Builder addOutputTree(
+          TreeArtifact output, TreeArtifactValue metadata, boolean saveTreeMetadata) {
+        String execPath = output.getExecPathString();
+        if (saveTreeMetadata) {
+          if (!metadata.getChildValues().isEmpty()
+              && metadata.getChildValues().values().stream()
+                  .allMatch(ProxyFileArtifactValue.class::isInstance)) {
+            proxyOutputs.add(output.getExecPathString());
+          } else {
+            outputTreeMetadata.put(execPath, SerializableTreeArtifactValue.create(metadata));
+          }
+        }
+        outputMetadataMap.put(execPath, metadata.getMetadata());
+        return this;
+      }
+
+      @CanIgnoreReturnValue
+      public Builder setPrunedInputs(boolean prunedInputs) {
+        this.prunedInputs = prunedInputs;
+        return this;
+      }
+
+      public Entry build() {
+        byte[] outputDigest = MetadataDigestUtils.fromMetadata(outputMetadataMap);
+        byte[] inDigest = inputDigest();
+        // combineUnordered() clobbers whichever argument is at least as long as the other. It must
+        // not clobber the cached input digest, both because build() may be called more than once
+        // and because the digest is computed once per action and reused. outputDigest is freshly
+        // allocated here, so clobbering it is safe and avoids an allocation; in the rare case that
+        // it is the shorter of the two (an empty metadata map digests to a single byte), combine
+        // into a copy of the input digest instead.
+        byte[] combinedMetadataDigest =
+            outputDigest.length >= inDigest.length
+                ? DigestUtils.combineUnordered(outputDigest, inDigest)
+                : DigestUtils.combineUnordered(inDigest.clone(), outputDigest);
+
+        return new Entry(
+            computeDigest(
+                actionKey,
+                discoveredInputPaths != null,
+                combinedMetadataDigest,
+                clientEnv,
+                actionExecutionSalt,
+                outputPermissions,
+                useArchivedTreeArtifacts),
+            discoveredInputPaths != null ? discoveredInputPaths.build() : null,
+            prunedInputs,
+            outputFileMetadata.buildOrThrow(),
+            outputTreeMetadata.buildOrThrow(),
+            proxyOutputs.build());
+      }
+
+      private static byte[] computeDigest(
+          String actionKey,
+          boolean discoversInputs,
+          byte[] metadataDigest,
+          Map<String, String> clientEnv,
+          String actionExecutionSalt,
+          OutputPermissions outputPermissions,
+          boolean useArchivedTreeArtifacts) {
+        Fingerprint fp = new Fingerprint();
+        fp.addString(actionKey);
+        fp.addBoolean(discoversInputs);
+        fp.addBytes(metadataDigest);
+        fp.addBytes(computeMapDigest(clientEnv));
+        fp.addString(actionExecutionSalt);
+        fp.addInt(outputPermissions.getPermissionsMode());
+        fp.addBoolean(useArchivedTreeArtifacts);
+        return fp.digestAndReset();
+      }
+
+      private static byte[] computeMapDigest(Map<String, String> map) {
+        if (map.isEmpty()) {
+          return EMPTY_DIGEST;
+        }
+        // Reuse Fingerprint and scratch buffer to avoid per-entry allocations.
+        Fingerprint fp = new Fingerprint();
+        byte[] result = new byte[fp.getDigestLength()];
+        byte[] scratch = new byte[result.length];
+        for (Map.Entry<String, String> entry : map.entrySet()) {
+          fp.addString(entry.getKey());
+          fp.addString(entry.getValue());
+          fp.digestAndReset(scratch, 0, scratch.length);
+          result = DigestUtils.combineUnordered(result, scratch);
+        }
+        return result;
+      }
     }
   }
 
   /**
    * Give persistent cache implementations a notification to write to disk.
+   *
    * @return size in bytes of the serialized cache.
    */
   long save() throws IOException;
@@ -352,9 +547,28 @@ public interface ActionCache {
   void clear();
 
   /**
-   * Dumps action cache content into the given PrintStream.
+   * Returns an {@link ActionCache} with the same backing directory, but whose contents may have
+   * been garbage collected.
+   *
+   * <p>May be safely interrupted. Upon interruption, this instance, including its backing
+   * directory, remains valid. Otherwise, the return value may be the current instance or a
+   * different one, depending on whether garbage collection was deemed necessary. If a different
+   * instance is returned, the current instance must not be used further. Thus, safe usage of this
+   * method looks like {@code actionCache = actionCache.trim(threshold, maxAge)}.
+   *
+   * @param threshold the fraction of stale entries required to trigger garbage collection
+   * @param maxAge the age at which entries are considered stale
+   * @return either the current instance, or a fresh instance that replaces it
+   * @throws IOException if an I/O error occurs
+   * @throws InterruptedException in case of interruption
    */
+  ActionCache trim(float threshold, Duration maxAge) throws IOException, InterruptedException;
+
+  /** Dumps the action cache into a human-readable format. */
   void dump(PrintStream out);
+
+  /** The number of entries in the cache. */
+  int size();
 
   /** Accounts one cache hit. */
   void accountHit();
@@ -373,4 +587,10 @@ public interface ActionCache {
 
   /** Resets the current statistics to zero. */
   void resetStatistics();
+
+  /** Duration it took to load the action cache. Might be null if not loaded in this invocation. */
+  @Nullable
+  default Duration getLoadTime() {
+    return null;
+  }
 }

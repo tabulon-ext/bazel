@@ -18,9 +18,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Iterables;
 import com.google.devtools.build.lib.actions.AbstractAction;
-import com.google.devtools.build.lib.actions.ActionAnalysisMetadata;
 import com.google.devtools.build.lib.actions.ActionExecutionContext;
 import com.google.devtools.build.lib.actions.ActionExecutionMetadata;
 import com.google.devtools.build.lib.actions.ActionInput;
@@ -28,15 +26,15 @@ import com.google.devtools.build.lib.actions.ActionInputHelper;
 import com.google.devtools.build.lib.actions.ActionKeyContext;
 import com.google.devtools.build.lib.actions.ActionOwner;
 import com.google.devtools.build.lib.actions.Artifact;
-import com.google.devtools.build.lib.actions.Artifact.ArtifactExpander;
 import com.google.devtools.build.lib.actions.ArtifactPathResolver;
+import com.google.devtools.build.lib.actions.BaseSpawn;
 import com.google.devtools.build.lib.actions.ExecException;
 import com.google.devtools.build.lib.actions.ExecutionRequirements;
-import com.google.devtools.build.lib.actions.MiddlemanType;
+import com.google.devtools.build.lib.actions.InputMetadataProvider;
 import com.google.devtools.build.lib.actions.ResourceSet;
-import com.google.devtools.build.lib.actions.RunfilesSupplier;
-import com.google.devtools.build.lib.actions.SimpleSpawn;
+import com.google.devtools.build.lib.actions.ResourceSetOrBuilder;
 import com.google.devtools.build.lib.actions.Spawn;
+import com.google.devtools.build.lib.actions.SpawnInputs;
 import com.google.devtools.build.lib.actions.SpawnResult;
 import com.google.devtools.build.lib.analysis.platform.PlatformInfo;
 import com.google.devtools.build.lib.collect.nestedset.NestedSet;
@@ -52,6 +50,7 @@ import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.Symlinks;
 import com.google.devtools.build.lib.vfs.SyscallCache;
+import com.google.protobuf.ByteString;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Collection;
@@ -65,20 +64,22 @@ import javax.annotation.Nullable;
 public class SpawnIncludeScanner {
   /** The grep-includes tool is very lightweight, so don't use the default from AbstractAction. */
   private static final ResourceSet LOCAL_RESOURCES =
-      ResourceSet.createWithRamCpu(/*memoryMb=*/ 10, /*cpuUsage=*/ 1);
+      ResourceSet.createWithRamCpu(/* memoryMb= */ 10, /* cpu= */ 1);
 
   private final Path execRoot;
   private OutputService outputService;
   private boolean inMemoryOutput;
   private final int remoteExtractionThreshold;
   private final SyscallCache syscallCache;
+  private final String productName;
 
   /** Constructs a new SpawnIncludeScanner. */
   public SpawnIncludeScanner(
-      Path execRoot, int remoteExtractionThreshold, SyscallCache syscallCache) {
+      Path execRoot, int remoteExtractionThreshold, SyscallCache syscallCache, String productName) {
     this.execRoot = execRoot;
     this.remoteExtractionThreshold = remoteExtractionThreshold;
     this.syscallCache = syscallCache;
+    this.productName = productName;
   }
 
   public void setOutputService(OutputService outputService) {
@@ -92,17 +93,21 @@ public class SpawnIncludeScanner {
 
   @VisibleForTesting
   Path getIncludesOutput(
-      Artifact src, ArtifactPathResolver resolver, GrepIncludesFileType fileType,
+      Artifact src,
+      ArtifactPathResolver resolver,
+      GrepIncludesFileType fileType,
       boolean placeNextToFile) {
     if (placeNextToFile) {
       // If this is an output file, just place the grepped-file next to it. The directory is bound
       // to exist.
-      return resolver.toPath(src)
+      return resolver
+          .toPath(src)
           .getParentDirectory()
-          .getRelative(src.getFilename() + ".blaze-grepped_includes_" + fileType);
+          .getRelative(src.getFilename() + "." + productName + "-grepped_includes_" + fileType);
     }
-    return resolver.convertPath(execRoot)
-        .getChild("blaze-grepped_includes_" + fileType.getFileType())
+    return resolver
+        .convertPath(execRoot)
+        .getChild(productName + "-grepped_includes_" + fileType.getFileType())
         .getRelative(src.getExecPath());
   }
 
@@ -119,13 +124,22 @@ public class SpawnIncludeScanner {
     if (file.getRoot().getRoot().isAbsolute()) {
       return false;
     }
-    // Files written remotely that are not locally available should be scanned remotely to avoid the
-    // bandwidth and disk space penalty of bringing them across. Also, enable include scanning
-    // remotely when explicitly directed to via a flag.
-    if (remoteExtractionThreshold == 0 || (outputService != null && !file.isSourceArtifact())) {
+    // Enable include scanning remotely when explicitly directed to via a flag.
+    if (remoteExtractionThreshold == 0) {
       return true;
     }
-    FileStatus status = syscallCache.statIfFound(file.getPath(), Symlinks.FOLLOW);
+    // Files written remotely that are not locally available should be scanned remotely to avoid the
+    // bandwidth and disk space penalty of bringing them across.
+    if (!outputService.isLocalOnly() && !file.isSourceArtifact()) {
+      return true;
+    }
+    Path path = file.getPath();
+    // Don't use syscallCache for a derived artifact: it might have been statted before it was
+    // regenerated.
+    FileStatus status =
+        file.isSourceArtifact()
+            ? syscallCache.statIfFound(path, Symlinks.FOLLOW)
+            : path.statIfFound(Symlinks.FOLLOW);
     return status == null || status.getSize() > remoteExtractionThreshold;
   }
 
@@ -143,9 +157,16 @@ public class SpawnIncludeScanner {
      * future.
      */
     private final ActionExecutionMetadata actionExecutionMetadata;
+
+    @Nullable private final PlatformInfo executionPlatform;
+
     private final String progressMessage;
 
-    GrepIncludesAction(ActionExecutionMetadata actionExecutionMetadata, PathFragment input) {
+    GrepIncludesAction(
+        ActionExecutionMetadata actionExecutionMetadata,
+        @Nullable PlatformInfo executionPlatform,
+        PathFragment input) {
+      this.executionPlatform = executionPlatform;
       this.actionExecutionMetadata = Preconditions.checkNotNull(actionExecutionMetadata);
       this.progressMessage = "Extracting include lines from " + input.getPathString();
     }
@@ -176,7 +197,7 @@ public class SpawnIncludeScanner {
     }
 
     @Override
-    public boolean inputsDiscovered() {
+    public boolean inputsKnown() {
       throw new UnsupportedOperationException();
     }
 
@@ -186,28 +207,60 @@ public class SpawnIncludeScanner {
     }
 
     @Override
+    public boolean allowsStrategyRegexpMatching() {
+      return false;
+    }
+
+    @Override
     public NestedSet<Artifact> getTools() {
       throw new UnsupportedOperationException();
     }
 
     @Override
     public NestedSet<Artifact> getInputs() {
-      throw new UnsupportedOperationException();
+      return actionExecutionMetadata.getInputs();
     }
 
     @Override
-    public RunfilesSupplier getRunfilesSupplier() {
+    public NestedSet<Artifact> getOriginalInputs() {
+      return actionExecutionMetadata.getInputs();
+    }
+
+    @Override
+    public NestedSet<Artifact> getSchedulingDependencies() {
       throw new UnsupportedOperationException();
     }
 
     @Override
     public ImmutableMap<String, String> getExecProperties() {
+      if (executionPlatform != null) {
+        return executionPlatform.execProperties();
+      }
       return actionExecutionMetadata.getExecProperties();
+    }
+
+    @Override
+    public ImmutableMap<String, String> getExecutionInfo() {
+      ImmutableMap<String, String> baseProperties = getExecProperties();
+      ImmutableMap<String, String> parentExecutionInfo = actionExecutionMetadata.getExecutionInfo();
+      if (parentExecutionInfo.containsKey(ExecutionRequirements.MAP_DIRECTORY_ACTION)
+          && !baseProperties.containsKey(ExecutionRequirements.MAP_DIRECTORY_ACTION)) {
+        return ImmutableMap.<String, String>builderWithExpectedSize(baseProperties.size() + 1)
+            .putAll(baseProperties)
+            .put(
+                ExecutionRequirements.MAP_DIRECTORY_ACTION,
+                parentExecutionInfo.get(ExecutionRequirements.MAP_DIRECTORY_ACTION))
+            .buildOrThrow();
+      }
+      return baseProperties;
     }
 
     @Override
     @Nullable
     public PlatformInfo getExecutionPlatform() {
+      if (executionPlatform != null) {
+        return executionPlatform;
+      }
       return actionExecutionMetadata.getExecutionPlatform();
     }
 
@@ -245,7 +298,7 @@ public class SpawnIncludeScanner {
 
     @Override
     public String getKey(
-        ActionKeyContext actionKeyContext, @Nullable ArtifactExpander artifactExpander) {
+        ActionKeyContext actionKeyContext, @Nullable InputMetadataProvider inputMetadataProvider) {
       throw new UnsupportedOperationException();
     }
 
@@ -271,16 +324,6 @@ public class SpawnIncludeScanner {
       // This is called to compute orphaned outputs. See getOutputs.
       return ImmutableSet.of();
     }
-
-    @Override
-    public MiddlemanType getActionType() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public boolean shouldReportPathPrefixConflict(ActionAnalysisMetadata action) {
-      throw new UnsupportedOperationException();
-    }
   }
 
   /** Extracts and returns inclusions from "file" using a spawn. */
@@ -289,12 +332,14 @@ public class SpawnIncludeScanner {
       ActionExecutionMetadata actionExecutionMetadata,
       ActionExecutionContext actionExecutionContext,
       Artifact grepIncludes,
+      @Nullable PlatformInfo grepIncludesExecutionPlatform,
       GrepIncludesFileType fileType,
       boolean isOutputFile)
       throws IOException, ExecException, InterruptedException {
     boolean placeNextToFile = isOutputFile && !file.hasParent();
-    Path output = getIncludesOutput(file, actionExecutionContext.getPathResolver(), fileType,
-        placeNextToFile);
+    Path output =
+        getIncludesOutput(
+            file, actionExecutionContext.getPathResolver(), fileType, placeNextToFile);
     if (!inMemoryOutput) {
       AbstractAction.deleteOutput(
           output,
@@ -316,7 +361,8 @@ public class SpawnIncludeScanner {
             // that _this does not work_. We call Spawn.getResourceOwner().getMnemonic() in a lot of
             // places, some of which are downstream from here, and doing so would cause the Spawn
             // and its owning ActionExecutionMetadata to be inconsistent with each other.
-            new GrepIncludesAction(actionExecutionMetadata, file.getExecPath()),
+            new GrepIncludesAction(
+                actionExecutionMetadata, grepIncludesExecutionPlatform, file.getExecPath()),
             actionExecutionContext,
             grepIncludes,
             fileType);
@@ -340,6 +386,7 @@ public class SpawnIncludeScanner {
    *     Otherwise "null"
    * @throws ExecException if scanning fails
    */
+  @Nullable
   private static InputStream spawnGrep(
       Artifact input,
       PathFragment outputExecPath,
@@ -350,9 +397,6 @@ public class SpawnIncludeScanner {
       GrepIncludesFileType fileType)
       throws ExecException, InterruptedException {
     ActionInput output = ActionInputHelper.fromPath(outputExecPath);
-    NestedSet<? extends ActionInput> inputs =
-        NestedSetBuilder.create(Order.STABLE_ORDER, grepIncludes, input);
-    ImmutableSet<ActionInput> outputs = ImmutableSet.of(output);
     ImmutableList<String> command =
         ImmutableList.of(
             grepIncludes.getExecPathString(),
@@ -360,26 +404,28 @@ public class SpawnIncludeScanner {
             outputExecPath.getPathString(),
             fileType.getFileType());
 
-    ImmutableMap.Builder<String, String> execInfoBuilder = ImmutableMap.builder();
-    execInfoBuilder.putAll(resourceOwner.getExecutionInfo());
+    ImmutableMap.Builder<String, String> execInfoBuilder =
+        ImmutableMap.<String, String>builder().putAll(resourceOwner.getExecutionInfo());
     if (inMemoryOutput) {
       execInfoBuilder.put(
-          ExecutionRequirements.REMOTE_EXECUTION_INLINE_OUTPUTS,
-          outputExecPath.getPathString());
+          ExecutionRequirements.REMOTE_EXECUTION_INLINE_OUTPUTS, outputExecPath.getPathString());
+      // grep-includes writes output file to disk. If in-memory output is requested, no-local should
+      // also be added, otherwise, grep-includes could be executed locally resulting output be
+      // written to local disk.
+      execInfoBuilder.put(ExecutionRequirements.NO_LOCAL, "");
     }
     execInfoBuilder.put(ExecutionRequirements.DO_NOT_REPORT, "");
 
     Spawn spawn =
-        new SimpleSpawn(
-            resourceOwner,
+        new GrepIncludesSpawn(
             command,
-            ImmutableMap.of(),
-            execInfoBuilder.buildOrThrow(),
-            inputs,
-            outputs,
-            LOCAL_RESOURCES);
+            execInfoBuilder.buildKeepingLast(),
+            resourceOwner,
+            grepIncludes,
+            input,
+            output);
 
-    actionExecutionContext.maybeReportSubcommand(spawn);
+    actionExecutionContext.maybeReportSubcommand(spawn, /* spawnRunner= */ null);
 
     // Don't share the originalOutErr across spawnGrep calls. Doing so would not be thread-safe.
     FileOutErr originalOutErr = actionExecutionContext.getFileOutErr();
@@ -396,8 +442,12 @@ public class SpawnIncludeScanner {
       throw e;
     }
 
-    SpawnResult result = Iterables.getLast(results);
-    return result.getInMemoryOutput(output);
+    SpawnResult result = results.getFirst();
+    ByteString includesContent = result.getInMemoryOutput(output);
+    if (includesContent != null) {
+      return includesContent.newInput();
+    }
+    return null;
   }
 
   private static void dump(ActionExecutionContext fromContext, ActionExecutionContext toContext) {
@@ -405,6 +455,55 @@ public class SpawnIncludeScanner {
       synchronized (toContext) {
         FileOutErr.dump(fromContext.getFileOutErr(), toContext.getFileOutErr());
       }
+    }
+  }
+
+  private static final class GrepIncludesSpawn extends BaseSpawn {
+    private final SpawnInputs inputs;
+    private final ImmutableSet<ActionInput> outputs;
+
+    GrepIncludesSpawn(
+        ImmutableList<String> arguments,
+        ImmutableMap<String, String> executionInfo,
+        ActionExecutionMetadata action,
+        Artifact grepIncludes,
+        Artifact input,
+        ActionInput output) {
+      // The resources are fixed because the execution info is the compile action's: its
+      // `resources:` entries describe the compiler process rather than this grep, and charging them
+      // here would make include scanning book a full compile's worth of resources.
+      super(
+          arguments,
+          /* environment= */ ImmutableMap.of(),
+          executionInfo,
+          action,
+          ResourceSetOrBuilder.ignoringOverrides(LOCAL_RESOURCES));
+      this.inputs =
+          SpawnInputs.of(NestedSetBuilder.create(Order.STABLE_ORDER, grepIncludes, input));
+      this.outputs = ImmutableSet.of(output);
+    }
+
+    @Override
+    public SpawnInputs getInputFiles() {
+      return inputs;
+    }
+
+    @Override
+    public ImmutableSet<ActionInput> getOutputFiles() {
+      return outputs;
+    }
+
+    @Override
+    public NestedSet<Artifact> getToolFiles() {
+      return NestedSetBuilder.emptySet(Order.STABLE_ORDER);
+    }
+
+    @Override
+    public ImmutableList<ActionInput> getOutputEdgesForExecutionGraph() {
+      // The output of GrepIncludesSpawn is read by the include scanner itself and is not an input
+      // to any other spawn. Hiding it from the execution graph can save a considerable amount of
+      // memory, see b/445300504.
+      return ImmutableList.of();
     }
   }
 }

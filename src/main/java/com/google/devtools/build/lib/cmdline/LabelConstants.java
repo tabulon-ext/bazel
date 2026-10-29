@@ -27,16 +27,10 @@ public class LabelConstants {
   public static final PathFragment MODULE_EXTENSION_WORKING_DIRECTORY_LOCATION =
       PathFragment.create("modextwd");
 
-  /**
-   * The name of the package that contains the targets representing external repositories. Only
-   * works if {@code --experimental_disable_external_package} is not in effect.
-   */
+  /** The reserved package name used for legacy external-repository labels and path handling. */
   public static final PathFragment EXTERNAL_PACKAGE_NAME = PathFragment.create("external");
 
-  /**
-   * The identifier of the package that contains the targets representing external repositories.
-   * Only works if {@code --experimental_disable_external_package} is not in effect.
-   */
+  /** The package identifier corresponding to {@link #EXTERNAL_PACKAGE_NAME}. */
   public static final PackageIdentifier EXTERNAL_PACKAGE_IDENTIFIER =
       PackageIdentifier.createInMainRepo(EXTERNAL_PACKAGE_NAME);
 
@@ -44,14 +38,14 @@ public class LabelConstants {
   public static final PathFragment WORKSPACE_DOT_BAZEL_FILE_NAME =
       PathFragment.create("WORKSPACE.bazel");
   public static final PathFragment MODULE_DOT_BAZEL_FILE_NAME = PathFragment.create("MODULE.bazel");
-  public static final String DEFAULT_REPOSITORY_DIRECTORY = "__main__";
+  public static final PathFragment REPO_FILE_NAME = PathFragment.create("REPO.bazel");
+  public static final PathFragment VENDOR_FILE_NAME = PathFragment.create("VENDOR.bazel");
+
+  public static final PathFragment MODULE_LOCKFILE_NAME = PathFragment.create("MODULE.bazel.lock");
 
   // With this prefix, non-main repositories are symlinked under
   // $output_base/execution_root/__main__/external
   public static final PathFragment EXTERNAL_PATH_PREFIX = PathFragment.create("external");
-  // With this prefix, non-main repositories are sibling symlinks of
-  // $output_base/execution_root/__main__
-  public static final PathFragment EXPERIMENTAL_EXTERNAL_PATH_PREFIX = PathFragment.create("..");
 
   // The relative path from the runfiles workspace root to external repository runfile top
   // directory.
@@ -59,4 +53,7 @@ public class LabelConstants {
   // As a result, external repository runfiles are symlinked to:
   // $runfiles_root/$workspace_name/../$repo_name/<path>, i.e. $runfiles_root/$repo_name/<path>.
   public static final PathFragment EXTERNAL_RUNFILES_PATH_PREFIX = PathFragment.create("..");
+  public static final String COMMAND_LINE_OPTION_PREFIX = "//command_line_option:";
+  public static final PackageIdentifier COMMAND_LINE_OPTION_PACKAGE_IDENTIFIER =
+      PackageIdentifier.createInMainRepo(PathFragment.create("command_line_option"));
 }

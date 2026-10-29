@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright 2016 The Bazel Authors. All rights reserved.
 #
@@ -42,21 +42,6 @@ fi
 source "$(rlocation "io_bazel/src/test/shell/integration_test_setup.sh")" \
   || { echo "integration_test_setup.sh not found!" >&2; exit 1; }
 
-# `uname` returns the current platform, e.g "MSYS_NT-10.0" or "Linux".
-# `tr` converts all upper case letters to lower case.
-# `case` matches the result if the `uname | tr` expression to string prefixes
-# that use the same wildcards as names do in Bash, i.e. "msys*" matches strings
-# starting with "msys", and "*" matches everything (it's the default case).
-case "$(uname -s | tr [:upper:] [:lower:])" in
-msys*)
-  # As of 2019-01-15, Bazel on Windows only supports MSYS Bash.
-  declare -r is_windows=true
-  ;;
-*)
-  declare -r is_windows=false
-  ;;
-esac
-
 if [[ -n "${1:-}" ]]; then
   declare -r DISTFILE=$(rlocation io_bazel/${1#./})
 else
@@ -67,6 +52,21 @@ if [[ -n "${2:-}" ]]; then
   declare -r EMBEDDED_JDK=$(rlocation io_bazel/${2#./})
 else
   declare -r EMBEDDED_JDK=""
+fi
+
+# The prerequisites documented at
+# https://bazel.build/install/compile-source#bootstrap-unix-prereq ask for a JDK
+# 25, so bootstrap with a hermetic JDK 25 from the runfiles rather than with
+# whichever JDK happens to be installed on the machine running this test. This
+# both keeps the test hermetic and verifies that a JDK 25 is in fact sufficient.
+setup_javabase
+export JAVA_HOME="${bazel_javabase}"
+# JAVA_TOOL_OPTIONS and _JAVA_OPTIONS make the JVM print an extra line, so unset
+# them for this check just like compile.sh does for the bootstrap itself.
+declare -r JAVAC_VERSION="$(unset JAVA_TOOL_OPTIONS _JAVA_OPTIONS; \
+  "${JAVA_HOME}/bin/javac" -version 2>&1)"
+if [[ ! "${JAVAC_VERSION}" =~ ^javac\ 25(\.|$) ]]; then
+  log_fatal "expected a JDK 25 in JAVA_HOME, but got '${JAVAC_VERSION}'"
 fi
 
 function test_bootstrap() {
@@ -102,13 +102,59 @@ function test_bootstrap() {
 
     JAVABASE=$(echo reduced*)
 
-    env EXTRA_BAZEL_ARGS="--host_javabase=@local_jdk//:jdk --tool_java_runtime_version=local_jdk" ./compile.sh \
-        || fail "Expected to be able to bootstrap bazel"
+    # TODO: Enable macOS layering_check when dependencies are updated
+    export EXTRA_BAZEL_ARGS="${EXTRA_BAZEL_ARGS:-} \
+      --repo_env=APPLE_SUPPORT_LAYERING_CHECK_BETA=0"
+
+    ./compile.sh || fail "Expected to be able to bootstrap bazel.\
+ If you updated MODULE.bazel, see the NOTE in that file."
+
     ./output/bazel \
       --server_javabase=$JAVABASE --host_jvm_args=--add-opens=java.base/java.nio=ALL-UNNAMED \
       version --nognu_format &> "${TEST_log}" \
       || fail "Generated bazel not working"
     expect_log "${SOURCE_DATE_EPOCH}"
+
+    # the repo cache is currently missing canonical IDs
+    export BAZEL_HTTP_RULES_URLS_AS_DEFAULT_CANONICAL_ID=0
+
+    JAVA_VERSION=100 # so we don't accidentally match something else
+
+    # create a fake toolchain to avoid @remote_java_tools
+    # this can't actually build anything, but we're just testing analysis
+    mkdir fake_java_toolchain
+    touch fake_java_toolchain/dummy.jar
+    cat << EOF > fake_java_toolchain/BUILD
+load("@rules_java//toolchains:default_java_toolchain.bzl", "default_java_toolchain")
+default_java_toolchain(
+    name = "fake_java_toolchain",
+    bootclasspath = [":dummy.jar"],
+    genclass = ":dummy.jar",
+    header_compiler = ":dummy.jar",
+    header_compiler_direct = ":dummy.jar",
+    ijar = ":dummy.jar",
+    jacocorunner = ":dummy.jar",
+    java_runtime = "@local_jdk//:jdk",
+    javabuilder = ":dummy.jar",
+    oneversion = ":dummy.jar",
+    singlejar = ":dummy.jar",
+    source_version = "${JAVA_VERSION}",
+    target_version = "${JAVA_VERSION}",
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+EOF
+
+    ./output/bazel \
+      --server_javabase=$JAVABASE --host_jvm_args=--add-opens=java.base/java.nio=ALL-UNNAMED \
+      build --nobuild --repository_cache=derived/repository_cache --repo_contents_cache= \
+      --repo_env=APPLE_SUPPORT_LAYERING_CHECK_BETA=0 \
+      --override_repository=$(cat derived/maven/MAVEN_CANONICAL_REPO_NAME)=derived/maven \
+      --java_language_version=${JAVA_VERSION} --tool_java_language_version=${JAVA_VERSION} \
+      --java_runtime_version=local_jdk --tool_java_runtime_version=local_jdk \
+      --extra_toolchains=@rules_python//python/runtime_env_toolchains:all \
+      --extra_toolchains=fake_java_toolchain:all \
+      src:bazel_nojdk &> "${TEST_log}" || fail "analysis with bootstrapped Bazel failed"
 }
 
 run_suite "bootstrap test"

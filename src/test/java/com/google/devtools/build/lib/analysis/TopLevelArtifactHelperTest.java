@@ -14,13 +14,13 @@
 
 package com.google.devtools.build.lib.analysis;
 
-import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.devtools.build.lib.analysis.OutputGroupInfo.HIDDEN_OUTPUT_GROUP_PREFIX;
 import static com.google.devtools.build.lib.analysis.TopLevelArtifactHelper.getAllArtifactsToBuild;
 import static java.util.Arrays.asList;
 
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ImmutableSortedSet;
 import com.google.devtools.build.lib.actions.Artifact;
 import com.google.devtools.build.lib.actions.ArtifactRoot;
@@ -28,12 +28,12 @@ import com.google.devtools.build.lib.actions.ArtifactRoot.RootType;
 import com.google.devtools.build.lib.actions.util.ActionsTestUtil;
 import com.google.devtools.build.lib.analysis.TopLevelArtifactHelper.ArtifactsInOutputGroup;
 import com.google.devtools.build.lib.analysis.TopLevelArtifactHelper.ArtifactsToBuild;
-import com.google.devtools.build.lib.collect.nestedset.NestedSet;
 import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
 import com.google.devtools.build.lib.collect.nestedset.Order;
 import com.google.devtools.build.lib.testutil.Scratch;
 import com.google.devtools.build.lib.util.Pair;
 import com.google.devtools.build.lib.vfs.Path;
+import java.util.TreeMap;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -54,20 +54,22 @@ public class TopLevelArtifactHelperTest {
   public final void setRootDir() throws Exception {
     Scratch scratch = new Scratch();
     Path execRoot = scratch.getFileSystem().getPath("/");
-    root = ArtifactRoot.asDerivedRoot(execRoot, RootType.Output, "blaze-out");
+    root = ArtifactRoot.asDerivedRoot(execRoot, RootType.OUTPUT, "blaze-out");
     path = scratch.dir("/blaze-out/foo");
   }
 
-  private void setup(Iterable<Pair<String, Integer>> groupArtifacts) {
-    ImmutableSortedSet.Builder<String> setBuilder = ImmutableSortedSet.naturalOrder();
-    ImmutableMap.Builder<String, NestedSet<Artifact>> mapBuilder = ImmutableMap.builder();
-    for (Pair<String, Integer> groupArtifact : groupArtifacts) {
-      setBuilder.add(checkNotNull(groupArtifact.getFirst()));
-      mapBuilder.put(
-          groupArtifact.getFirst(), newArtifacts(checkNotNull(groupArtifact.getSecond())));
+  private void setup(Iterable<Pair<String, Integer>> groups) {
+    TreeMap<String, NestedSetBuilder<Artifact>> outputGroups = new TreeMap<>();
+    for (var pair : groups) {
+      outputGroups.put(pair.first, newArtifacts(pair.second));
     }
-    ctx = new TopLevelArtifactContext(false, false, false, setBuilder.build());
-    groupProvider = new OutputGroupInfo(mapBuilder.build());
+    groupProvider = OutputGroupInfo.fromBuilders(outputGroups);
+    ctx =
+        new TopLevelArtifactContext(
+            false,
+            ImmutableSortedSet.copyOf(groupProvider),
+            /* failOnUnknownOutputGroups= */ false,
+            /* forRunCommand= */ false);
   }
 
   @Test
@@ -109,12 +111,32 @@ public class TopLevelArtifactHelperTest {
     assertThat(allArtifacts.getImportantArtifacts().toList()).hasSize(2);
   }
 
-  private NestedSet<Artifact> newArtifacts(int num) {
-    NestedSetBuilder<Artifact> builder = new NestedSetBuilder<>(Order.STABLE_ORDER);
+  @Test
+  public void importantArtifactsExcluding() {
+    setup(
+        asList(
+            Pair.of(HIDDEN_OUTPUT_GROUP_PREFIX + "notimportant", 1),
+            Pair.of("skipped", 2),
+            Pair.of("kept", 3)));
+
+    ArtifactsToBuild allArtifacts = getAllArtifactsToBuild(groupProvider, null, ctx);
+    assertThat(allArtifacts.getAllArtifacts().toList()).hasSize(6);
+    assertThat(allArtifacts.getImportantArtifacts().toList()).hasSize(5);
+    assertThat(allArtifacts.getImportantArtifactsExcluding(ImmutableSet.of("skipped")).toList())
+        .hasSize(3);
+    assertThat(
+            allArtifacts
+                .getImportantArtifactsExcluding(ImmutableSet.of("skipped", "kept"))
+                .toList())
+        .isEmpty();
+  }
+
+  private NestedSetBuilder<Artifact> newArtifacts(int num) {
+    NestedSetBuilder<Artifact> builder = NestedSetBuilder.newBuilder(Order.STABLE_ORDER);
     for (int i = 0; i < num; i++) {
       builder.add(newArtifact());
     }
-    return builder.build();
+    return builder;
   }
 
   private Artifact newArtifact() {

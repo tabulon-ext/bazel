@@ -13,11 +13,13 @@
 // limitations under the License.
 package com.google.devtools.build.lib.actions;
 
+import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
+
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
 import com.google.devtools.build.lib.actions.ArtifactRoot.RootType;
-import com.google.devtools.build.lib.actions.MutableActionGraph.ActionConflictException;
 import com.google.devtools.build.lib.actions.util.ActionsTestUtil;
 import com.google.devtools.build.lib.actions.util.ActionsTestUtil.UncheckedActionConflictException;
 import com.google.devtools.build.lib.actions.util.TestAction;
@@ -52,7 +54,7 @@ public final class MapBasedActionGraphTest {
     Path path = root.getRelative("foo");
     Artifact output =
         ActionsTestUtil.createArtifact(
-            ArtifactRoot.asDerivedRoot(execRoot, RootType.Output, outSegment), path);
+            ArtifactRoot.asDerivedRoot(execRoot, RootType.OUTPUT, outSegment), path);
     Action action =
         new TestAction(
             TestAction.NO_EFFECT,
@@ -62,7 +64,7 @@ public final class MapBasedActionGraphTest {
     path = root.getRelative("bar");
     output =
         ActionsTestUtil.createArtifact(
-            ArtifactRoot.asDerivedRoot(execRoot, RootType.Output, outSegment), path);
+            ArtifactRoot.asDerivedRoot(execRoot, RootType.OUTPUT, outSegment), path);
     Action action2 =
         new TestAction(
             TestAction.NO_EFFECT,
@@ -81,7 +83,7 @@ public final class MapBasedActionGraphTest {
     Artifact output =
         ActionsTestUtil.createArtifact(
             ArtifactRoot.asDerivedRoot(
-                execRoot, RootType.Output, root.relativeTo(execRoot).getPathString()),
+                execRoot, RootType.OUTPUT, root.relativeTo(execRoot).getPathString()),
             path);
     Action action =
         new TestAction(
@@ -109,7 +111,7 @@ public final class MapBasedActionGraphTest {
           200,
           1,
           TimeUnit.SECONDS,
-          /*failFastOnException=*/ true,
+          ExceptionHandlingMode.FAIL_FAST,
           "action-graph-test",
           ErrorClassifier.DEFAULT);
       Path execRoot = fileSystem.getPath("/");
@@ -118,7 +120,7 @@ public final class MapBasedActionGraphTest {
       Path path = root.getChild("foo");
       output =
           ActionsTestUtil.createArtifact(
-              ArtifactRoot.asDerivedRoot(execRoot, RootType.Output, rootSegment), path);
+              ArtifactRoot.asDerivedRoot(execRoot, RootType.OUTPUT, rootSegment), path);
       allActions.add(
           new TestAction(
               TestAction.NO_EFFECT,
@@ -169,5 +171,44 @@ public final class MapBasedActionGraphTest {
     ActionRegisterer actionRegisterer = new ActionRegisterer();
     actionRegisterer.doRandom();
     actionRegisterer.work();
+  }
+
+  @Test
+  public void testActionConflictShowsIsShareable() throws Exception {
+    MutableActionGraph actionGraph = new MapBasedActionGraph(actionKeyContext);
+    Path execRoot = fileSystem.getPath("/");
+    String outSegment = "root";
+    Path root = execRoot.getChild(outSegment);
+    Path path = root.getRelative("foo");
+    Artifact output =
+        ActionsTestUtil.createArtifact(
+            ArtifactRoot.asDerivedRoot(execRoot, RootType.OUTPUT, outSegment), path);
+
+    Action action1 =
+        new TestAction(
+            TestAction.NO_EFFECT,
+            NestedSetBuilder.emptySet(Order.STABLE_ORDER),
+            ImmutableSet.of(output)) {
+          @Override
+          public boolean isShareable() {
+            return true;
+          }
+        };
+    actionGraph.registerAction(action1);
+
+    Action action2 =
+        new TestAction(
+            TestAction.NO_EFFECT,
+            NestedSetBuilder.emptySet(Order.STABLE_ORDER),
+            ImmutableSet.of(output)) {
+          @Override
+          public boolean isShareable() {
+            return false;
+          }
+        };
+
+    var thrown =
+        assertThrows(ActionConflictException.class, () -> actionGraph.registerAction(action2));
+    assertThat(thrown).hasMessageThat().containsMatch("IsShareable: false, true");
   }
 }

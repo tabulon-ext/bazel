@@ -13,6 +13,7 @@
 // limitations under the License.
 package com.google.devtools.build.lib.skyframe;
 
+import static com.google.common.base.Throwables.throwIfInstanceOf;
 import static com.google.common.util.concurrent.Futures.immediateCancelledFuture;
 import static com.google.common.util.concurrent.Futures.immediateFailedFuture;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
@@ -29,6 +30,7 @@ import com.google.common.util.concurrent.MoreExecutors;
 import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.devtools.build.lib.cmdline.BatchCallback;
 import com.google.devtools.build.lib.cmdline.BatchCallback.SafeBatchCallback;
+import com.google.devtools.build.lib.cmdline.IgnoredSubdirectories;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.cmdline.PackageIdentifier;
 import com.google.devtools.build.lib.cmdline.QueryExceptionMarkerInterface;
@@ -57,9 +59,12 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
+import javax.annotation.Nullable;
 
 /** A {@link TargetPatternResolver} backed by a {@link RecursivePackageProvider}. */
 @ThreadCompatible
@@ -73,6 +78,8 @@ public final class RecursivePackageProviderBackedTargetPatternResolver
   private final RecursivePackageProvider recursivePackageProvider;
   private final ExtendedEventHandler eventHandler;
   private final MultisetSemaphore<PackageIdentifier> packageSemaphore;
+
+  @Nullable private final Semaphore getTargetsTaskSemaphore;
   private final PackageIdentifierBatchingCallback.Factory packageIdentifierBatchingCallbackFactory;
 
   public RecursivePackageProviderBackedTargetPatternResolver(
@@ -80,11 +87,16 @@ public final class RecursivePackageProviderBackedTargetPatternResolver
       ExtendedEventHandler eventHandler,
       FilteringPolicy policy,
       MultisetSemaphore<PackageIdentifier> packageSemaphore,
+      Optional<Integer> maxConcurrentGetTargetsTasks,
       PackageIdentifierBatchingCallback.Factory packageIdentifierBatchingCallbackFactory) {
     this.recursivePackageProvider = recursivePackageProvider;
     this.eventHandler = eventHandler;
     this.policy = policy;
     this.packageSemaphore = packageSemaphore;
+    this.getTargetsTaskSemaphore =
+        maxConcurrentGetTargetsTasks.isPresent()
+            ? new Semaphore(maxConcurrentGetTargetsTasks.get())
+            : null;
     this.packageIdentifierBatchingCallbackFactory = packageIdentifierBatchingCallbackFactory;
   }
 
@@ -102,12 +114,8 @@ public final class RecursivePackageProviderBackedTargetPatternResolver
     return recursivePackageProvider.getPackage(eventHandler, pkgIdentifier);
   }
 
-  private Map<PackageIdentifier, Package> bulkGetPackages(Iterable<PackageIdentifier> pkgIds)
-      throws NoSuchPackageException, InterruptedException {
-    return recursivePackageProvider.bulkGetPackages(pkgIds);
-  }
-
   @Override
+  @Nullable
   public Target getTargetOrNull(Label label)
       throws InterruptedException, InconsistentFilesystemException {
     try {
@@ -141,6 +149,7 @@ public final class RecursivePackageProviderBackedTargetPatternResolver
         rulesOnly ? FilteringPolicies.and(FilteringPolicies.RULES_ONLY, policy) : policy;
     try {
       Package pkg = getPackage(packageIdentifier);
+      Package.maybeAddPackageContainsErrorsEventToHandler(pkg, eventHandler);
       return TargetPatternResolverUtil.resolvePackageTargets(pkg, actualPolicy);
     } catch (NoSuchThingException e) {
       String message =
@@ -153,7 +162,8 @@ public final class RecursivePackageProviderBackedTargetPatternResolver
       String originalPattern, Iterable<PackageIdentifier> pkgIds, FilteringPolicy policy)
       throws InterruptedException {
     try {
-      Map<PackageIdentifier, Package> pkgs = bulkGetPackages(pkgIds);
+      Map<PackageIdentifier, Package> pkgs =
+          recursivePackageProvider.bulkGetPackages(eventHandler, pkgIds);
       if (pkgs.size() != Iterables.size(pkgIds)) {
         throw new IllegalStateException(
             "Bulk package retrieval missing results: "
@@ -162,6 +172,7 @@ public final class RecursivePackageProviderBackedTargetPatternResolver
       ImmutableMap.Builder<PackageIdentifier, Collection<Target>> result = ImmutableMap.builder();
       for (PackageIdentifier pkgId : pkgIds) {
         Package pkg = pkgs.get(pkgId);
+        Package.maybeAddPackageContainsErrorsEventToHandler(pkg, eventHandler);
         result.put(pkgId, TargetPatternResolverUtil.resolvePackageTargets(pkg, policy));
       }
       return result.buildOrThrow();
@@ -190,7 +201,7 @@ public final class RecursivePackageProviderBackedTargetPatternResolver
       final String originalPattern,
       String directory,
       boolean rulesOnly,
-      ImmutableSet<PathFragment> forbiddenSubdirectories,
+      IgnoredSubdirectories forbiddenSubdirectories,
       ImmutableSet<PathFragment> excludedSubdirectories,
       BatchCallback<Target, E> callback,
       Class<E> exceptionClass)
@@ -208,7 +219,7 @@ public final class RecursivePackageProviderBackedTargetPatternResolver
               callback,
               MoreExecutors.newDirectExecutorService());
     } catch (QueryException e) {
-      Throwables.propagateIfPossible(e, exceptionClass);
+      throwIfInstanceOf(e, exceptionClass);
       throw new IllegalStateException(e);
     } catch (NoSuchPackageException e) {
       // Can happen during a Skyframe no-keep-going evaluation.
@@ -237,7 +248,7 @@ public final class RecursivePackageProviderBackedTargetPatternResolver
           String originalPattern,
           String directory,
           boolean rulesOnly,
-          ImmutableSet<PathFragment> forbiddenSubdirectories,
+          IgnoredSubdirectories forbiddenSubdirectories,
           ImmutableSet<PathFragment> excludedSubdirectories,
           BatchCallback<Target, E> callback,
           Class<E> exceptionClass,
@@ -281,12 +292,15 @@ public final class RecursivePackageProviderBackedTargetPatternResolver
           String pattern,
           String directory,
           boolean rulesOnly,
-          ImmutableSet<PathFragment> forbiddenSubdirectories,
+          IgnoredSubdirectories forbiddenSubdirectories,
           ImmutableSet<PathFragment> excludedSubdirectories,
           BatchCallback<Target, E> callback,
           ListeningExecutorService executor)
-          throws TargetParsingException, QueryException, InterruptedException,
-              ProcessPackageDirectoryException, NoSuchPackageException {
+          throws TargetParsingException,
+              QueryException,
+              InterruptedException,
+              ProcessPackageDirectoryException,
+              NoSuchPackageException {
     FilteringPolicy actualPolicy =
         rulesOnly ? FilteringPolicies.and(FilteringPolicies.RULES_ONLY, policy) : policy;
 
@@ -339,9 +353,22 @@ public final class RecursivePackageProviderBackedTargetPatternResolver
       this.callback = callback;
     }
 
+    private void acquireTaskLock() throws InterruptedException {
+      if (getTargetsTaskSemaphore != null) {
+        getTargetsTaskSemaphore.acquire();
+      }
+    }
+
+    private void releaseTaskLock() {
+      if (getTargetsTaskSemaphore != null) {
+        getTargetsTaskSemaphore.release();
+      }
+    }
+
     @Override
     public Void call() throws E, InterruptedException {
       ImmutableSet<PackageIdentifier> pkgIdBatchSet = ImmutableSet.copyOf(packageIdentifiers);
+      acquireTaskLock();
       packageSemaphore.acquireAll(pkgIdBatchSet);
       try {
         Iterable<Collection<Target>> resolvedTargets =
@@ -363,6 +390,7 @@ public final class RecursivePackageProviderBackedTargetPatternResolver
         callback.process(filteredTargets);
       } finally {
         packageSemaphore.releaseAll(pkgIdBatchSet);
+        releaseTaskLock();
       }
       return null;
     }

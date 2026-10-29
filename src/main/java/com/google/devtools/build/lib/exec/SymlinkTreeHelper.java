@@ -13,25 +13,17 @@
 // limitations under the License.
 package com.google.devtools.build.lib.exec;
 
+import static com.google.common.base.Preconditions.checkArgument;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Lists;
 import com.google.devtools.build.lib.actions.Artifact;
 import com.google.devtools.build.lib.actions.EnvironmentalExecException;
 import com.google.devtools.build.lib.actions.ExecException;
 import com.google.devtools.build.lib.actions.FilesetOutputSymlink;
-import com.google.devtools.build.lib.server.FailureDetails.Execution;
+import com.google.devtools.build.lib.profiler.Profiler;
+import com.google.devtools.build.lib.profiler.SilentCloseable;
 import com.google.devtools.build.lib.server.FailureDetails.Execution.Code;
-import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
-import com.google.devtools.build.lib.shell.Command;
-import com.google.devtools.build.lib.shell.CommandException;
-import com.google.devtools.build.lib.util.CommandBuilder;
-import com.google.devtools.build.lib.util.CommandUtils;
-import com.google.devtools.build.lib.util.OsUtils;
-import com.google.devtools.build.lib.util.io.OutErr;
 import com.google.devtools.build.lib.vfs.Dirent;
 import com.google.devtools.build.lib.vfs.FileStatus;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
@@ -40,7 +32,6 @@ import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.Symlinks;
 import java.io.IOException;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import javax.annotation.Nullable;
 
@@ -49,35 +40,78 @@ import javax.annotation.Nullable;
  * symlink farms.
  */
 public final class SymlinkTreeHelper {
-  @VisibleForTesting
-  public static final String BUILD_RUNFILES = "build-runfiles" + OsUtils.executableExtension();
 
   private final Path inputManifest;
+  private final Path outputManifest;
   private final Path symlinkTreeRoot;
-  private final boolean filesetTree;
+  private final String workspaceName;
 
   /**
    * Creates SymlinkTreeHelper instance. Can be used independently of SymlinkTreeAction.
    *
    * @param inputManifest exec path to the input runfiles manifest
+   * @param outputManifest path to the output runfiles manifest
    * @param symlinkTreeRoot the root of the symlink tree to be created
-   * @param filesetTree true if this is fileset symlink tree, false if this is a runfiles symlink
-   *     tree.
+   * @param workspaceName the name of the workspace, used to create the workspace subdirectory
    */
-  public SymlinkTreeHelper(Path inputManifest, Path symlinkTreeRoot, boolean filesetTree) {
-    this.inputManifest = inputManifest;
-    this.symlinkTreeRoot = symlinkTreeRoot;
-    this.filesetTree = filesetTree;
+  public SymlinkTreeHelper(
+      Path inputManifest, Path outputManifest, Path symlinkTreeRoot, String workspaceName) {
+    // Do not indirect paths through overlay filesystems (such as the action filesystem or a
+    // snapshotting filesystem), for a few reasons:
+    // (1) we always want to create the symlinks on disk, even if the overlay filesystem creates
+    //     them in memory (at the time of writing, no action filesystem implementations do so, but
+    //     this may change in the future).
+    // (2) current action filesystem implementations are not a true overlay filesystem, so errors
+    //     might occur in an incremental build when the parent directory of a symlink exists on disk
+    //     but not in memory (see https://github.com/bazelbuild/bazel/issues/24867).
+    // (3) Changes made to a file referenced by a symlink tree should be reflected in the symlink
+    //     tree without having to rebuild. Therefore, if a snapshotting file system is used, we must
+    //     use the underlying non-snapshotting file system instead to create the symlink tree.
+    this.inputManifest = inputManifest.forHostFileSystem();
+    this.outputManifest = outputManifest.forHostFileSystem();
+    this.symlinkTreeRoot = symlinkTreeRoot.forHostFileSystem();
+    this.workspaceName = workspaceName;
   }
 
-  private Path getOutputManifest() {
-    return symlinkTreeRoot.getChild("MANIFEST");
+  interface TargetPathFunction<T> {
+    /** Obtains a symlink target path from a T. */
+    PathFragment get(T target) throws IOException;
   }
 
-  /** Creates a symlink tree by making VFS calls. */
-  public void createSymlinksDirectly(Path symlinkTreeRoot, Map<PathFragment, Artifact> symlinks)
-      throws IOException {
-    Preconditions.checkState(!filesetTree);
+  /**
+   * Returns whether the file system requires the targets of symlinks to regular files to exist when
+   * the symlinks are created.
+   *
+   * <p>This is the case on Windows unless {@code --windows_enable_symlinks} is set: the file system
+   * emulates symlinks to files with copies, which requires the file to be present, and would
+   * otherwise fall back to creating a junction, which can't be used to access a file.
+   */
+  public boolean requiresExistingFileTargets() {
+    return !symlinkTreeRoot
+        .getFileSystem()
+        .supportsSymbolicLinksNatively(symlinkTreeRoot.asFragment());
+  }
+
+  /** Creates a symlink tree for a fileset by making VFS calls. */
+  public void createFilesetSymlinks(Map<PathFragment, PathFragment> symlinkMap)
+      throws ExecException {
+    createSymlinks(symlinkMap, (path) -> path);
+  }
+
+  /** Creates a symlink tree for a runfiles by making VFS calls. */
+  public void createRunfilesSymlinks(Map<PathFragment, Artifact> symlinks) throws ExecException {
+    createSymlinks(
+        symlinks,
+        (artifact) ->
+            artifact.isSymlink()
+                // Unresolved symlinks are created textually.
+                ? artifact.getPath().readSymbolicLink()
+                : artifact.getPath().asFragment());
+  }
+
+  /** Creates a symlink tree. */
+  private <T> void createSymlinks(
+      Map<PathFragment, T> symlinkMap, TargetPathFunction<T> targetPathFn) throws ExecException {
     // Our strategy is to minimize mutating file system operations as much as possible. Ideally, if
     // there is an existing symlink tree with the expected contents, we don't make any changes. Our
     // algorithm goes as follows:
@@ -108,169 +142,180 @@ public final class SymlinkTreeHelper {
     //
     // 3. For every remaining entry in the node, create the corresponding file, symlink, or
     //    directory on disk. If it is a directory, recurse into that directory.
-    Directory root = new Directory();
-    for (Map.Entry<PathFragment, Artifact> entry : symlinks.entrySet()) {
-      // This creates intermediate directory nodes as a side effect.
-      Directory parentDir = root.walk(entry.getKey().getParentDirectory());
-      parentDir.addSymlink(entry.getKey().getBaseName(), entry.getValue());
-    }
-    root.syncTreeRecursively(symlinkTreeRoot);
-  }
-
-  /**
-   * Creates symlink tree and output manifest using the {@code build-runfiles.cc} tool.
-   *
-   * @param enableRunfiles If {@code false} only the output manifest is created.
-   */
-  public void createSymlinks(
-      Path execRoot,
-      OutErr outErr,
-      BinTools binTools,
-      Map<String, String> shellEnvironment,
-      boolean enableRunfiles)
-      throws ExecException, InterruptedException {
-    if (enableRunfiles) {
-      createSymlinksUsingCommand(execRoot, binTools, shellEnvironment, outErr);
-    } else {
-      copyManifest();
-    }
-  }
-
-  /** Copies the input manifest to the output manifest. */
-  public void copyManifest() throws ExecException {
-    // Pretend we created the runfiles tree by copying the manifest
-    try {
-      symlinkTreeRoot.createDirectoryAndParents();
-      FileSystemUtils.copyFile(inputManifest, getOutputManifest());
-    } catch (IOException e) {
-      throw new EnvironmentalExecException(e, Code.SYMLINK_TREE_MANIFEST_COPY_IO_EXCEPTION);
-    }
-  }
-
-  /**
-   * Creates a symlink tree using a CommandBuilder. This means that the symlink tree will always be
-   * present on the developer's workstation. Useful when running commands locally.
-   *
-   * <p>Warning: this method REALLY executes the command on the box Bazel is running on, without any
-   * kind of synchronization, locking, or anything else.
-   */
-  public void createSymlinksUsingCommand(
-      Path execRoot, BinTools binTools, Map<String, String> shellEnvironment, OutErr outErr)
-      throws EnvironmentalExecException, InterruptedException {
-    Command command = createCommand(execRoot, binTools, shellEnvironment);
-    try {
-      if (outErr != null) {
-        command.execute(outErr.getOutputStream(), outErr.getErrorStream());
-      } else {
-        command.execute();
+    try (SilentCloseable c = Profiler.instance().profile("Create symlink tree")) {
+      Directory<T> root = new Directory<>();
+      PathFragment previousParent = PathFragment.EMPTY_FRAGMENT;
+      Directory<T> parentDir = root;
+      for (Map.Entry<PathFragment, T> entry : symlinkMap.entrySet()) {
+        PathFragment path = entry.getKey();
+        checkArgument(!path.isEmpty() && !path.isAbsolute(), path);
+        PathFragment parent = path.getParentDirectory();
+        if (!parent.equals(previousParent)) {
+          // walk creates intermediate directory nodes as a side effect.
+          parentDir = root.walk(parent);
+          previousParent = parent;
+        }
+        parentDir.addSymlink(path.getBaseName(), entry.getValue());
       }
-    } catch (CommandException e) {
-      throw new EnvironmentalExecException(
-          e,
-          FailureDetail.newBuilder()
-              .setMessage(CommandUtils.describeCommandFailure(true, e))
-              .setExecution(
-                  Execution.newBuilder().setCode(Code.SYMLINK_TREE_CREATION_COMMAND_EXCEPTION))
-              .build());
+      root.syncTreeRecursively(symlinkTreeRoot, targetPathFn, requiresExistingFileTargets());
+      createWorkspaceSubdirectory();
+    } catch (IOException e) {
+      throw new EnvironmentalExecException(e, Code.SYMLINK_TREE_CREATION_IO_EXCEPTION);
     }
   }
 
-  @VisibleForTesting
-  Command createCommand(Path execRoot, BinTools binTools, Map<String, String> shellEnvironment) {
-    Preconditions.checkNotNull(shellEnvironment);
-    List<String> args = Lists.newArrayList();
-    args.add(binTools.getEmbeddedPath(BUILD_RUNFILES).asFragment().getPathString());
-    if (filesetTree) {
-      args.add("--allow_relative");
-      args.add("--use_metadata");
-    }
-    args.add(inputManifest.relativeTo(execRoot).getPathString());
-    args.add(symlinkTreeRoot.relativeTo(execRoot).getPathString());
-    return new CommandBuilder()
-        .addArgs(args)
-        .setWorkingDir(execRoot)
-        .setEnv(shellEnvironment)
-        .build();
+  /**
+   * Creates a minimal runfiles directory containing only the output manifest and the workspace
+   * subdirectory. This is the expected state with --noenable_runfiles or --nobuild_runfile_links.
+   */
+  public void createMinimalRunfilesDirectory() throws ExecException {
+    clearRunfilesDirectory();
+    linkManifest();
+    createWorkspaceSubdirectory();
   }
 
+  /** Deletes the contents of the runfiles directory. */
+  private void clearRunfilesDirectory() throws ExecException {
+    try (SilentCloseable c = Profiler.instance().profile("Clear symlink tree")) {
+      symlinkTreeRoot.deleteTreesBelow();
+    } catch (IOException e) {
+      throw new EnvironmentalExecException(e, Code.SYMLINK_TREE_DELETION_IO_EXCEPTION);
+    }
+  }
+
+  /** Links the output manifest to the input manifest. */
+  public void linkManifest() throws ExecException {
+    // TODO(b/443703909): This should probably be a copy, not a symlink.
+    try {
+      outputManifest.delete();
+      outputManifest.createSymbolicLink(inputManifest);
+    } catch (IOException e) {
+      throw new EnvironmentalExecException(e, Code.SYMLINK_TREE_MANIFEST_LINK_IO_EXCEPTION);
+    }
+  }
+
+  public void createWorkspaceSubdirectory() throws ExecException {
+    // Always create the subdirectory corresponding to the workspace (i.e., the main repository).
+    // This is required by tests as their working directory, even with --noenable_runfiles. But if
+    // the test action creates the directory and then proceeds to execute the test spawn, this logic
+    // would remove it. For the sake of consistency, always create the directory instead.
+    try {
+      symlinkTreeRoot.getRelative(workspaceName).createDirectory();
+    } catch (IOException e) {
+      throw new EnvironmentalExecException(e, Code.SYMLINK_TREE_CREATION_IO_EXCEPTION);
+    }
+  }
+
+  /**
+   * Processes a list of fileset symlinks into a map that can be passed to {@link
+   * com.google.devtools.build.lib.vfs.OutputService#createSymlinkTree}.
+   *
+   * <p>By convention, all symlinks are placed under a directory with the given workspace name.
+   */
   static ImmutableMap<PathFragment, PathFragment> processFilesetLinks(
-      ImmutableList<FilesetOutputSymlink> links, PathFragment root, PathFragment execRoot) {
-    Map<PathFragment, PathFragment> symlinks = new HashMap<>();
+      ImmutableList<FilesetOutputSymlink> links, String workspaceName) {
+    PathFragment root = PathFragment.create(workspaceName);
+    var symlinks = ImmutableMap.<PathFragment, PathFragment>builderWithExpectedSize(links.size());
     for (FilesetOutputSymlink symlink : links) {
-      symlinks.put(root.getRelative(symlink.getName()), symlink.reconstituteTargetPath(execRoot));
+      symlinks.put(root.getRelative(symlink.name()), symlink.target().getPath().asFragment());
     }
-    return ImmutableMap.copyOf(symlinks);
+    // Fileset links are already deduplicated by name in SkyframeFilesetManifestAction.
+    return symlinks.buildOrThrow();
   }
 
-  private static final class Directory {
-    private final Map<String, Artifact> symlinks = new HashMap<>();
-    private final Map<String, Directory> directories = new HashMap<>();
+  private static final class Directory<T> {
+    private final Map<String, T> symlinks = new HashMap<>();
+    private final Map<String, Directory<T>> directories = new HashMap<>();
 
-    void addSymlink(String basename, @Nullable Artifact artifact) {
-      symlinks.put(basename, artifact);
+    void addSymlink(String basename, @Nullable T target) {
+      // Fileset children take precedence over a symlink or empty file at their parent.
+      if (!directories.containsKey(basename)) {
+        symlinks.put(basename, target);
+      }
     }
 
-    Directory walk(PathFragment dir) {
-      Directory result = this;
+    Directory<T> walk(PathFragment dir) {
+      Directory<T> result = this;
       for (String segment : dir.segments()) {
-        result = result.directories.computeIfAbsent(segment, unused -> new Directory());
+        result.symlinks.remove(segment);
+        result = result.directories.computeIfAbsent(segment, unused -> new Directory<>());
       }
       return result;
     }
 
-    void syncTreeRecursively(Path at) throws IOException {
-      // This is a reimplementation of the C++ code in build-runfiles.cc. This avoids having to ship
-      // a separate native tool to create a few runfiles.
-      // TODO(ulfjack): Measure performance.
-      FileStatus stat = at.statNullable(Symlinks.FOLLOW);
-      if (stat == null) {
+    /**
+     * Makes the directory at the given path match this node.
+     *
+     * @param targetPathFn computes the target path of a symlink from its value
+     * @param fileSymlinksAreCopies whether the file system emulates symlinks to regular files with
+     *     copies (see {@link SymlinkTreeHelper#requiresExistingFileTargets}). In this case, an
+     *     existing symlink (or junction) is replaced rather than kept as-is, as it may be a
+     *     junction to a file that was created while the file didn't exist yet.
+     */
+    void syncTreeRecursively(
+        Path at, TargetPathFunction<T> targetPathFn, boolean fileSymlinksAreCopies)
+        throws IOException {
+      FileStatus stat = at.statIfFound(Symlinks.NOFOLLOW);
+      if (stat == null || !stat.isDirectory()) {
+        if (stat != null) {
+          at.deleteTree();
+        }
         at.createDirectoryAndParents();
-      } else if (!stat.isDirectory()) {
-        at.deleteTree();
-        at.createDirectoryAndParents();
+        createMissingEntries(at, targetPathFn);
+        return;
       }
-      // TODO(ulfjack): provide the mode bits from FileStatus and use that to construct the correct
-      //  chmod call here. Note that we do not have any tests for this right now. Something like
-      //  this:
-      // if (!stat.isExecutable() || !stat.isReadable()) {
-      //   at.chmod(stat.getMods() | 0700);
-      // }
-      for (Dirent dirent : at.readdir(Symlinks.FOLLOW)) {
+      // If the directory already exists, ensure it has appropriate permissions.
+      int perms = stat.getPermissions();
+      if (perms == -1) {
+        at.chmod(0755);
+      } else if ((perms & 0700) != 0700) {
+        at.chmod(perms | 0700);
+      }
+      for (Dirent dirent : at.readdir(Symlinks.NOFOLLOW)) {
         String basename = dirent.getName();
         Path next = at.getChild(basename);
         if (symlinks.containsKey(basename)) {
-          Artifact value = symlinks.remove(basename);
-          if (value == null) {
-            if (dirent.getType() != Dirent.Type.FILE) {
-              next.deleteTree();
-              FileSystemUtils.createEmptyFile(next);
-            }
-            // For consistency with build-runfiles.cc, we don't truncate the file if one exists.
+          T value = symlinks.get(basename);
+          if (value == null && dirent.getType() == Dirent.Type.FILE) {
+            // For historical reasons, we don't truncate the file if one exists.
+            // TODO(tjgq): Ponder whether this is still necessary to preserve the intentional
+            // non-hermeticity of symlink trees under source edits.
+            symlinks.remove(basename);
+          } else if (value != null
+              && dirent.getType() == Dirent.Type.SYMLINK
+              && !fileSymlinksAreCopies) {
+            FileSystemUtils.ensureSymbolicLink(next, targetPathFn.get(value));
+            symlinks.remove(basename);
           } else {
-            // TODO(ulfjack): On Windows, this call makes a copy rather than creating a symlink.
-            FileSystemUtils.ensureSymbolicLink(next, value.getPath().asFragment());
-          }
-        } else if (directories.containsKey(basename)) {
-          Directory nextDir = directories.remove(basename);
-          if (dirent.getType() != Dirent.Type.DIRECTORY) {
+            // Leave deleted entries in the map for createMissingEntries.
             next.deleteTree();
           }
-          nextDir.syncTreeRecursively(at.getChild(basename));
+        } else if (directories.containsKey(basename) && dirent.getType() == Dirent.Type.DIRECTORY) {
+          directories
+              .remove(basename)
+              .syncTreeRecursively(next, targetPathFn, fileSymlinksAreCopies);
         } else {
-          at.getChild(basename).deleteTree();
+          next.deleteTree();
         }
       }
 
-      for (Map.Entry<String, Artifact> entry : symlinks.entrySet()) {
+      createMissingEntries(at, targetPathFn);
+    }
+
+    void createMissingEntries(Path at, TargetPathFunction<T> targetPathFn) throws IOException {
+      for (Map.Entry<String, T> entry : symlinks.entrySet()) {
         Path next = at.getChild(entry.getKey());
-        if (entry.getValue() == null) {
+        T value = entry.getValue();
+        if (value == null) {
           FileSystemUtils.createEmptyFile(next);
         } else {
-          FileSystemUtils.ensureSymbolicLink(next, entry.getValue().getPath().asFragment());
+          next.createSymbolicLink(targetPathFn.get(value));
         }
       }
-      for (Map.Entry<String, Directory> entry : directories.entrySet()) {
-        entry.getValue().syncTreeRecursively(at.getChild(entry.getKey()));
+      for (Map.Entry<String, Directory<T>> entry : directories.entrySet()) {
+        Path next = at.getChild(entry.getKey());
+        next.createDirectory();
+        entry.getValue().createMissingEntries(next, targetPathFn);
       }
     }
   }

@@ -1,17 +1,18 @@
 # Darwin specific test utilities.
 
-package(
-    default_testonly = 1,
-    default_visibility = ["//src:__subpackages__"],
-)
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 
-licenses(["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    default_testonly = 1,
+    default_visibility = ["//visibility:public"],
+)
 
 filegroup(
     name = "srcs",
     testonly = 0,
     srcs = glob(["**"]),
-    visibility = ["//src:__subpackages__"],
+    visibility = ["//src/test/java/com/google/devtools/build/lib:__pkg__"],
 )
 
 # Utility for sending notifications. It expects one arg which is the
@@ -20,4 +21,5 @@ cc_binary(
     name = "notifier",
     srcs = ["notifier.c"],
     tags = ["requires-darwin"],
+    target_compatible_with = ["@platforms//os:macos"],
 )

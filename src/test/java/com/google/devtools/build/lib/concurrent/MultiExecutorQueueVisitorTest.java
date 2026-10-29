@@ -15,9 +15,13 @@ package com.google.devtools.build.lib.concurrent;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
+import com.google.devtools.build.lib.concurrent.AbstractQueueVisitor.ExceptionHandlingMode;
 import com.google.devtools.build.lib.concurrent.MultiThreadPoolsQuiescingExecutor.ThreadPoolType;
 import java.util.concurrent.ExecutorService;
 import org.junit.Test;
@@ -34,7 +38,7 @@ public class MultiExecutorQueueVisitorTest {
 
     MultiExecutorQueueVisitor queueVisitor =
         MultiExecutorQueueVisitor.createWithExecutorServices(
-            regular, cpuHeavy, /*failFastOnException=*/ false, ErrorClassifier.DEFAULT);
+            regular, cpuHeavy, ExceptionHandlingMode.KEEP_GOING, ErrorClassifier.DEFAULT);
 
     assertThat(queueVisitor.getExecutorServiceByThreadPoolType(ThreadPoolType.REGULAR))
         .isEqualTo(regular);
@@ -47,7 +51,7 @@ public class MultiExecutorQueueVisitorTest {
 
     MultiExecutorQueueVisitor queueVisitor =
         MultiExecutorQueueVisitor.createWithExecutorServices(
-            regular, cpuHeavy, /*failFastOnException=*/ false, ErrorClassifier.DEFAULT);
+            regular, cpuHeavy, ExceptionHandlingMode.KEEP_GOING, ErrorClassifier.DEFAULT);
 
     assertThat(queueVisitor.getExecutorServiceByThreadPoolType(ThreadPoolType.CPU_HEAVY))
         .isEqualTo(cpuHeavy);
@@ -60,7 +64,7 @@ public class MultiExecutorQueueVisitorTest {
 
     MultiExecutorQueueVisitor queueVisitor =
         MultiExecutorQueueVisitor.createWithExecutorServices(
-            regular, cpuHeavy, /*failFastOnException=*/ false, ErrorClassifier.DEFAULT);
+            regular, cpuHeavy, ExceptionHandlingMode.KEEP_GOING, ErrorClassifier.DEFAULT);
     queueVisitor.shutdownExecutorService(/*catastrophe=*/ null);
 
     verify(regular).shutdown();
@@ -74,7 +78,7 @@ public class MultiExecutorQueueVisitorTest {
 
     MultiExecutorQueueVisitor queueVisitor =
         MultiExecutorQueueVisitor.createWithExecutorServices(
-            regular, cpuHeavy, /*failFastOnException=*/ false, ErrorClassifier.DEFAULT);
+            regular, cpuHeavy, ExceptionHandlingMode.KEEP_GOING, ErrorClassifier.DEFAULT);
     RuntimeException toBeThrown = new RuntimeException();
 
     Throwable thrown =
@@ -95,7 +99,7 @@ public class MultiExecutorQueueVisitorTest {
             regular,
             cpuHeavy,
             executionPhase,
-            /*failFastOnException=*/ false,
+            ExceptionHandlingMode.KEEP_GOING,
             ErrorClassifier.DEFAULT);
 
     assertThat(queueVisitor.getExecutorServiceByThreadPoolType(ThreadPoolType.EXECUTION_PHASE))
@@ -109,12 +113,45 @@ public class MultiExecutorQueueVisitorTest {
 
     MultiExecutorQueueVisitor queueVisitorWithoutExecutionPhasePool =
         MultiExecutorQueueVisitor.createWithExecutorServices(
-            regular, cpuHeavy, /*failFastOnException=*/ false, ErrorClassifier.DEFAULT);
+            regular, cpuHeavy, ExceptionHandlingMode.KEEP_GOING, ErrorClassifier.DEFAULT);
 
     assertThrows(
         NullPointerException.class,
         () ->
             queueVisitorWithoutExecutionPhasePool.getExecutorServiceByThreadPoolType(
                 ThreadPoolType.EXECUTION_PHASE));
+  }
+
+  @Test
+  public void testLaunchQueuedUpExecutionPhaseTasks() {
+    ExecutorService regular = mock(ExecutorService.class);
+    ExecutorService cpuHeavy = mock(ExecutorService.class);
+    ExecutorService executionPhase = mock(ExecutorService.class);
+
+    MultiExecutorQueueVisitor queueVisitor =
+        MultiExecutorQueueVisitor.createWithExecutorServices(
+            regular,
+            cpuHeavy,
+            executionPhase,
+            ExceptionHandlingMode.KEEP_GOING,
+            ErrorClassifier.DEFAULT);
+
+    Runnable runnable = mock(Runnable.class);
+    QuiescingTask task =
+        new QuiescingTask(queueVisitor) {
+          @Override
+          public void runCore() {}
+        };
+
+    queueVisitor.execute(
+        runnable, ThreadPoolType.EXECUTION_PHASE, /* shouldStallAwaitingSignal= */ true);
+    queueVisitor.execute(
+        task, ThreadPoolType.EXECUTION_PHASE, /* shouldStallAwaitingSignal= */ true);
+
+    verify(executionPhase, never()).execute(any(Runnable.class));
+
+    queueVisitor.launchQueuedUpExecutionPhaseTasks();
+
+    verify(executionPhase, times(2)).execute(any(Runnable.class));
   }
 }

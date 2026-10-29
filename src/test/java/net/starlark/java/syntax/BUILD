@@ -1,22 +1,31 @@
-load("@rules_java//java:defs.bzl", "java_test")
+load("@rules_java//java:defs.bzl", "java_library", "java_test")
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_testonly = 1,
-    default_visibility = ["//src:__subpackages__"],
 )
-
-licenses(["notice"])
 
 filegroup(
     name = "srcs",
     testonly = 0,
     srcs = glob(["**"]),
-    visibility = ["//src:__subpackages__"],
+    visibility = ["//src/test/java/net/starlark/java:__pkg__"],
 )
 
-# SyntaxTests tests the Starlark parser/resolver.
-java_test(
-    name = "SyntaxTests",
+java_library(
+    name = "TestUtils",
+    srcs = ["TestUtils.java"],
+    visibility = ["//src/test/java/net/starlark/java:__subpackages__"],
+    deps = [
+        "//src/main/java/net/starlark/java/syntax",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:collect",
+        "//third_party/java/jsr305_annotations",
+    ],
+)
+
+java_library(
+    name = "SyntaxTests_lib",
     srcs = [
         "FileLocationsTest.java",
         "LValueBoundNamesTest.java",
@@ -26,14 +35,31 @@ java_test(
         "NodeVisitorTest.java",
         "ParserInputTest.java",
         "ParserTest.java",
+        "ProgramTest.java",
         "ResolverTest.java",
         "StarlarkFileTest.java",
-        "SyntaxTests.java",  # (suite)
+        "TypeCheckerTest.java",
+        "TypeTaggerTest.java",
+        "TypesTest.java",
     ],
     deps = [
+        ":TestUtils",
         "//src/main/java/net/starlark/java/syntax",
-        "//third_party:guava",
-        "//third_party:junit4",
-        "//third_party:truth",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:collect",
+        "//third_party/java/jsr305_annotations",
+        "//third_party/java/junit",
+        "//third_party/java/testparameterinjector",
+        "//third_party/java/truth",
+    ],
+)
+
+# SyntaxTests tests the Starlark parser/resolver.
+java_test(
+    name = "SyntaxTests",
+    srcs = ["SyntaxTests.java"],  # suite
+    deps = [
+        ":SyntaxTests_lib",
+        "//third_party/java/junit",
     ],
 )

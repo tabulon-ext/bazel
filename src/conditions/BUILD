@@ -52,7 +52,7 @@ config_setting(
     name = "linux_ppc64le",
     constraint_values = [
         "@platforms//os:linux",
-        "@platforms//cpu:ppc",
+        "@platforms//cpu:ppc64le",
     ],
     visibility = ["//visibility:public"],
 )
@@ -80,6 +80,15 @@ config_setting(
     constraint_values = [
         "@platforms//os:linux",
         "@platforms//cpu:riscv64",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "linux_loongarch64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:loongarch64",
     ],
     visibility = ["//visibility:public"],
 )
@@ -118,6 +127,10 @@ config_setting(
 
 config_setting(
     name = "darwin_arm64_flag",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:x86_64",
+    ],
     values = {"cpu": "darwin_arm64"},
 )
 
@@ -140,12 +153,6 @@ config_setting(
         "@platforms//os:macos",
         "@platforms//cpu:arm64e",
     ],
-    visibility = ["//visibility:public"],
-)
-
-config_setting(
-    name = "iphonesdk",
-    values = {"define": "IPHONE_SDK=1"},
     visibility = ["//visibility:public"],
 )
 
@@ -188,6 +195,10 @@ config_setting(
 # Remove the flag after toolchain cc resolution is fixed
 config_setting(
     name = "windows_x64_arm64_flag",
+    constraint_values = [
+        "@platforms//os:windows",
+        "@platforms//cpu:x86_64",
+    ],
     values = {"cpu": "x64_arm64_windows"},
 )
 
@@ -207,14 +218,59 @@ selects.config_setting_group(
 )
 
 config_setting(
-    name = "arm",
-    constraint_values = ["@platforms//cpu:arm"],
+    name = "windows_clang_cl",
+    constraint_values = ["@platforms//os:windows"],
+    flag_values = {"@rules_cc//cc/compiler:compiler": "clang-cl"},
+)
+
+config_setting(
+    name = "windows_msvc_cl",
+    constraint_values = ["@platforms//os:windows"],
+    flag_values = {"@rules_cc//cc/compiler:compiler": "msvc-cl"},
+)
+
+selects.config_setting_group(
+    name = "windows_msvc_like",
+    match_any = [
+        ":windows_clang_cl",
+        ":windows_msvc_cl",
+    ],
     visibility = ["//visibility:public"],
 )
 
 config_setting(
-    name = "remote",
-    values = {"define": "EXECUTOR=remote"},
+    name = "windows_clang",
+    constraint_values = ["@platforms//os:windows"],
+    flag_values = {"@rules_cc//cc/compiler:compiler": "clang"},
+)
+
+config_setting(
+    name = "windows_gcc",
+    constraint_values = ["@platforms//os:windows"],
+    flag_values = {"@rules_cc//cc/compiler:compiler": "gcc"},
+)
+
+config_setting(
+    name = "windows_mingw_gcc",
+    constraint_values = ["@platforms//os:windows"],
+    flag_values = {"@rules_cc//cc/compiler:compiler": "mingw-gcc"},
+)
+
+# Compilers targeting Windows that use a GCC-style driver (MinGW), which expects
+# -l<lib> rather than -DEFAULTLIB:<lib>.lib to link against system libraries.
+selects.config_setting_group(
+    name = "windows_gcc_like",
+    match_any = [
+        ":windows_clang",
+        ":windows_gcc",
+        ":windows_mingw_gcc",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "arm",
+    constraint_values = ["@platforms//cpu:arm"],
     visibility = ["//visibility:public"],
 )
 

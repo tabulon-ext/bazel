@@ -25,7 +25,11 @@ import com.google.common.util.concurrent.ListeningScheduledExecutorService;
 import com.google.devtools.build.lib.remote.RemoteRetrier;
 import com.google.devtools.build.lib.remote.Retrier;
 import com.google.devtools.build.lib.remote.Retrier.Backoff;
+import com.google.devtools.build.lib.remote.Retrier.ResultClassifier;
+import com.google.devtools.build.lib.remote.Retrier.ResultClassifier.Result;
 import com.google.protobuf.ByteString;
+import io.grpc.Status;
+import io.grpc.Status.Code;
 import io.grpc.stub.StreamObserver;
 import java.util.Collection;
 import java.util.List;
@@ -34,7 +38,6 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 /** Test utilities */
@@ -42,13 +45,16 @@ public class TestUtils {
 
   public static RemoteRetrier newRemoteRetrier(
       Supplier<Backoff> backoff,
-      Predicate<? super Exception> shouldRetry,
+      ResultClassifier resultClassifier,
       ListeningScheduledExecutorService retryScheduler) {
     ZeroDelayListeningScheduledExecutorService zeroDelayRetryScheduler =
         new ZeroDelayListeningScheduledExecutorService(retryScheduler);
     return new RemoteRetrier(
         backoff,
-        shouldRetry,
+        (e) ->
+            Status.fromThrowable(e).getCode() == Code.CANCELLED
+                ? Result.SUCCESS
+                : resultClassifier.test(e),
         zeroDelayRetryScheduler,
         Retrier.ALLOW_ALL_CALLS,
         (millis) -> {

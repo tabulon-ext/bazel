@@ -1,3 +1,6 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
 filegroup(
     name = "srcs",
     srcs = glob(["**"]),
@@ -25,9 +28,15 @@ cc_library(
         "file.h",
         "util.h",
     ],
-    linkopts = [
-        "-DEFAULTLIB:advapi32.lib",  # RegGetValueW
-    ],
+    # RegGetValueW. This package is embedded into @bazel_tools, so it can't use
+    # the conditions in //src/conditions.
+    linkopts = select({
+        "@rules_cc//cc/compiler:clang": ["-ladvapi32"],
+        "@rules_cc//cc/compiler:gcc": ["-ladvapi32"],
+        "@rules_cc//cc/compiler:mingw-gcc": ["-ladvapi32"],
+        "//conditions:default": ["-DEFAULTLIB:advapi32.lib"],
+    }),
+    target_compatible_with = ["@platforms//os:windows"],
     visibility = [
         "//src/main/cpp:__subpackages__",
         "//src/main/tools:__pkg__",
@@ -42,6 +51,7 @@ cc_library(
     name = "lib-process",
     srcs = ["process.cc"],
     hdrs = ["process.h"],
+    target_compatible_with = ["@platforms//os:windows"],
     visibility = [
         "//src/main/cpp:__pkg__",
         "//src/test/native:__subpackages__",
@@ -63,18 +73,21 @@ cc_binary(
         "system_disk_space_monitor_jni.cc",
         "system_load_advisory_monitor_jni.cc",
         "system_memory_pressure_jni.cc",
+        "system_network_stats.cc",
         "system_suspension_monitor_jni.cc",
         "system_thermal_monitor_jni.cc",
         "//src/main/native:jni.h",
         "//src/main/native:jni_md.h",
     ],
     linkshared = 1,
+    target_compatible_with = ["@platforms//os:windows"],
     visibility = [
         "//src/main/java/com/google/devtools/build/lib/jni:__pkg__",
     ],
     deps = [
         ":lib-file",
         ":lib-process",
+        "//src/main/native:blake3_jni",
     ],
 )
 

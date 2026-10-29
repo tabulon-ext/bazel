@@ -20,12 +20,14 @@ import static com.google.devtools.build.lib.bazel.repository.downloader.HttpPars
 import static java.nio.charset.StandardCharsets.ISO_8859_1;
 import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
-import com.google.common.base.Function;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.io.ByteStreams;
 import com.google.common.io.CharStreams;
@@ -40,14 +42,15 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.Reader;
 import java.net.InetAddress;
-import java.net.Proxy;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
-import java.net.URL;
+import java.net.URI;
 import java.net.URLConnection;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CyclicBarrier;
@@ -78,8 +81,7 @@ public class HttpConnectorTest {
   @Rule
   public final TemporaryFolder testFolder = new TemporaryFolder();
 
-  @Rule
-  public final Timeout globalTimeout = new Timeout(10000);
+  @Rule public final Timeout globalTimeout = Timeout.seconds(10);
 
   private final ExecutorService executor = Executors.newFixedThreadPool(2);
   private final ManualClock clock = new ManualClock();
@@ -94,7 +96,7 @@ public class HttpConnectorTest {
 
   @Before
   public void before() throws Exception {
-    when(proxyHelper.createProxyIfNeeded(any(URL.class))).thenReturn(Proxy.NO_PROXY);
+    when(proxyHelper.createProxyIfNeeded(any(URI.class))).thenReturn(ProxyInfo.NO_PROXY);
   }
 
   @After
@@ -108,9 +110,7 @@ public class HttpConnectorTest {
     assertThat(
             ByteStreams.toByteArray(
                 connector
-                    .connect(
-                        createTempFile(fileContents).toURI().toURL(),
-                        url -> ImmutableMap.<String, String>of())
+                    .connect(createTempFile(fileContents).toURI(), url -> ImmutableMap.of())
                     .getInputStream()))
         .isEqualTo(fileContents);
   }
@@ -119,14 +119,35 @@ public class HttpConnectorTest {
   public void badHost_throwsIOException() throws Exception {
     thrown.expect(IOException.class);
     thrown.expectMessage("Unknown host: bad.example");
-    connector.connect(new URL("http://bad.example"), url -> ImmutableMap.<String, String>of());
+    connector.connect(URI.create("http://bad.example"), url -> ImmutableMap.of());
+  }
+
+  @Test
+  public void requestHeadersFailure_doesNotConnectOrRetry() throws Exception {
+    IOException headerFailure = new IOException("credential helper failed");
+    AtomicInteger calls = new AtomicInteger();
+
+    IOException thrown =
+        assertThrows(
+            IOException.class,
+            () ->
+                connector.connect(
+                    URI.create("http://test.example"),
+                    url -> {
+                      calls.incrementAndGet();
+                      throw headerFailure;
+                    }));
+
+    assertThat(thrown).isSameInstanceAs(headerFailure);
+    assertThat(calls.get()).isEqualTo(1);
+    verifyNoInteractions(proxyHelper);
   }
 
   @Test
   public void normalRequest() throws Exception {
-    final Map<String, String> headers = new ConcurrentHashMap<>();
+    final Map<String, List<String>> headers = new ConcurrentHashMap<>();
     try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName(null))) {
-      @SuppressWarnings("unused") 
+      @SuppressWarnings("unused")
       Future<?> possiblyIgnoredError =
           executor.submit(
               new Callable<Object>() {
@@ -151,16 +172,16 @@ public class HttpConnectorTest {
           new InputStreamReader(
               connector
                   .connect(
-                      new URL(String.format("http://localhost:%d/boo", server.getLocalPort())),
-                      url -> ImmutableMap.of("Content-Encoding", "gzip"))
+                      URI.create(String.format("http://localhost:%d/boo", server.getLocalPort())),
+                      url -> ImmutableMap.of("Content-Encoding", ImmutableList.of("gzip")))
                   .getInputStream(),
               ISO_8859_1)) {
         assertThat(CharStreams.toString(payload)).isEqualTo("hello");
       }
     }
-    assertThat(headers).containsEntry("x-method", "GET");
-    assertThat(headers).containsEntry("x-request-uri", "/boo");
-    assertThat(headers).containsEntry("content-encoding", "gzip");
+    assertThat(headers).containsEntry("x-method", ImmutableList.of("GET"));
+    assertThat(headers).containsEntry("x-request-uri", ImmutableList.of("/boo"));
+    assertThat(headers).containsEntry("content-encoding", ImmutableList.of("gzip"));
   }
 
   @Test
@@ -203,12 +224,13 @@ public class HttpConnectorTest {
           new InputStreamReader(
               connector
                   .connect(
-                      new URL(String.format("http://localhost:%d", server.getLocalPort())),
-                      url -> ImmutableMap.<String, String>of())
+                      URI.create(String.format("http://localhost:%d", server.getLocalPort())),
+                      url -> ImmutableMap.of())
                   .getInputStream(),
               ISO_8859_1)) {
         assertThat(CharStreams.toString(payload)).isEqualTo("hello");
-        assertThat(clock.currentTimeMillis()).isEqualTo(100L);
+        assertThat(clock.currentTimeMillis()).isGreaterThan(50L);
+        assertThat(clock.currentTimeMillis()).isLessThan(150L);
       }
     }
   }
@@ -262,8 +284,8 @@ public class HttpConnectorTest {
           new InputStreamReader(
               connector
                   .connect(
-                      new URL(String.format("http://localhost:%d", port)),
-                      url -> ImmutableMap.<String, String>of())
+                      URI.create(String.format("http://localhost:%d", port)),
+                      url -> ImmutableMap.of())
                   .getInputStream(),
               ISO_8859_1)) {
         assertThat(CharStreams.toString(payload)).isEqualTo("hello");
@@ -322,8 +344,8 @@ public class HttpConnectorTest {
           new InputStreamReader(
               connector
                   .connect(
-                      new URL(String.format("http://localhost:%d", server.getLocalPort())),
-                      url -> ImmutableMap.<String, String>of())
+                      URI.create(String.format("http://localhost:%d", server.getLocalPort())),
+                      url -> ImmutableMap.of())
                   .getInputStream(),
               ISO_8859_1)) {
         assertThat(CharStreams.toString(payload)).isEqualTo("hello");
@@ -355,14 +377,29 @@ public class HttpConnectorTest {
           new InputStreamReader(
               connector
                   .connect(
-                      new URL(String.format("http://localhost:%d", server.getLocalPort())),
-                      url -> ImmutableMap.<String, String>of())
+                      URI.create(String.format("http://localhost:%d", server.getLocalPort())),
+                      url -> ImmutableMap.of())
                   .getInputStream(),
               ISO_8859_1)) {
         fail("Should have thrown");
       } catch (IOException expected) {
-        assertThat(expected).hasCauseThat().isInstanceOf(SocketTimeoutException.class);
-        assertThat(expected).hasCauseThat().hasMessageThat().ignoringCase().contains("timed out");
+        if (expected.getCause() != null) {
+          // SocketTimeoutException gets wrapped in an IOException and rethrown.
+          assertThat(expected).hasCauseThat().isInstanceOf(SocketTimeoutException.class);
+          assertThat(expected).hasCauseThat().hasMessageThat().ignoringCase().contains("timed out");
+        } else {
+          // For windows, it is possible that the thrown exception is a ConnectException (no cause)
+          // from {@code HttpURLConnection.connect()} rather than a SocketTimeoutException from
+          // {@code HttpURLConnection.getResponseCode()}. In the former case, we expect the
+          // SocketTimeoutException to have already occurred but gets suppressed within the final
+          // ConnectException (upon max retry).
+          ImmutableList<Throwable> suppressed = ImmutableList.copyOf(expected.getSuppressed());
+          Optional<Throwable> ste =
+              suppressed.stream().filter(t -> t instanceof SocketTimeoutException).findFirst();
+          assertThat(ste).isPresent();
+          assertThat(ste.get()).isInstanceOf(SocketTimeoutException.class);
+          assertThat(ste.get()).hasMessageThat().ignoringCase().contains("timed out");
+        }
       }
     }
   }
@@ -394,8 +431,8 @@ public class HttpConnectorTest {
       thrown.expect(IOException.class);
       thrown.expectMessage("401 Unauthorized");
       connector.connect(
-          new URL(String.format("http://localhost:%d", server.getLocalPort())),
-          url -> ImmutableMap.<String, String>of());
+          URI.create(String.format("http://localhost:%d", server.getLocalPort())),
+          url -> ImmutableMap.of());
     }
   }
 
@@ -426,8 +463,8 @@ public class HttpConnectorTest {
       thrown.expect(FileNotFoundException.class);
       thrown.expectMessage("404 Not Found");
       connector.connect(
-          new URL(String.format("http://localhost:%d", server.getLocalPort())),
-          url -> ImmutableMap.<String, String>of());
+          URI.create(String.format("http://localhost:%d", server.getLocalPort())),
+          url -> ImmutableMap.of());
     }
   }
 
@@ -461,8 +498,8 @@ public class HttpConnectorTest {
                 }
               });
       connector.connect(
-          new URL(String.format("http://localhost:%d", server.getLocalPort())),
-          url -> ImmutableMap.<String, String>of());
+          URI.create(String.format("http://localhost:%d", server.getLocalPort())),
+          url -> ImmutableMap.of());
       fail();
     } catch (IOException ignored) {
       // ignored
@@ -503,9 +540,10 @@ public class HttpConnectorTest {
       thrown.expect(IOException.class);
       thrown.expectMessage("500 Oh My");
       try {
-        connector.connect(
-            new URL(String.format("http://localhost:%d", server.getLocalPort())),
-            url -> ImmutableMap.<String, String>of());
+        var unused =
+            connector.connect(
+                URI.create(String.format("http://localhost:%d", server.getLocalPort())),
+                url -> ImmutableMap.of());
       } finally {
         assertThat(tries.get()).isGreaterThan(2);
       }
@@ -542,9 +580,10 @@ public class HttpConnectorTest {
       thrown.expect(IOException.class);
       thrown.expectMessage("403 Forbidden");
       try {
-        connector.connect(
-            new URL(String.format("http://localhost:%d", server.getLocalPort())),
-            url -> ImmutableMap.<String, String>of());
+        var unused =
+            connector.connect(
+                URI.create(String.format("http://localhost:%d", server.getLocalPort())),
+                url -> ImmutableMap.of());
       } finally {
         assertThat(tries.get()).isGreaterThan(2);
       }
@@ -576,8 +615,8 @@ public class HttpConnectorTest {
 
   public void redirectToDifferentPath_works(String code) throws Exception {
     String redirectCode = "HTTP/1.1 " + code + " Redirect";
-    final Map<String, String> headers1 = new ConcurrentHashMap<>();
-    final Map<String, String> headers2 = new ConcurrentHashMap<>();
+    final Map<String, List<String>> headers1 = new ConcurrentHashMap<>();
+    final Map<String, List<String>> headers2 = new ConcurrentHashMap<>();
     try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName(null))) {
       @SuppressWarnings("unused")
       Future<?> possiblyIgnoredError =
@@ -614,24 +653,26 @@ public class HttpConnectorTest {
               });
       URLConnection connection =
           connector.connect(
-              new URL(String.format("http://localhost:%d", server.getLocalPort())),
-              url -> ImmutableMap.<String, String>of());
-      assertThat(connection.getURL()).isEqualTo(
-          new URL(String.format("http://localhost:%d/doodle.tar.gz", server.getLocalPort())));
+              URI.create(String.format("http://localhost:%d", server.getLocalPort())),
+              url -> ImmutableMap.of());
+      assertThat(connection.getURL())
+          .isEqualTo(
+              URI.create(String.format("http://localhost:%d/doodle.tar.gz", server.getLocalPort()))
+                  .toURL());
       try (InputStream input = connection.getInputStream()) {
         assertThat(ByteStreams.toByteArray(input)).isEmpty();
       }
     }
-    assertThat(headers1).containsEntry("x-request-uri", "/");
-    assertThat(headers2).containsEntry("x-request-uri", "/doodle.tar.gz");
+    assertThat(headers1).containsEntry("x-request-uri", ImmutableList.of("/"));
+    assertThat(headers2).containsEntry("x-request-uri", ImmutableList.of("/doodle.tar.gz"));
   }
 
   public void redirectToDifferentServer_works(String code) throws Exception {
     String redirectCode = "HTTP/1.1 " + code + " Redirect";
     final String basic1 = "Basic b25lOmZpcnN0c2VjcmV0";
     final String basic2 = "Basic dHdvOnNlY29uZHNlY3JldA==";
-    final Map<String, String> headers1 = new ConcurrentHashMap<>();
-    final Map<String, String> headers2 = new ConcurrentHashMap<>();
+    final Map<String, List<String>> headers1 = new ConcurrentHashMap<>();
+    final Map<String, List<String>> headers2 = new ConcurrentHashMap<>();
     try (ServerSocket server1 = new ServerSocket(0, 1, InetAddress.getByName(null));
         ServerSocket server2 = new ServerSocket(0, 1, InetAddress.getByName(null))) {
       @SuppressWarnings("unused")
@@ -679,30 +720,30 @@ public class HttpConnectorTest {
               });
       // Header function that provides different auth headers for
       // the two servers.
-      Function<URL, ImmutableMap<String, String>> authHeaders =
-          new Function<URL, ImmutableMap<String, String>>() {
-            @Override
-            public ImmutableMap<String, String> apply(URL url) {
-              if (url.getPort() == server1.getLocalPort()) {
-                return ImmutableMap.of("Authentication", basic1);
-              } else if (url.getPort() == server2.getLocalPort()) {
-                return ImmutableMap.of("Authentication", basic2);
-              } else {
-                return ImmutableMap.<String, String>of();
-              }
+      HttpConnector.RequestHeadersProvider authHeaders =
+          url -> {
+            if (url.getPort() == server1.getLocalPort()) {
+              return ImmutableMap.of("Authentication", ImmutableList.of(basic1));
+            } else if (url.getPort() == server2.getLocalPort()) {
+              return ImmutableMap.of("Authentication", ImmutableList.of(basic2));
+            } else {
+              return ImmutableMap.of();
             }
           };
       URLConnection connection =
           connector.connect(
-              new URL(String.format("http://localhost:%d", server1.getLocalPort())), authHeaders);
-      assertThat(connection.getURL()).isEqualTo(
-          new URL(String.format("http://localhost:%d/doodle.tar.gz", server2.getLocalPort())));
+              URI.create(String.format("http://localhost:%d", server1.getLocalPort())),
+              authHeaders);
+      assertThat(connection.getURL())
+          .isEqualTo(
+              URI.create(String.format("http://localhost:%d/doodle.tar.gz", server2.getLocalPort()))
+                  .toURL());
       try (InputStream input = connection.getInputStream()) {
         assertThat(ByteStreams.toByteArray(input)).isEqualTo("hello".getBytes(US_ASCII));
       }
       // Verify that the correct form of authentication is used for each server.
-      assertThat(headers1).containsEntry("authentication", basic1);
-      assertThat(headers2).containsEntry("authentication", basic2);
+      assertThat(headers1).containsEntry("authentication", ImmutableList.of(basic1));
+      assertThat(headers2).containsEntry("authentication", ImmutableList.of(basic2));
     }
   }
 

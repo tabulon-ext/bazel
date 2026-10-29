@@ -15,9 +15,9 @@
 #ifndef BAZEL_SRC_TOOLS_SINGLEJAR_MAPPED_FILE_H_
 #define BAZEL_SRC_TOOLS_SINGLEJAR_MAPPED_FILE_H_ 1
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
-
-#include "src/tools/singlejar/port.h"
 
 /*
  * A mapped read-only file with auto closing.
@@ -34,21 +34,32 @@ class MappedFile {
 
   ~MappedFile() { Close(); }
 
-  bool Open(const std::string &path);
+  // Maps the file at path. If populate is true, the whole file is read in
+  // upfront (MAP_POPULATE), which is faster when most of it will be accessed.
+  // Callers that only read a small part of the file (e.g. a jar's central
+  // directory) should pass false. Ignored where MAP_POPULATE is unavailable
+  // (e.g. macOS) and on Windows, where mappings are always populated lazily.
+  bool Open(const std::string& path, bool populate = true);
+
+  bool MapExisting(unsigned char* mapped_start, unsigned char* mapped_end) {
+    mapped_start_ = mapped_start;
+    mapped_end_ = mapped_end;
+    return true;
+  }
 
   void Close();
 
-  bool mapped(const void *addr) const {
+  bool mapped(const void* addr) const {
     return mapped_start_ <= addr && addr < mapped_end_;
   }
 
-  const unsigned char *start() const { return mapped_start_; }
-  const unsigned char *end() const { return mapped_end_; }
-  const unsigned char *address(off64_t offset) const {
+  const unsigned char* start() const { return mapped_start_; }
+  const unsigned char* end() const { return mapped_end_; }
+  const unsigned char* address(int64_t offset) const {
     return mapped_start_ + offset;
   }
-  off64_t offset(const void *address) const {
-    return reinterpret_cast<const unsigned char *>(address) - mapped_start_;
+  int64_t offset(const void* address) const {
+    return reinterpret_cast<const unsigned char*>(address) - mapped_start_;
   }
 
 #ifndef _WIN32
@@ -60,14 +71,15 @@ class MappedFile {
 #endif
 
   size_t size() const { return mapped_end_ - mapped_start_; }
-  bool is_open() const;
 
  private:
-  unsigned char *mapped_start_;
-  unsigned char *mapped_end_;
+  bool is_open() const;
+
+  unsigned char* mapped_start_;
+  unsigned char* mapped_end_;
 #ifdef _WIN32
-  /* HANDLE */ void *hFile_;
-  /* HANDLE */ void *hMapFile_;
+  /* HANDLE */ void* hFile_;
+  /* HANDLE */ void* hMapFile_;
 #else
   int fd_;
 #endif

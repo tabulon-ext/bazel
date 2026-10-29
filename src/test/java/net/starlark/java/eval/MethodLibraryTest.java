@@ -21,8 +21,12 @@ import com.google.common.base.Joiner;
 import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableCollection;
 import com.google.common.collect.ImmutableList;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
+import net.starlark.java.annot.Param;
 import net.starlark.java.annot.StarlarkBuiltin;
+import net.starlark.java.annot.StarlarkMethod;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
@@ -127,7 +131,8 @@ public final class MethodLibraryTest {
             "Traceback (most recent call last):", //
             "\tFile \"\", line 1, column 4, in <toplevel>",
             "\t\tlen(1)",
-            "Error in len: int is not iterable"));
+            "Error in len: in call to len(), parameter 'x' got value of type 'int', want 'iterable"
+                + " or string'"));
 
     // in a function
     checkEvalErrorStack(
@@ -141,7 +146,8 @@ public final class MethodLibraryTest {
             "\t\tf()",
             "\tFile \"\", line 2, column 6, in f",
             "\t\tlen(1)",
-            "Error in len: int is not iterable"));
+            "Error in len: in call to len(), parameter 'x' got value of type 'int', want 'iterable"
+                + " or string'"));
   }
 
   @Test
@@ -263,6 +269,22 @@ public final class MethodLibraryTest {
   }
 
   @Test
+  public void testAbs() throws Exception {
+    ev.new Scenario()
+        // int
+        .testEval("abs(4)", "4")
+        .testEval("abs(-2)", "2")
+        .testEval("abs(0)", "0")
+        // float
+        .testEval("abs(-2.3)", "2.3")
+        .testEval("abs(5.2)", "5.2")
+        .testEval("abs(0.0)", "0.0")
+        // big int
+        .testEval("abs(-12345678901234567890)", "12345678901234567890")
+        .testEval("abs(12345678901234567890)", "12345678901234567890");
+  }
+
+  @Test
   public void testBoolean() throws Exception {
     ev.new Scenario().testExpression("False", Boolean.FALSE).testExpression("True", Boolean.TRUE);
   }
@@ -289,6 +311,80 @@ public final class MethodLibraryTest {
         .testIfExactError(
             "unsupported comparison: builtin_function_or_method <=> builtin_function_or_method",
             "sorted([sorted, sorted])");
+  }
+
+  @StarlarkBuiltin(name = "BadComparable", documented = false, doc = "")
+  static final class BadComparable implements StarlarkValue, Comparable<BadComparable> {
+    final int val;
+
+    BadComparable(int val) {
+      this.val = val;
+    }
+
+    @Override
+    public int compareTo(BadComparable o) {
+      if (this.val == o.val) {
+        return 1; // Violates reflexivity.
+      }
+      return Integer.compare(this.val, o.val);
+    }
+  }
+
+  @Test
+  public void testSortedComparisonError() throws Exception {
+    Random rand = new Random(42);
+    List<BadComparable> list = new ArrayList<>();
+    for (int i = 0; i < 100; i++) {
+      list.add(new BadComparable(rand.nextInt(10)));
+    }
+    ev.update("bad_list", StarlarkList.copyOf(Mutability.IMMUTABLE, list));
+
+    Exception thrown = assertThrows(Exception.class, () -> ev.eval("sorted(bad_list)"));
+    assertThat(thrown).isInstanceOf(Starlark.UncheckedEvalException.class);
+    assertThat(thrown).hasCauseThat().isInstanceOf(IllegalStateException.class);
+    assertThat(thrown)
+        .hasCauseThat()
+        .hasMessageThat()
+        .contains(
+            "sort: element ordering is not self-consistent (element types:"
+                + " [net.starlark.java.eval.MethodLibraryTest$BadComparable])");
+    assertThat(thrown).hasCauseThat().hasCauseThat().isInstanceOf(IllegalArgumentException.class);
+  }
+
+  @Test
+  public void testSortedWithKeyComparisonError() throws Exception {
+    Random rand = new Random(42);
+    List<StarlarkInt> list = new ArrayList<>();
+    for (int i = 0; i < 100; i++) {
+      list.add(StarlarkInt.of(rand.nextInt(10)));
+    }
+    ev.update("int_list", StarlarkList.copyOf(Mutability.IMMUTABLE, list));
+    StarlarkCallable badComparable =
+        new StarlarkCallable() {
+          @Override
+          public String getName() {
+            return "bad_comparable";
+          }
+
+          @Override
+          public Object call(StarlarkThread thread, Tuple args, Dict<String, Object> kwargs)
+              throws EvalException {
+            return new BadComparable(((StarlarkInt) args.get(0)).toIntUnchecked());
+          }
+        };
+    ev.update("bad_comparable", badComparable);
+
+    Exception thrown =
+        assertThrows(Exception.class, () -> ev.eval("sorted(int_list, key = bad_comparable)"));
+    assertThat(thrown).isInstanceOf(Starlark.UncheckedEvalException.class);
+    assertThat(thrown).hasCauseThat().isInstanceOf(IllegalStateException.class);
+    assertThat(thrown)
+        .hasCauseThat()
+        .hasMessageThat()
+        .contains(
+            "sort: element ordering is not self-consistent (key types:"
+                + " [net.starlark.java.eval.MethodLibraryTest$BadComparable])");
+    assertThat(thrown).hasCauseThat().hasCauseThat().isInstanceOf(IllegalArgumentException.class);
   }
 
   @Test
@@ -617,7 +713,7 @@ public final class MethodLibraryTest {
 
   @Test
   public void testLenOnBadType() throws Exception {
-    ev.new Scenario().testIfErrorContains("int is not iterable", "len(1)");
+    ev.new Scenario().testIfErrorContains("want 'iterable or string'", "len(1)");
   }
 
   @Test
@@ -662,6 +758,7 @@ public final class MethodLibraryTest {
         .testExpression("type('a')", "string")
         .testExpression("type([1, 2])", "list")
         .testExpression("type((1, 2))", "tuple")
+        .testExpression("type((1,))", "tuple")
         .testExpression("type(True)", "bool")
         .testExpression("type(None)", "NoneType")
         .testExpression("type(f)", "function")
@@ -687,8 +784,8 @@ public final class MethodLibraryTest {
    * string and chars argument. If chars is null no argument is passed.
    */
   private void checkStrip(
-      String input, Object chars,
-      String expLeft, String expRight, String expBoth) throws Exception {
+      String input, Object chars, String expLeft, String expRight, String expBoth)
+      throws Exception {
     if (chars == null) {
       ev.new Scenario()
           .update("s", input)
@@ -718,9 +815,7 @@ public final class MethodLibraryTest {
     checkStrip(" a b c ", Starlark.NONE, "a b c ", " a b c", "a b c");
     // Default whitespace with full range of Latin-1 whitespace chars.
     String whitespace = "\u0009\n\u000B\u000C\r\u001C\u001D\u001E\u001F\u0020\u0085\u00A0";
-    checkStrip(
-        whitespace + "a" + whitespace, null,
-        "a" + whitespace, whitespace + "a", "a");
+    checkStrip(whitespace + "a" + whitespace, null, "a" + whitespace, whitespace + "a", "a");
     checkStrip(
         whitespace + "a" + whitespace, Starlark.NONE, "a" + whitespace, whitespace + "a", "a");
     // Empty cases.
@@ -736,8 +831,47 @@ public final class MethodLibraryTest {
         .testIfErrorContains("abc", "fail('abc')")
         .testIfErrorContains("18", "fail(18)")
         .testIfErrorContains("1 2 3", "fail(1, 2, 3)")
+        .testIfErrorContains("1, 2, 3", "fail(1, 2, 3, sep=', ')")
         .testIfErrorContains("attribute foo: 1 2 3", "fail(1, 2, 3, attr='foo')") // deprecated
         .testIfErrorContains("0 1 2 3", "fail(1, 2, 3, msg=0)"); // deprecated
+  }
+
+  @Test
+  public void testFail_stackTrace() throws Exception {
+    final StarlarkSemantics withoutForce =
+        StarlarkSemantics.DEFAULT.toBuilder()
+            .setBool(StarlarkSemantics.FORCE_STARLARK_STACK_TRACE, false)
+            .build();
+
+    final StarlarkSemantics withForce =
+        StarlarkSemantics.DEFAULT.toBuilder()
+            .setBool(StarlarkSemantics.FORCE_STARLARK_STACK_TRACE, true)
+            .build();
+
+    EvaluationTestCase customSemanticsEv = new EvaluationTestCase();
+
+    try {
+      customSemanticsEv.setSemantics(withoutForce);
+      customSemanticsEv.eval("fail('with_a_trace')");
+    } catch (EvalException e) {
+      assertThat(e.getMessageWithStack()).contains("Traceback (most recent call last)");
+      assertThat(e.getMessageWithStack()).contains("Error: with_a_trace");
+      assertThat(e.getMessageWithStack()).doesNotContain("Error in fail");
+    }
+
+    try {
+      customSemanticsEv.setSemantics(withoutForce);
+      customSemanticsEv.eval("fail('without_a_trace', stack_trace=False)");
+    } catch (EvalException e) {
+      assertThat(e.getMessageWithStack()).doesNotContain("Traceback (most recent call last)");
+    }
+
+    try {
+      customSemanticsEv.setSemantics(withForce);
+      customSemanticsEv.eval("fail('without_a_trace', stack_trace=False)");
+    } catch (EvalException e) {
+      assertThat(e.getMessageWithStack()).contains("Traceback (most recent call last)");
+    }
   }
 
   @Test
@@ -753,6 +887,29 @@ public final class MethodLibraryTest {
         .testIfErrorContains(
             "join() got named argument for positional-only parameter 'elements'",
             "','.join(elements=['foo', 'bar'])");
+  }
+
+  @StarlarkBuiltin(name = "named_only", doc = "")
+  static final class NamedOnly implements StarlarkValue {
+    @StarlarkMethod(
+        name = "foo",
+        documented = false,
+        parameters = {
+          @Param(name = "a"),
+          @Param(name = "b", named = true, defaultValue = "None", positional = false),
+        })
+    public Object foo(Object a, Object b) {
+      return a;
+    }
+  }
+
+  @Test
+  public void testNamedOnlyArgument() throws Exception {
+    ev.new Scenario()
+        .update("named_only", new NamedOnly())
+        .testIfErrorContains(
+            "foo() accepts no more than 1 positional argument but got 2",
+            "named_only.foo([1, 2, 3], int)");
   }
 
   @Test

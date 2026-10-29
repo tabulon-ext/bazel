@@ -21,13 +21,11 @@ import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.ImmutableSortedSet;
 import com.google.devtools.build.lib.analysis.AnalysisOptions;
+import com.google.devtools.build.lib.analysis.AspectCollection;
 import com.google.devtools.build.lib.analysis.OutputGroupInfo;
 import com.google.devtools.build.lib.analysis.TopLevelArtifactContext;
 import com.google.devtools.build.lib.analysis.ViewCreationFailedException;
-import com.google.devtools.build.lib.analysis.config.BuildOptions;
-import com.google.devtools.build.lib.buildeventstream.BuildEventProtocolOptions;
 import com.google.devtools.build.lib.exec.ExecutionOptions;
 import com.google.devtools.build.lib.packages.semantics.BuildLanguageOptions;
 import com.google.devtools.build.lib.pkgcache.LoadingOptions;
@@ -42,20 +40,20 @@ import com.google.devtools.build.lib.util.io.OutErr;
 import com.google.devtools.common.options.OptionsBase;
 import com.google.devtools.common.options.OptionsParsingResult;
 import com.google.devtools.common.options.OptionsProvider;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import javax.annotation.Nullable;
 
 /**
- * A BuildRequest represents a single invocation of the build tool by a user.
- * A request specifies a list of targets to be built for a single
- * configuration, a pair of output/error streams, and additional options such
- * as --keep_going, --jobs, etc.
+ * A BuildRequest represents a single invocation of the build tool by a user. A request specifies a
+ * list of targets to be built for a single configuration, a pair of output/error streams, and
+ * additional options such as --keep_going, --jobs, etc.
  */
 public class BuildRequest implements OptionsProvider {
-  public static final String VALIDATION_ASPECT_NAME = "ValidateTarget";
 
   private static final ImmutableList<Class<? extends OptionsBase>> MANDATORY_OPTIONS =
       ImmutableList.of(
@@ -89,51 +87,61 @@ public class BuildRequest implements OptionsProvider {
 
     private Builder() {}
 
+    @CanIgnoreReturnValue
     public Builder setId(UUID id) {
       this.id = id;
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder setOptions(OptionsParsingResult options) {
       this.options = options;
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder setStartupOptions(OptionsParsingResult startupOptions) {
       this.startupOptions = startupOptions;
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder setCommandName(String commandName) {
       this.commandName = commandName;
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder setOutErr(OutErr outErr) {
       this.outErr = outErr;
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder setTargets(List<String> targets) {
       this.targets = targets;
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder setStartTimeMillis(long startTimeMillis) {
       this.startTimeMillis = startTimeMillis;
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder setNeedsInstrumentationFilter(boolean needsInstrumentationFilter) {
       this.needsInstrumentationFilter = needsInstrumentationFilter;
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder setRunTests(boolean runTests) {
       this.runTests = runTests;
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder setCheckforActionConflicts(boolean checkForActionConflicts) {
       this.checkForActionConflicts = checkForActionConflicts;
       return this;
@@ -148,6 +156,7 @@ public class BuildRequest implements OptionsProvider {
      * output) and false for queries (where users want to understand target relationships or
      * diagnose why incompatible targets are incompatible).
      */
+    @CanIgnoreReturnValue
     public Builder setReportIncompatibleTargets(boolean report) {
       this.reportIncompatibleTargets = report;
       return this;
@@ -172,14 +181,14 @@ public class BuildRequest implements OptionsProvider {
   private final UUID id;
   private final LoadingCache<Class<? extends OptionsBase>, Optional<OptionsBase>> optionsCache;
   private final Map<String, Object> starlarkOptions;
+  private final Set<String> starlarkOptionsAllowingMultiple;
+  private final Map<String, String> scopesAttributes;
+  private final Map<String, Object> onLeaveScopeValues;
 
   /** A human-readable description of all the non-default option settings. */
   private final String optionsDescription;
 
-  /**
-   * The name of the Blaze command that the user invoked.
-   * Used for --announce.
-   */
+  /** The name of the Blaze command that the user invoked. Used for --announce. */
   private final String commandName;
 
   private final OutErr outErr;
@@ -192,6 +201,7 @@ public class BuildRequest implements OptionsProvider {
   private final boolean runTests;
   private final boolean checkForActionConflicts;
   private final boolean reportIncompatibleTargets;
+  private final ImmutableMap<String, String> userOptions;
 
   private BuildRequest(
       String commandName,
@@ -211,6 +221,10 @@ public class BuildRequest implements OptionsProvider {
     this.targets = targets;
     this.id = id;
     this.startTimeMillis = startTimeMillis;
+    this.userOptions =
+        options.getUserOptions() == null
+            ? ImmutableMap.of()
+            : ImmutableMap.copyOf(options.getUserOptions());
     this.optionsCache =
         Caffeine.newBuilder()
             .build(
@@ -223,6 +237,9 @@ public class BuildRequest implements OptionsProvider {
                   return Optional.fromNullable(result);
                 });
     this.starlarkOptions = options.getStarlarkOptions();
+    this.starlarkOptionsAllowingMultiple = options.getStarlarkOptionsAllowingMultiple();
+    this.scopesAttributes = options.getScopesAttributes();
+    this.onLeaveScopeValues = options.getOnLeaveScopeValues();
     this.needsInstrumentationFilter = needsInstrumentationFilter;
     this.runTests = runTests;
     this.checkForActionConflicts = checkForActionConflicts;
@@ -233,7 +250,18 @@ public class BuildRequest implements OptionsProvider {
     }
 
     // All this, just to pass a global boolean from the client to the server. :(
-    this.runningInEmacs = options.getOptions(UiOptions.class).runningInEmacs;
+    this.runningInEmacs = options.getOptions(UiOptions.class).getRunningInEmacs();
+  }
+
+  /**
+   * Return whether this BuildRequest contains multiple top-level configs
+   *
+   * <p>Note: The ability to have a multi-top-level-config build is currently completely disabled.
+   * However, certain parts of the infra would fail horribly if it was ever enabled at all so
+   * keeping this flag for those parts to check as a sort of mild future-proofing.
+   */
+  public boolean isMultiConfigBuild() {
+    return false;
   }
 
   /**
@@ -247,16 +275,41 @@ public class BuildRequest implements OptionsProvider {
     return starlarkOptions;
   }
 
+  @Override
+  public Map<String, String> getScopesAttributes() {
+    return scopesAttributes;
+  }
+
+  @Override
+  public Map<String, Object> getOnLeaveScopeValues() {
+    return onLeaveScopeValues;
+  }
+
+  @Override
+  public Map<String, Object> getExplicitCommandLineStarlarkOptions() {
+    throw new UnsupportedOperationException("No known callers to this implementation");
+  }
+
+  @Override
+  public Set<String> getStarlarkOptionsAllowingMultiple() {
+    return starlarkOptionsAllowingMultiple;
+  }
+
   /**
-   * Returns a unique identifier that universally identifies this build.
+   * Returns the list of options that were parsed from either a user blazerc file or the command
+   * line.
    */
+  @Override
+  public ImmutableMap<String, String> getUserOptions() {
+    return userOptions;
+  }
+
+  /** Returns a unique identifier that universally identifies this build. */
   public UUID getId() {
     return id;
   }
 
-  /**
-   * Returns the name of the Blaze command that the user invoked.
-   */
+  /** Returns the name of the Blaze command that the user invoked. */
   public String getCommandName() {
     return commandName;
   }
@@ -265,24 +318,19 @@ public class BuildRequest implements OptionsProvider {
     return runningInEmacs;
   }
 
-  /**
-   * Returns true if tests should be run by the build tool.
-   */
+  /** Returns true if tests should be run by the build tool. */
   public boolean shouldRunTests() {
     return runTests;
   }
 
-  /**
-   * Returns the (immutable) list of targets to build in commandline
-   * form.
-   */
+  /** Returns the (immutable) list of targets to build in commandline form. */
   public List<String> getTargets() {
     return targets;
   }
 
   /**
-   * Returns the output/error streams to which errors and progress messages
-   * should be sent during the fulfillment of this request.
+   * Returns the output/error streams to which errors and progress messages should be sent during
+   * the fulfillment of this request.
    */
   public OutErr getOutErr() {
     return outErr;
@@ -294,10 +342,7 @@ public class BuildRequest implements OptionsProvider {
     return (T) optionsCache.get(clazz).orNull();
   }
 
-
-  /**
-   * Returns the set of command-line options specified for this request.
-   */
+  /** Returns the set of command-line options specified for this request. */
   public BuildRequestOptions getBuildOptions() {
     return getOptions(BuildRequestOptions.class);
   }
@@ -307,48 +352,39 @@ public class BuildRequest implements OptionsProvider {
     return getOptions(PackageOptions.class);
   }
 
-  /**
-   * Returns the set of options related to the loading phase.
-   */
+  /** Returns the set of options related to the loading phase. */
   public LoadingOptions getLoadingOptions() {
     return getOptions(LoadingOptions.class);
   }
 
-  /**
-   * Returns the set of command-line options related to the view specified for
-   * this request.
-   */
+  /** Returns the set of command-line options related to the view specified for this request. */
   public AnalysisOptions getViewOptions() {
     return getOptions(AnalysisOptions.class);
   }
 
   /** Returns the value of the --keep_going option. */
   public boolean getKeepGoing() {
-    return getOptions(KeepGoingOption.class).keepGoing;
+    return getOptions(KeepGoingOption.class).getKeepGoing();
   }
 
   /** Returns the value of the --loading_phase_threads option. */
   int getLoadingPhaseThreadCount() {
-    return getOptions(LoadingPhaseThreadsOption.class).threads;
+    return getOptions(LoadingPhaseThreadsOption.class).getThreads();
   }
-  /**
-   * Returns the set of execution options specified for this request.
-   */
+
+  /** Returns the set of execution options specified for this request. */
   public ExecutionOptions getExecutionOptions() {
     return getOptions(ExecutionOptions.class);
   }
 
-  /**
-   * Returns the human-readable description of the non-default options
-   * for this build request.
-   */
+  /** Returns the human-readable description of the non-default options for this build request. */
   public String getOptionsDescription() {
     return optionsDescription;
   }
 
   /**
-   * Return the time (according to System.currentTimeMillis()) at which the
-   * service of this request was started.
+   * Return the time (according to System.currentTimeMillis()) at which the service of this request
+   * was started.
    */
   public long getStartTime() {
     return startTimeMillis;
@@ -369,17 +405,14 @@ public class BuildRequest implements OptionsProvider {
   public List<String> validateOptions() {
     List<String> warnings = new ArrayList<>();
 
-    int localTestJobs = getExecutionOptions().localTestJobs;
-    int jobs = getBuildOptions().jobs;
+    int localTestJobs = getExecutionOptions().getLocalTestJobs();
+    int jobs = getBuildOptions().getJobs();
     if (localTestJobs > jobs) {
       warnings.add(
-          String.format("High value for --local_test_jobs: %d. This exceeds the value for --jobs: "
-              + "%d. Only up to %d local tests will run concurrently.", localTestJobs, jobs, jobs));
-    }
-
-    // Validate other BuildRequest options.
-    if (getBuildOptions().verboseExplanations && getBuildOptions().explanationPath == null) {
-      warnings.add("--verbose_explanations has no effect when --explain=<file> is not enabled");
+          String.format(
+              "High value for --local_test_jobs: %d. This exceeds the value for --jobs: "
+                  + "%d. Only up to %d local tests will run concurrently.",
+              localTestJobs, jobs, jobs));
     }
 
     return warnings;
@@ -389,29 +422,29 @@ public class BuildRequest implements OptionsProvider {
   public TopLevelArtifactContext getTopLevelArtifactContext() {
     BuildRequestOptions buildOptions = getBuildOptions();
     return new TopLevelArtifactContext(
-        getOptions(ExecutionOptions.class).testStrategy.equals("exclusive"),
-        getOptions(BuildEventProtocolOptions.class).expandFilesets,
-        getOptions(BuildEventProtocolOptions.class).fullyResolveFilesetSymlinks,
+        getOptions(ExecutionOptions.class).getTestStrategy().equals("exclusive"),
         OutputGroupInfo.determineOutputGroups(
-            buildOptions.outputGroups, validationMode(), /*shouldRunTests=*/ shouldRunTests()));
-  }
-
-  public ImmutableSortedSet<String> getMultiCpus() {
-    return ImmutableSortedSet.copyOf(getBuildOptions().multiCpus);
+            buildOptions.getOutputGroups(),
+            buildOptions.getExtraDefaultOutputGroups(),
+            validationMode(),
+            /* shouldRunTests= */ shouldRunTests()),
+        buildOptions.getIncompatibleFailOnUnknownOutputGroups(),
+        /* forRunCommand= */ commandName.equals("run"));
   }
 
   public ImmutableList<String> getAspects() {
-    List<String> aspects = getBuildOptions().aspects;
+    List<String> aspects = getBuildOptions().getAspects();
     ImmutableList.Builder<String> result = ImmutableList.<String>builder().addAll(aspects);
-    if (!aspects.contains(VALIDATION_ASPECT_NAME) && useValidationAspect()) {
-      result.add(VALIDATION_ASPECT_NAME);
+    if (!aspects.contains(AspectCollection.VALIDATION_ASPECT_NAME) && useValidationAspect()) {
+      result.add(AspectCollection.VALIDATION_ASPECT_NAME);
     }
     return result.build();
   }
 
   @Nullable
   public ImmutableMap<String, String> getAspectsParameters() throws ViewCreationFailedException {
-    List<Map.Entry<String, String>> aspectsParametersList = getBuildOptions().aspectsParameters;
+    List<Map.Entry<String, String>> aspectsParametersList =
+        getBuildOptions().getAspectsParameters();
     try {
       return aspectsParametersList.stream()
           .collect(toImmutableMap(Map.Entry::getKey, Map.Entry::getValue));
@@ -427,21 +460,17 @@ public class BuildRequest implements OptionsProvider {
     }
   }
 
-  /** Whether {@value #VALIDATION_ASPECT_NAME} is in use. */
+  /** Whether {@value AspectCollection#VALIDATION_ASPECT_NAME} is in use. */
   public boolean useValidationAspect() {
     return validationMode() == OutputGroupInfo.ValidationMode.ASPECT;
   }
 
   private OutputGroupInfo.ValidationMode validationMode() {
     BuildRequestOptions buildOptions = getBuildOptions();
-    // "and" these together so that --noexperimental_run_validation and --norun_validations work
-    // as expected.
-    boolean runValidationActions =
-        buildOptions.runValidationActions && buildOptions.experimentalRunValidationActions;
-    if (!runValidationActions) {
+    if (!buildOptions.getRunValidationActions()) {
       return OutputGroupInfo.ValidationMode.OFF;
     }
-    return buildOptions.useValidationAspect
+    return buildOptions.getUseValidationAspect()
         ? OutputGroupInfo.ValidationMode.ASPECT
         : OutputGroupInfo.ValidationMode.OUTPUT_GROUP;
   }

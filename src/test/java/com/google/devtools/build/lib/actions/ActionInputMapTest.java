@@ -13,22 +13,18 @@
 // limitations under the License.
 package com.google.devtools.build.lib.actions;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.truth.Truth.assertThat;
 import static java.nio.charset.StandardCharsets.US_ASCII;
 import static org.junit.Assert.assertThrows;
-import static org.mockito.Mockito.doNothing;
-import static org.mockito.Mockito.mock;
 
 import com.google.auto.value.AutoValue;
-import com.google.devtools.build.lib.actions.Artifact.SpecialArtifact;
+import com.google.devtools.build.lib.actions.Artifact.TreeArtifact;
 import com.google.devtools.build.lib.actions.Artifact.TreeFileArtifact;
 import com.google.devtools.build.lib.actions.ArtifactRoot.RootType;
 import com.google.devtools.build.lib.actions.util.ActionsTestUtil;
-import com.google.devtools.build.lib.bugreport.BugReporter;
-import com.google.devtools.build.lib.clock.BlazeClock;
 import com.google.devtools.build.lib.skyframe.TreeArtifactValue;
 import com.google.devtools.build.lib.vfs.DigestHashFunction;
-import com.google.devtools.build.lib.vfs.FileSystem;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.inmemoryfs.InMemoryFileSystem;
@@ -36,46 +32,43 @@ import com.google.testing.junit.testparameterinjector.TestParameter;
 import com.google.testing.junit.testparameterinjector.TestParameterInjector;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Random;
-import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.mockito.ArgumentCaptor;
 
 /** Unit test for {@link ActionInputMap}. */
 @RunWith(TestParameterInjector.class)
 public final class ActionInputMapTest {
 
   // small hint to stress the map
-  private final ActionInputMap map = new ActionInputMap(BugReporter.defaultInstance(), 1);
-  private ArtifactRoot artifactRoot;
-
-  @Before
-  public void createArtifactRoot() {
-    FileSystem fs = new InMemoryFileSystem(BlazeClock.instance(), DigestHashFunction.SHA256);
-    artifactRoot =
-        ArtifactRoot.asDerivedRoot(fs.getPath("/execroot"), RootType.Output, "bazel-out");
-  }
+  private final ActionInputMap map = new ActionInputMap(1);
+  private final ArtifactRoot artifactRoot =
+      ArtifactRoot.asDerivedRoot(
+          new InMemoryFileSystem(DigestHashFunction.SHA256).getPath("/execroot"),
+          RootType.OUTPUT,
+          "bazel-out");
 
   @Test
   public void basicPutAndLookup() {
-    assertThat(put("/abc/def", 5)).isTrue();
+    put("/abc/def", 5);
     assertThat(map.sizeForDebugging()).isEqualTo(1);
     assertContains("/abc/def", 5);
     assertThat(map.getMetadata(PathFragment.create("blah"))).isNull();
-    assertThat(map.getInput("blah")).isNull();
+    assertThat(map.getInput(PathFragment.create("blah"))).isNull();
   }
 
   @Test
   public void put_ignoresSubsequentPuts() {
-    assertThat(put("/abc/def", 5)).isTrue();
+    put("/abc/def", 5);
     assertThat(map.sizeForDebugging()).isEqualTo(1);
-    assertThat(put("/abc/def", 6)).isFalse();
+    put("/abc/def", 6);
     assertThat(map.sizeForDebugging()).isEqualTo(1);
-    assertThat(put("/ghi/jkl", 7)).isTrue();
+    put("/ghi/jkl", 7);
     assertThat(map.sizeForDebugging()).isEqualTo(2);
-    assertThat(put("/ghi/jkl", 8)).isFalse();
+    put("/ghi/jkl", 8);
     assertThat(map.sizeForDebugging()).isEqualTo(2);
     assertContains("/abc/def", 5);
     assertContains("/ghi/jkl", 7);
@@ -85,14 +78,13 @@ public final class ActionInputMapTest {
   public void clear_removesAllElements() {
     ActionInput input1 = new TestInput("/abc/def");
     ActionInput input2 = new TestInput("/ghi/jkl");
-    SpecialArtifact tree = createTreeArtifact("tree");
+    TreeArtifact tree = createTreeArtifact("tree");
     TreeFileArtifact treeChild = TreeFileArtifact.createTreeOutput(tree, "child");
-    map.putWithNoDepOwner(input1, TestMetadata.create(1));
-    map.putWithNoDepOwner(input2, TestMetadata.create(2));
+    map.put(input1, TestMetadata.create(1));
+    map.put(input2, TestMetadata.create(2));
     map.putTreeArtifact(
         tree,
-        TreeArtifactValue.newBuilder(tree).putChild(treeChild, TestMetadata.create(3)).build(),
-        /*depOwner=*/ null);
+        TreeArtifactValue.newBuilder(tree).putChild(treeChild, TestMetadata.create(3)).build());
     // Sanity check
     assertThat(map.sizeForDebugging()).isEqualTo(3);
 
@@ -107,17 +99,17 @@ public final class ActionInputMapTest {
 
   @Test
   public void putTreeArtifact_addsEmptyTreeArtifact() {
-    SpecialArtifact tree = createTreeArtifact("tree");
+    TreeArtifact tree = createTreeArtifact("tree");
 
-    map.putTreeArtifact(tree, TreeArtifactValue.empty(), /*depOwner=*/ null);
+    map.putTreeArtifact(tree, TreeArtifactValue.empty());
 
     assertThat(map.sizeForDebugging()).isEqualTo(1);
-    assertContainsEqualMetadata(tree, TreeArtifactValue.empty().getMetadata());
+    assertContainsTree(tree, TreeArtifactValue.empty());
   }
 
   @Test
   public void putTreeArtifact_addsTreeArtifactAndAllChildren() {
-    SpecialArtifact tree = createTreeArtifact("tree");
+    TreeArtifact tree = createTreeArtifact("tree");
     TreeFileArtifact child1 = TreeFileArtifact.createTreeOutput(tree, "child1");
     FileArtifactValue child1Metadata = TestMetadata.create(1);
     TreeFileArtifact child2 = TreeFileArtifact.createTreeOutput(tree, "child2");
@@ -128,38 +120,38 @@ public final class ActionInputMapTest {
             .putChild(child2, child2Metadata)
             .build();
 
-    map.putTreeArtifact(tree, treeValue, /*depOwner=*/ null);
+    map.putTreeArtifact(tree, treeValue);
 
     assertThat(map.sizeForDebugging()).isEqualTo(1);
-    assertContainsEqualMetadata(tree, treeValue.getMetadata());
-    assertContainsSameInstance(child1, child1Metadata);
-    assertContainsSameInstance(child2, child2Metadata);
+    assertContainsTree(tree, treeValue);
+    assertContainsFile(child1, child1Metadata);
+    assertContainsFile(child2, child2Metadata);
   }
 
   @Test
   public void putTreeArtifact_mixedTreeAndFiles_addsTreeAndChildren() {
-    SpecialArtifact tree = createTreeArtifact("tree");
+    TreeArtifact tree = createTreeArtifact("tree");
     TreeFileArtifact child = TreeFileArtifact.createTreeOutput(tree, "child");
     FileArtifactValue childMetadata = TestMetadata.create(1);
     ActionInput file = ActionInputHelper.fromPath("file");
     FileArtifactValue fileMetadata = TestMetadata.create(2);
-    map.putWithNoDepOwner(file, fileMetadata);
+    map.put(file, fileMetadata);
     TreeArtifactValue treeValue =
         TreeArtifactValue.newBuilder(tree).putChild(child, childMetadata).build();
 
-    map.putTreeArtifact(tree, treeValue, /*depOwner=*/ null);
+    map.putTreeArtifact(tree, treeValue);
 
-    assertContainsEqualMetadata(tree, treeValue.getMetadata());
-    assertContainsSameInstance(child, childMetadata);
-    assertContainsSameInstance(file, fileMetadata);
+    assertContainsTree(tree, treeValue);
+    assertContainsFile(child, childMetadata);
+    assertContainsFile(file, fileMetadata);
   }
 
   @Test
   public void putTreeArtifact_multipleTrees_addsAllTreesAndChildren() {
-    SpecialArtifact tree1 = createTreeArtifact("tree1");
+    TreeArtifact tree1 = createTreeArtifact("tree1");
     TreeFileArtifact tree1Child = TreeFileArtifact.createTreeOutput(tree1, "child");
     FileArtifactValue tree1ChildMetadata = TestMetadata.create(1);
-    SpecialArtifact tree2 = createTreeArtifact("tree2");
+    TreeArtifact tree2 = createTreeArtifact("tree2");
     TreeFileArtifact tree2Child = TreeFileArtifact.createTreeOutput(tree2, "child");
     FileArtifactValue tree2ChildMetadata = TestMetadata.create(2);
     TreeArtifactValue tree1Value =
@@ -167,55 +159,58 @@ public final class ActionInputMapTest {
     TreeArtifactValue tree2Value =
         TreeArtifactValue.newBuilder(tree2).putChild(tree2Child, tree2ChildMetadata).build();
 
-    map.putTreeArtifact(tree1, tree1Value, /*depOwner=*/ null);
-    map.putTreeArtifact(tree2, tree2Value, /*depOwner=*/ null);
+    map.putTreeArtifact(tree1, tree1Value);
+    map.putTreeArtifact(tree2, tree2Value);
 
-    assertContainsEqualMetadata(tree1, tree1Value.getMetadata());
-    assertContainsSameInstance(tree1Child, tree1ChildMetadata);
-    assertContainsEqualMetadata(tree2, tree2Value.getMetadata());
-    assertContainsSameInstance(tree2Child, tree2ChildMetadata);
+    assertContainsTree(tree1, tree1Value);
+    assertContainsFile(tree1Child, tree1ChildMetadata);
+    assertContainsTree(tree2, tree2Value);
+    assertContainsFile(tree2Child, tree2ChildMetadata);
   }
 
   @Test
   public void putTreeArtifact_multipleTreesUnderSameDirectory_addsAllTrees() {
-    SpecialArtifact tree1 = createTreeArtifact("dir/tree1");
-    SpecialArtifact tree2 = createTreeArtifact("dir/tree2");
-    SpecialArtifact tree3 = createTreeArtifact("dir/tree3");
+    TreeArtifact tree1 = createTreeArtifact("dir/tree1");
+    TreeArtifact tree2 = createTreeArtifact("dir/tree2");
+    TreeArtifact tree3 = createTreeArtifact("dir/tree3");
 
-    map.putTreeArtifact(tree1, TreeArtifactValue.empty(), /*depOwner=*/ null);
-    map.putTreeArtifact(tree2, TreeArtifactValue.empty(), /*depOwner=*/ null);
-    map.putTreeArtifact(tree3, TreeArtifactValue.empty(), /*depOwner=*/ null);
+    map.putTreeArtifact(tree1, TreeArtifactValue.empty());
+    map.putTreeArtifact(tree2, TreeArtifactValue.empty());
+    map.putTreeArtifact(tree3, TreeArtifactValue.empty());
 
-    assertThat(map.getInput(tree1.getExecPathString())).isEqualTo(tree1);
-    assertThat(map.getInput(tree2.getExecPathString())).isEqualTo(tree2);
-    assertThat(map.getInput(tree3.getExecPathString())).isEqualTo(tree3);
+    assertContainsTree(tree1, TreeArtifactValue.empty());
+    assertContainsTree(tree2, TreeArtifactValue.empty());
+    assertContainsTree(tree3, TreeArtifactValue.empty());
   }
 
   @Test
   public void putTreeArtifact_afterPutTreeArtifactWithSameExecPath_doesNothing() {
-    SpecialArtifact tree1 = createTreeArtifact("tree");
-    SpecialArtifact tree2 = createTreeArtifact("tree");
+    TreeArtifact tree1 = createTreeArtifact("tree");
+    TreeArtifact tree2 = createTreeArtifact("tree");
     TreeFileArtifact tree2File = TreeFileArtifact.createTreeOutput(tree2, "file");
+    TreeArtifactValue tree1Value = TreeArtifactValue.empty();
     TreeArtifactValue tree2Value =
         TreeArtifactValue.newBuilder(tree2).putChild(tree2File, TestMetadata.create(1)).build();
-    map.putTreeArtifact(tree1, TreeArtifactValue.empty(), /*depOwner=*/ null);
+    map.putTreeArtifact(tree1, tree1Value);
 
-    map.putTreeArtifact(tree2, tree2Value, /*depOwner=*/ null);
+    map.putTreeArtifact(tree2, tree2Value);
 
-    assertContainsEqualMetadata(tree1, TreeArtifactValue.empty().getMetadata());
-    assertThat(map.getMetadata(tree2)).isEqualTo(TreeArtifactValue.empty().getMetadata());
+    assertContainsTree(tree1, tree1Value);
+    // Cannot assertContainsTree since the execpath will point to tree1 instead.
+    assertThat(map.getInputMetadata(tree2)).isEqualTo(tree1Value.getMetadata());
+    assertThat(map.getTreeMetadata(tree2.getExecPath())).isSameInstanceAs(tree1Value);
+    assertThat(map.getInput(tree2.getExecPath())).isSameInstanceAs(tree1);
     assertDoesNotContain(tree2File);
   }
 
   @Test
   public void putTreeArtifact_sameExecPathAsARegularFile_fails() {
-    SpecialArtifact tree = createTreeArtifact("tree");
+    TreeArtifact tree = createTreeArtifact("tree");
     ActionInput file = ActionInputHelper.fromPath(tree.getExecPath());
-    map.put(file, TestMetadata.create(1), /*depOwner=*/ null);
+    map.put(file, TestMetadata.create(1));
 
     assertThrows(
-        IllegalArgumentException.class,
-        () -> map.putTreeArtifact(tree, TreeArtifactValue.empty(), /*depOwner=*/ null));
+        IllegalArgumentException.class, () -> map.putTreeArtifact(tree, TreeArtifactValue.empty()));
   }
 
   private enum PutOrder {
@@ -236,7 +231,7 @@ public final class ActionInputMapTest {
   @Test
   public void putTreeArtifact_nestedFile_returnsNestedFileFromExecPath(
       @TestParameter PutOrder putOrder) {
-    SpecialArtifact tree = createTreeArtifact("tree");
+    TreeArtifact tree = createTreeArtifact("tree");
     TreeFileArtifact treeFile = TreeFileArtifact.createTreeOutput(tree, "file");
     FileArtifactValue treeFileMetadata = TestMetadata.create(1);
     ActionInput file = ActionInputHelper.fromPath(treeFile.getExecPath());
@@ -244,57 +239,12 @@ public final class ActionInputMapTest {
     TreeArtifactValue treeValue =
         TreeArtifactValue.newBuilder(tree).putChild(treeFile, treeFileMetadata).build();
 
-    putOrder.runPuts(
-        () -> map.put(file, fileMetadata, /*depOwner=*/ null),
-        () -> map.putTreeArtifact(tree, treeValue, /*depOwner=*/ null));
+    putOrder.runPuts(() -> map.put(file, fileMetadata), () -> map.putTreeArtifact(tree, treeValue));
 
-    assertThat(map.getMetadata(file)).isSameInstanceAs(fileMetadata);
-    assertThat(map.getMetadata(treeFile)).isSameInstanceAs(treeFileMetadata);
+    assertThat(map.getInputMetadata(file)).isSameInstanceAs(fileMetadata);
+    assertThat(map.getInputMetadata(treeFile)).isSameInstanceAs(treeFileMetadata);
     assertThat(map.getMetadata(treeFile.getExecPath())).isSameInstanceAs(fileMetadata);
-    assertThat(map.getInput(treeFile.getExecPathString())).isSameInstanceAs(file);
-  }
-
-  @Test
-  public void putTreeArtifact_nestedTree_returnsOuterEntriesForOverlappingFiles(
-      @TestParameter PutOrder putOrder) {
-    SpecialArtifact tree = createTreeArtifact("tree");
-    TreeFileArtifact onlyOuterTreeFile = TreeFileArtifact.createTreeOutput(tree, "file1");
-    FileArtifactValue onlyOuterTreeFileMetadata = TestMetadata.create(1);
-    TreeFileArtifact treeFile = TreeFileArtifact.createTreeOutput(tree, "dir/file2");
-    FileArtifactValue treeFileMetadata = TestMetadata.create(2);
-    TreeArtifactValue treeValue =
-        TreeArtifactValue.newBuilder(tree)
-            .putChild(treeFile, treeFileMetadata)
-            .putChild(onlyOuterTreeFile, onlyOuterTreeFileMetadata)
-            .build();
-    SpecialArtifact nestedTree = createTreeArtifact("tree/dir");
-    TreeFileArtifact nestedTreeFile = TreeFileArtifact.createTreeOutput(nestedTree, "file2");
-    FileArtifactValue nestedTreeFileMetadata = TestMetadata.create(2); // Same as treeFileMetadata.
-    TreeArtifactValue nestedTreeValue =
-        TreeArtifactValue.newBuilder(nestedTree)
-            .putChild(nestedTreeFile, nestedTreeFileMetadata)
-            .build();
-
-    putOrder.runPuts(
-        () -> map.putTreeArtifact(tree, treeValue, /*depOwner=*/ null),
-        () -> map.putTreeArtifact(nestedTree, nestedTreeValue, /*depOwner=*/ null));
-
-    assertContainsEqualMetadata(tree, treeValue.getMetadata());
-    assertContainsEqualMetadata(nestedTree, nestedTreeValue.getMetadata());
-    assertThat(map.getMetadata(treeFile)).isSameInstanceAs(treeFileMetadata);
-    assertThat(map.getMetadata(nestedTreeFile)).isSameInstanceAs(nestedTreeFileMetadata);
-    assertThat(map.getMetadata(treeFile.getExecPath())).isSameInstanceAs(treeFileMetadata);
-    assertThat(map.getInput(treeFile.getExecPathString())).isSameInstanceAs(treeFile);
-    assertContainsSameInstance(onlyOuterTreeFile, onlyOuterTreeFileMetadata);
-  }
-
-  @Test
-  public void putTreeArtifact_omittedTree_addsEntryWithNoChildren() {
-    SpecialArtifact tree = createTreeArtifact("tree");
-
-    map.putTreeArtifact(tree, TreeArtifactValue.OMITTED_TREE_MARKER, /*depOwner=*/ null);
-
-    assertContainsSameInstance(tree, FileArtifactValue.OMITTED_FILE_MARKER);
+    assertThat(map.getInput(treeFile.getExecPath())).isSameInstanceAs(file);
   }
 
   @Test
@@ -303,114 +253,160 @@ public final class ActionInputMapTest {
         TreeFileArtifact.createTreeOutput(createTreeArtifact("tree"), "file");
     FileArtifactValue metadata = TestMetadata.create(1);
 
-    map.put(treeFile, metadata, /*depOwner=*/ null);
+    map.put(treeFile, metadata);
 
-    assertContainsSameInstance(treeFile, metadata);
+    assertContainsFile(treeFile, metadata);
   }
 
   @Test
   public void put_sameExecPathAsATree_fails() {
-    SpecialArtifact tree = createTreeArtifact("tree");
+    TreeArtifact tree = createTreeArtifact("tree");
     ActionInput file = ActionInputHelper.fromPath(tree.getExecPath());
     FileArtifactValue fileMetadata = TestMetadata.create(1);
-    map.putTreeArtifact(tree, TreeArtifactValue.empty(), /*depOwner=*/ null);
+    map.putTreeArtifact(tree, TreeArtifactValue.empty());
 
-    assertThrows(
-        IllegalArgumentException.class, () -> map.put(file, fileMetadata, /*depOwner=*/ null));
+    assertThrows(IllegalArgumentException.class, () -> map.put(file, fileMetadata));
   }
 
   @Test
   public void put_treeArtifact_fails() {
-    SpecialArtifact tree = createTreeArtifact("tree");
+    TreeArtifact tree = createTreeArtifact("tree");
     FileArtifactValue metadata = TestMetadata.create(1);
 
-    assertThrows(IllegalArgumentException.class, () -> map.put(tree, metadata, /*depOwner=*/ null));
+    assertThrows(IllegalArgumentException.class, () -> map.put(tree, metadata));
   }
 
   @Test
   public void getMetadata_actionInputWithTreeExecPath_returnsTreeArtifactEntries() {
-    SpecialArtifact tree = createTreeArtifact("tree");
-    map.putTreeArtifact(tree, TreeArtifactValue.empty(), /*depOwner=*/ null);
+    TreeArtifact tree = createTreeArtifact("tree");
+    map.putTreeArtifact(tree, TreeArtifactValue.empty());
     ActionInput input = ActionInputHelper.fromPath(tree.getExecPath());
 
-    assertThat(map.getMetadata(input)).isEqualTo(TreeArtifactValue.empty().getMetadata());
+    assertThat(map.getInputMetadata(input)).isEqualTo(TreeArtifactValue.empty().getMetadata());
   }
 
   @Test
   public void getMetadata_actionInputWithTreeFileExecPath_returnsTreeArtifactEntries() {
-    BugReporter bugReporter = mock(BugReporter.class);
-    ArgumentCaptor<Throwable> exceptionCaptor = ArgumentCaptor.forClass(Throwable.class);
-    doNothing().when(bugReporter).sendBugReport(exceptionCaptor.capture());
-    ActionInputMap inputMap = new ActionInputMap(bugReporter, /*sizeHint=*/ 1);
-    SpecialArtifact tree = createTreeArtifact("tree");
+    ActionInputMap inputMap = new ActionInputMap(/* sizeHint= */ 1);
+    TreeArtifact tree = createTreeArtifact("tree");
     TreeFileArtifact treeFile = TreeFileArtifact.createTreeOutput(tree, "file");
     FileArtifactValue treeFileMetadata = TestMetadata.create(1);
     TreeArtifactValue treeValue =
         TreeArtifactValue.newBuilder(tree).putChild(treeFile, treeFileMetadata).build();
-    inputMap.putTreeArtifact(tree, treeValue, /*depOwner=*/ null);
+    inputMap.putTreeArtifact(tree, treeValue);
     ActionInput input = ActionInputHelper.fromPath(treeFile.getExecPath());
 
-    FileArtifactValue metadata = inputMap.getMetadata(input);
+    FileArtifactValue metadata = inputMap.getInputMetadata(input);
 
     assertThat(metadata).isSameInstanceAs(treeFileMetadata);
-    assertThat(exceptionCaptor.getValue()).isInstanceOf(IllegalArgumentException.class);
-    assertThat(exceptionCaptor.getValue())
-        .hasMessageThat()
-        .isEqualTo("Tree artifact file: 'bazel-out/tree/file' referred to as an action input");
   }
 
   @Test
   public void getMetadata_artifactWithTreeFileExecPath_returnsNull() {
-    SpecialArtifact tree = createTreeArtifact("tree");
+    TreeArtifact tree = createTreeArtifact("tree");
     TreeFileArtifact treeFile = TreeFileArtifact.createTreeOutput(tree, "file");
     TreeArtifactValue treeValue =
         TreeArtifactValue.newBuilder(tree).putChild(treeFile, TestMetadata.create(1)).build();
-    map.putTreeArtifact(tree, treeValue, /*depOwner=*/ null);
+    map.putTreeArtifact(tree, treeValue);
     Artifact artifact =
         ActionsTestUtil.createArtifactWithExecPath(artifactRoot, treeFile.getExecPath());
 
     // Even though we could match the artifact by exec path, it was not registered as a nested
     // artifact -- only the tree file was.
-    assertThat(map.getMetadata(artifact)).isNull();
+    assertThat(map.getInputMetadata(artifact)).isNull();
   }
 
   @Test
   public void getMetadata_missingFileWithinTree_returnsNull() {
-    SpecialArtifact tree = createTreeArtifact("tree");
+    TreeArtifact tree = createTreeArtifact("tree");
     map.putTreeArtifact(
         tree,
         TreeArtifactValue.newBuilder(tree)
             .putChild(TreeFileArtifact.createTreeOutput(tree, "file"), TestMetadata.create(1))
-            .build(),
-        /*depOwner=*/ null);
+            .build());
     TreeFileArtifact nonexistentTreeFile = TreeFileArtifact.createTreeOutput(tree, "nonexistent");
 
     assertDoesNotContain(nonexistentTreeFile);
   }
 
   @Test
-  public void getMetadata_treeFileUnderOmittedParent_fails() {
-    SpecialArtifact tree = createTreeArtifact("tree");
+  public void getInputMetadata_treeFileUnderFile_fails() {
+    TreeArtifact tree = createTreeArtifact("tree");
     TreeFileArtifact child = TreeFileArtifact.createTreeOutput(tree, "file");
-    map.putTreeArtifact(tree, TreeArtifactValue.OMITTED_TREE_MARKER, /*depOwner=*/ null);
+    ActionInput file = ActionInputHelper.fromPath(tree.getExecPath());
+    map.put(file, TestMetadata.create(1));
 
-    assertThrows(IllegalArgumentException.class, () -> map.getMetadata(child));
+    assertThrows(IllegalArgumentException.class, () -> map.getInputMetadata(child));
   }
 
   @Test
-  public void getMetadata_treeFileUnderFile_fails() {
-    SpecialArtifact tree = createTreeArtifact("tree");
-    TreeFileArtifact child = TreeFileArtifact.createTreeOutput(tree, "file");
-    ActionInput file = ActionInputHelper.fromPath(tree.getExecPath());
-    map.put(file, TestMetadata.create(1), /*depOwner=*/ null);
+  public void getInputMetadata_subtreeFile() {
+    TreeArtifact tree = createTreeArtifact("tree");
+    TreeArtifact subtree = createSubTreeArtifact(tree, "subdir");
+    TreeFileArtifact child = TreeFileArtifact.createTreeOutput(subtree, "file");
+    FileArtifactValue treeFileMetadata = TestMetadata.create(1);
+    map.putTreeArtifact(
+        subtree, TreeArtifactValue.newBuilder(subtree).putChild(child, treeFileMetadata).build());
 
-    assertThrows(IllegalArgumentException.class, () -> map.getMetadata(child));
+    assertThat(map.getInputMetadata(child)).isEqualTo(treeFileMetadata);
+  }
+
+  @Test
+  public void getInputMetadata_subtreeFileUnderTopLevelTree() {
+    TreeArtifact tree = createTreeArtifact("tree");
+    TreeArtifact subtree = createSubTreeArtifact(tree, "subdir");
+    TreeFileArtifact child = TreeFileArtifact.createTreeOutput(subtree, "file");
+    FileArtifactValue treeFileMetadata = TestMetadata.create(1);
+    // When the top-level tree is added (instead of the subtree)...
+    map.putTreeArtifact(
+        tree, TreeArtifactValue.newBuilder(tree).putChild(child, treeFileMetadata).build());
+    // getInputMetadata should successfully lookup the metadata under the top-level tree.
+    assertThat(map.getInputMetadata(child)).isEqualTo(treeFileMetadata);
+  }
+
+  @Test
+  public void getTreeMetadataForPrefix_nonTree() {
+    ActionInput file = ActionInputHelper.fromPath("some/file");
+    map.put(file, TestMetadata.create(1));
+
+    assertThat(map.getEnclosingTreeMetadata(file.getExecPath())).isNull();
+    assertThat(map.getEnclosingTreeMetadata(file.getExecPath().getParentDirectory())).isNull();
+    assertThat(map.getEnclosingTreeMetadata(file.getExecPath().getChild("under"))).isNull();
+  }
+
+  @Test
+  public void getTreeMetadataForPrefix_emptyTree() {
+    TreeArtifact tree = createTreeArtifact("a/tree");
+    TreeArtifactValue treeValue = TreeArtifactValue.newBuilder(tree).build();
+    map.putTreeArtifact(tree, treeValue);
+
+    assertThat(map.getEnclosingTreeMetadata(tree.getExecPath().getParentDirectory())).isNull();
+    assertThat(map.getEnclosingTreeMetadata(tree.getExecPath())).isEqualTo(treeValue);
+    assertThat(map.getEnclosingTreeMetadata(tree.getExecPath().getChild("under")))
+        .isEqualTo(treeValue);
+  }
+
+  @Test
+  public void getTreeMetadataForPrefix_nonEmptyTree() {
+    TreeArtifact tree = createTreeArtifact("a/tree");
+    TreeFileArtifact child = TreeFileArtifact.createTreeOutput(tree, "some/child");
+    TreeArtifactValue treeValue =
+        TreeArtifactValue.newBuilder(tree).putChild(child, TestMetadata.create(1)).build();
+    map.putTreeArtifact(tree, treeValue);
+
+    assertThat(map.getEnclosingTreeMetadata(tree.getExecPath().getParentDirectory())).isNull();
+    assertThat(map.getEnclosingTreeMetadata(tree.getExecPath())).isEqualTo(treeValue);
+    assertThat(map.getEnclosingTreeMetadata(child.getExecPath())).isEqualTo(treeValue);
+    assertThat(map.getEnclosingTreeMetadata(child.getExecPath().getParentDirectory()))
+        .isEqualTo(treeValue);
+    assertThat(map.getEnclosingTreeMetadata(child.getExecPath().getChild("under")))
+        .isEqualTo(treeValue);
   }
 
   @Test
   public void getters_missingTree_returnNull() {
-    map.putTreeArtifact(createTreeArtifact("tree"), TreeArtifactValue.empty(), /*depOwner=*/ null);
-    SpecialArtifact otherTree = createTreeArtifact("other");
+    map.putTreeArtifact(createTreeArtifact("tree"), TreeArtifactValue.empty());
+    TreeArtifact otherTree = createTreeArtifact("other");
 
     assertDoesNotContain(otherTree);
     assertDoesNotContain(TreeFileArtifact.createTreeOutput(otherTree, "child"));
@@ -439,43 +435,52 @@ public final class ActionInputMapTest {
       Collections.shuffle(data);
       for (int i = 0; i < data.size(); ++i) {
         TestEntry entry = data.get(i);
-        assertThat(map.putWithNoDepOwner(entry.input, entry.metadata)).isTrue();
+        map.put(entry.input, entry.metadata);
       }
       assertThat(map.sizeForDebugging()).isEqualTo(data.size());
       for (int i = 0; i < data.size(); ++i) {
         TestEntry entry = data.get(i);
-        assertThat(map.getMetadata(entry.input)).isEqualTo(entry.metadata);
+        assertThat(map.getInputMetadata(entry.input)).isEqualTo(entry.metadata);
       }
     }
   }
 
-  private boolean put(String execPath, int value) {
-    return map.putWithNoDepOwner(new TestInput(execPath), TestMetadata.create(value));
+  private void put(String execPath, int value) {
+    map.put(new TestInput(execPath), TestMetadata.create(value));
   }
 
   private void assertContains(String execPath, int value) {
-    assertThat(map.getMetadata(new TestInput(execPath))).isEqualTo(TestMetadata.create(value));
+    assertThat(map.getInputMetadata(new TestInput(execPath))).isEqualTo(TestMetadata.create(value));
     assertThat(map.getMetadata(PathFragment.create(execPath)))
         .isEqualTo(TestMetadata.create(value));
-    assertThat(map.getInput(execPath)).isEqualTo(new TestInput(execPath));
+    assertThat(map.getInput(PathFragment.create(execPath))).isEqualTo(new TestInput(execPath));
   }
 
   private void assertDoesNotContain(ActionInput input) {
-    assertThat(map.getMetadata(input)).isNull();
+    assertThat(map.getInputMetadata(input)).isNull();
     assertThat(map.getMetadata(input.getExecPath())).isNull();
-    assertThat(map.getInput(input.getExecPathString())).isNull();
+    assertThat(map.getTreeMetadata(input.getExecPath())).isNull();
+    assertThat(map.getInput(input.getExecPath())).isNull();
   }
 
-  private void assertContainsEqualMetadata(ActionInput input, FileArtifactValue metadata) {
-    assertThat(map.getMetadata(input)).isEqualTo(metadata);
-    assertThat(map.getMetadata(input.getExecPath())).isEqualTo(metadata);
-    assertThat(map.getInput(input.getExecPathString())).isSameInstanceAs(input);
+  private void assertContainsFile(ActionInput input, FileArtifactValue fileValue) {
+    checkArgument(!(input instanceof TreeArtifact), "use assertContainsTree for tree artifacts");
+    assertThat(map.getInputMetadata(input)).isSameInstanceAs(fileValue);
+    assertThat(map.getMetadata(input.getExecPath())).isSameInstanceAs(fileValue);
+    assertThat(map.getTreeMetadata(input.getExecPath())).isNull();
+    assertThat(map.getInput(input.getExecPath())).isSameInstanceAs(input);
   }
 
-  private void assertContainsSameInstance(ActionInput input, FileArtifactValue metadata) {
-    assertThat(map.getMetadata(input)).isSameInstanceAs(metadata);
-    assertThat(map.getMetadata(input.getExecPath())).isSameInstanceAs(metadata);
-    assertThat(map.getInput(input.getExecPathString())).isSameInstanceAs(input);
+  private void assertContainsTree(TreeArtifact input, TreeArtifactValue treeValue) {
+    // TreeArtifactValue#getMetadata returns a freshly allocated instance.
+    assertThat(map.getInputMetadata(input)).isEqualTo(treeValue.getMetadata());
+    assertThat(map.getMetadata(input.getExecPath())).isEqualTo(treeValue.getMetadata());
+    assertThat(map.getTreeMetadata(input.getExecPath())).isSameInstanceAs(treeValue);
+    assertThat(map.getInput(input.getExecPath())).isSameInstanceAs(input);
+
+    Map<PathFragment, TreeArtifactValue> trees = new HashMap<>();
+    map.forEachTreeArtifact(trees::put);
+    assertThat(trees).containsAtLeast(input.getExecPath(), treeValue);
   }
 
   private static class TestEntry {
@@ -493,6 +498,11 @@ public final class ActionInputMapTest {
 
     public TestInput(String fragment) {
       this.fragment = PathFragment.create(fragment);
+    }
+
+    @Override
+    public boolean isDirectory() {
+      return false;
     }
 
     @Override
@@ -527,9 +537,17 @@ public final class ActionInputMapTest {
     }
   }
 
-  private SpecialArtifact createTreeArtifact(String relativeExecPath) {
+  private TreeArtifact createTreeArtifact(String relativeExecPath) {
     return ActionsTestUtil.createTreeArtifactWithGeneratingAction(
         artifactRoot, artifactRoot.getExecPath().getRelative(relativeExecPath));
+  }
+
+  private TreeArtifact createSubTreeArtifact(TreeArtifact parent, String parentRelativePath) {
+    TreeArtifact subtree =
+        TreeArtifact.createSubTreeArtifact(
+            parent, PathFragment.create(parentRelativePath), ActionsTestUtil.NULL_ARTIFACT_OWNER);
+    subtree.setGeneratingActionKey(ActionsTestUtil.NULL_ACTION_LOOKUP_DATA);
+    return subtree;
   }
 
   @AutoValue
@@ -563,11 +581,6 @@ public final class ActionInputMapTest {
     @Override
     public boolean wasModifiedSinceDigest(Path path) {
       throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public boolean isRemote() {
-      return false;
     }
 
     @Override

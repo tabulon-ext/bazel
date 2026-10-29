@@ -1,8 +1,13 @@
+load("@apple_support//rules:universal_binary.bzl", "universal_binary")
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:objc_library.bzl", "objc_library")
 load(
     "//tools/osx:xcode_version_flag.bzl",
     "ios_sdk_version_flag",
     "macos_sdk_version_flag",
     "tvos_sdk_version_flag",
+    "visionos_sdk_version_flag",
     "watchos_sdk_version_flag",
     "xcode_version_flag",
 )
@@ -16,51 +21,48 @@ filegroup(
 
 filegroup(
     name = "bzl_srcs",
-    srcs = glob(["*.bzl"]) + [
-        "//tools/osx/crosstool:bzl_srcs",
-    ],
+    srcs = glob(["*.bzl"]),
     visibility = ["//tools:__pkg__"],
 )
 
 exports_files([
     "xcode_locator.m",
-    "xcode_configure.bzl",
 ])
 
-DARWIN_XCODE_LOCATOR_COMPILE_COMMAND = """
-  /usr/bin/xcrun --sdk macosx clang -mmacosx-version-min=10.9 -fobjc-arc -framework CoreServices \
-      -framework Foundation -arch arm64 -arch x86_64 -Wl,-no_adhoc_codesign -Wl,-no_uuid -o $@ $< && \
-  env -i codesign --identifier $@ --force --sign - $@
-"""
+objc_library(
+    name = "xcode-locator-lib",
+    srcs = ["xcode_locator.m"],
+    sdk_frameworks = [
+        "CoreServices",
+        "Foundation",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+)
 
-genrule(
-    name = "xcode-locator-genrule",
-    srcs = select({
-        ":darwin": ["xcode_locator.m"],
-        ":darwin_x86_64": ["xcode_locator.m"],
-        ":darwin_arm64": ["xcode_locator.m"],
-        ":darwin_arm64e": ["xcode_locator.m"],
-        "//conditions:default": ["xcode_locator_stub.sh"],
+cc_binary(
+    name = "xcode-locator-native",
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [":xcode-locator-lib"],
+)
+
+universal_binary(
+    name = "xcode-locator-universal",
+    binary = ":xcode-locator-native",
+    target_compatible_with = ["@platforms//os:macos"],
+)
+
+copy_file(
+    name = "xcode-locator-copy",
+    src = select({
+        "//src/conditions:darwin": ":xcode-locator-universal",
+        "//conditions:default": "xcode_locator_stub.sh",
     }),
-    outs = ["xcode-locator"],
-    cmd = select({
-        ":darwin": DARWIN_XCODE_LOCATOR_COMPILE_COMMAND,
-        ":darwin_x86_64": DARWIN_XCODE_LOCATOR_COMPILE_COMMAND,
-        ":darwin_arm64": DARWIN_XCODE_LOCATOR_COMPILE_COMMAND,
-        ":darwin_arm64e": DARWIN_XCODE_LOCATOR_COMPILE_COMMAND,
-        "//conditions:default": "cp $< $@",
-    }),
-    local = 1,
-    output_to_bindir = 1,
+    out = "xcode-locator",
+    allow_symlink = True,
+    is_executable = True,
 )
 
 # TODO(cparsons): Consolidate with config_settings under //src
-config_setting(
-    name = "darwin",
-    values = {"cpu": "darwin"},
-    visibility = ["//visibility:public"],
-)
-
 config_setting(
     name = "darwin_x86_64",
     values = {"cpu": "darwin_x86_64"},
@@ -78,8 +80,6 @@ config_setting(
     values = {"cpu": "darwin_arm64e"},
     visibility = ["//visibility:public"],
 )
-
-xcode_config_alias(name = "current_xcode_config")
 
 xcode_version_flag(name = "xcode_version_flag")
 
@@ -99,6 +99,8 @@ xcode_version_flag(name = "xcode_version_flag")
 ios_sdk_version_flag(name = "ios_sdk_version_flag")
 
 tvos_sdk_version_flag(name = "tvos_sdk_version_flag")
+
+visionos_sdk_version_flag(name = "visionos_sdk_version_flag")
 
 watchos_sdk_version_flag(name = "watchos_sdk_version_flag")
 

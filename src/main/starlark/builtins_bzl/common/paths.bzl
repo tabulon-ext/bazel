@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """
 Duplicated from bazel_skylib/libs/paths.bzl.
 
@@ -22,7 +21,7 @@ path separators (forward slash, "/"); they do not handle Windows-style paths
 with backslash separators or drive letters.
 """
 
-def _basename(p):
+def _basename(p: str) -> str:
     """Returns the basename (i.e., the file portion) of a path.
 
     Note that if `p` ends with a slash, this function returns an empty string.
@@ -38,7 +37,7 @@ def _basename(p):
     """
     return p.rpartition("/")[-1]
 
-def _dirname(p):
+def _dirname(p: str) -> str:
     """Returns the dirname of a path.
 
     The dirname is the portion of `p` up to but not including the file portion
@@ -59,7 +58,7 @@ def _dirname(p):
         # os.path.dirname does.
         return prefix.rstrip("/")
 
-def _is_absolute(path):
+def _is_absolute(path: str) -> bool:
     """Returns `True` if `path` is an absolute path.
 
     Args:
@@ -70,7 +69,7 @@ def _is_absolute(path):
     """
     return path.startswith("/") or (len(path) > 2 and path[1] == ":")
 
-def _join(path, *others):
+def _join(path: str, *others: str) -> str:
     """Joins one or more path components intelligently.
 
     This function mimics the behavior of Python's `os.path.join` function on POSIX
@@ -100,7 +99,7 @@ def _join(path, *others):
 
     return result
 
-def _normalize(path):
+def _normalize(path: str) -> str:
     """Normalizes a path, eliminating double slashes and other redundant segments.
 
     This function mimics the behavior of Python's `os.path.normpath` function on
@@ -156,7 +155,7 @@ def _normalize(path):
 
     return path or "."
 
-def _relativize(path, start):
+def _relativize(path: str, start: str) -> str:
     """Returns the portion of `path` that is relative to `start`.
 
     Because we do not have access to the underlying file system, this
@@ -192,7 +191,7 @@ def _relativize(path, start):
     result_segments = segments[-length:]
     return "/".join(result_segments)
 
-def _replace_extension(p, new_extension):
+def _replace_extension(p: str, new_extension: str) -> str:
     """Replaces the extension of the file at the end of a path.
 
     If the path has no extension, the new extension is added to it.
@@ -207,7 +206,7 @@ def _replace_extension(p, new_extension):
     """
     return _split_extension(p)[0] + new_extension
 
-def _split_extension(p):
+def _split_extension(p: str) -> tuple[str, str]:
     """Splits the path `p` into a tuple containing the root and extension.
 
     Leading periods on the basename are ignored, so
@@ -238,12 +237,13 @@ _SEPARATOR = 1
 _DOT = 2
 _DOTDOT = 3
 
-def _is_normalized(str):
+def _is_normalized(str: str, look_for_same_level_references: bool = True) -> bool:
     """
-    Returns true if the passed path contains uplevel references ".." or single-dot references ".".
+    Returns true if the passed path contains uplevel references "..". Also checks for single-dot references "." if look_for_same_level_references is True.
 
     Args:
         str: The path string to check.
+        look_for_same_level_references: If True checks if path contains uplevel references ".." or single-dot references ".".
 
     Returns:
         True if the path is normalized, False otherwise.
@@ -268,7 +268,10 @@ def _is_normalized(str):
                 state = _BASE
         elif state == _DOT:
             if is_separator:
-                return False
+                if look_for_same_level_references:
+                    # "." segment found.
+                    return False
+                state = _SEPARATOR
             elif c == ".":
                 state = _DOTDOT
             else:
@@ -280,15 +283,54 @@ def _is_normalized(str):
                 state = _BASE
 
     if state == _DOT:
-        return False
+        if look_for_same_level_references:
+            # "." segment found.
+            return False
     elif state == _DOTDOT:
         return False
     return True
 
-def _get_relative(path_a, path_b):
+def _get_relative(path_a: str, path_b: str) -> str:
     if paths.is_absolute(path_b):
         return path_b
     return paths.normalize(paths.join(path_a, path_b))
+
+def _contains_up_level_references(path: str) -> bool:
+    return path.startswith("..") and (len(path) == 2 or path[2] == "/")
+
+def _starts_with(path_a: str, path_b: str) -> bool:
+    """Returns True if and only if path_b is an ancestor of path_a.
+
+    Does not handle OS dependent case-insensitivty."""
+    if not path_b:
+        # all paths start with the empty string
+        return True
+    norm_a = _normalize(path_a)
+    norm_b = _normalize(path_b)
+    if len(norm_b) > len(norm_a):
+        return False
+    if not norm_a.startswith(norm_b):
+        return False
+    return len(norm_a) == len(norm_b) or norm_a[len(norm_b)] == "/"
+
+def _root_relative_path(file: File) -> str:
+    """Returns the path of `file` relative to its root.
+
+    A Starlark implementation of `Artifact.getRootRelativePath()`.
+
+    Args:
+        file: (File) The file to get the root-relative path for.
+    Returns:
+        (str) The root-relative path of the file.
+    """
+    if not file.is_source:
+        return _relativize(file.path, file.root.path)
+    short_path = file.short_path
+    if not short_path.startswith("../"):
+        return short_path
+
+    # This is a file in an external repo, skip over the repo name.
+    return short_path[short_path.index("/", 3) + 1:]
 
 paths = struct(
     basename = _basename,
@@ -299,7 +341,10 @@ paths = struct(
     relativize = _relativize,
     replace_extension = _replace_extension,
     split_extension = _split_extension,
-    # The methods below this line are not in the skylib implementation.
     is_normalized = _is_normalized,
+    starts_with = _starts_with,
+    # The methods below this line are not in the skylib implementation.
     get_relative = _get_relative,
+    contains_up_level_references = _contains_up_level_references,
+    root_relative_path = _root_relative_path,
 )

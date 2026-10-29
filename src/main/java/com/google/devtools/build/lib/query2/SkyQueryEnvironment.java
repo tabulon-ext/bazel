@@ -22,22 +22,25 @@ import com.google.common.base.Function;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicate;
 import com.google.common.base.Predicates;
-import com.google.common.base.Throwables;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.Collections2;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.ImmutableSetMultimap;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
+import com.google.common.collect.Sets.SetView;
 import com.google.common.flogger.GoogleLogger;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.ListeningExecutorService;
 import com.google.common.util.concurrent.MoreExecutors;
+import com.google.common.util.concurrent.SettableFuture;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import com.google.devtools.build.lib.analysis.config.ToolchainTypeRequirement;
 import com.google.devtools.build.lib.bugreport.BugReport;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.cmdline.PackageIdentifier;
@@ -50,12 +53,12 @@ import com.google.devtools.build.lib.collect.compacthashset.CompactHashSet;
 import com.google.devtools.build.lib.concurrent.BlockingStack;
 import com.google.devtools.build.lib.concurrent.MultisetSemaphore;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;
-import com.google.devtools.build.lib.events.DelegatingEventHandler;
 import com.google.devtools.build.lib.events.Event;
-import com.google.devtools.build.lib.events.EventKind;
 import com.google.devtools.build.lib.events.ExtendedEventHandler;
+import com.google.devtools.build.lib.io.InconsistentFilesystemException;
 import com.google.devtools.build.lib.packages.BuildFileContainsErrorsException;
 import com.google.devtools.build.lib.packages.DependencyFilter;
+import com.google.devtools.build.lib.packages.LabelPrinter;
 import com.google.devtools.build.lib.packages.NoSuchPackageException;
 import com.google.devtools.build.lib.packages.NoSuchTargetException;
 import com.google.devtools.build.lib.packages.NoSuchThingException;
@@ -67,9 +70,11 @@ import com.google.devtools.build.lib.pkgcache.PathPackageLocator;
 import com.google.devtools.build.lib.profiler.AutoProfiler;
 import com.google.devtools.build.lib.profiler.GoogleAutoProfilerUtils;
 import com.google.devtools.build.lib.query2.common.AbstractBlazeQueryEnvironment;
+import com.google.devtools.build.lib.query2.common.QueryTransitivePackagePreloader;
 import com.google.devtools.build.lib.query2.common.UniverseScope;
 import com.google.devtools.build.lib.query2.common.UniverseSkyKey;
 import com.google.devtools.build.lib.query2.compat.FakeLoadTarget;
+import com.google.devtools.build.lib.query2.engine.AggregatingQueryExpressionVisitor.RequiresEdgesQueryExpressionVisitor;
 import com.google.devtools.build.lib.query2.engine.AllRdepsFunction;
 import com.google.devtools.build.lib.query2.engine.Callback;
 import com.google.devtools.build.lib.query2.engine.KeyExtractor;
@@ -80,22 +85,25 @@ import com.google.devtools.build.lib.query2.engine.QueryException;
 import com.google.devtools.build.lib.query2.engine.QueryExpression;
 import com.google.devtools.build.lib.query2.engine.QueryExpressionContext;
 import com.google.devtools.build.lib.query2.engine.QueryExpressionMapper;
+import com.google.devtools.build.lib.query2.engine.QueryUtil;
 import com.google.devtools.build.lib.query2.engine.QueryUtil.MinDepthUniquifierImpl;
-import com.google.devtools.build.lib.query2.engine.QueryUtil.MutableKeyExtractorBackedMapImpl;
 import com.google.devtools.build.lib.query2.engine.QueryUtil.NonExceptionalUniquifier;
 import com.google.devtools.build.lib.query2.engine.QueryUtil.ThreadSafeMutableKeyExtractorBackedSetImpl;
 import com.google.devtools.build.lib.query2.engine.QueryUtil.UniquifierImpl;
 import com.google.devtools.build.lib.query2.engine.StreamableQueryEnvironment;
 import com.google.devtools.build.lib.query2.engine.ThreadSafeOutputFormatterCallback;
+import com.google.devtools.build.lib.query2.engine.TotalWeightQueryExpressionVisitor;
 import com.google.devtools.build.lib.query2.engine.Uniquifier;
 import com.google.devtools.build.lib.query2.query.BlazeTargetAccessor;
+import com.google.devtools.build.lib.server.FailureDetails;
 import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
 import com.google.devtools.build.lib.server.FailureDetails.Query;
 import com.google.devtools.build.lib.server.FailureDetails.Query.Code;
 import com.google.devtools.build.lib.skyframe.DetailedException;
 import com.google.devtools.build.lib.skyframe.GraphBackedRecursivePackageProvider;
 import com.google.devtools.build.lib.skyframe.GraphBackedRecursivePackageProvider.UniverseTargetPattern;
-import com.google.devtools.build.lib.skyframe.IgnoredPackagePrefixesValue;
+import com.google.devtools.build.lib.skyframe.IgnoredSubdirectoriesValue;
+import com.google.devtools.build.lib.skyframe.PackageLookupValue;
 import com.google.devtools.build.lib.skyframe.PackageValue;
 import com.google.devtools.build.lib.skyframe.PrepareDepsOfPatternsFunction;
 import com.google.devtools.build.lib.skyframe.RecursivePackageProviderBackedTargetPatternResolver;
@@ -104,12 +112,8 @@ import com.google.devtools.build.lib.skyframe.TargetPatternValue;
 import com.google.devtools.build.lib.skyframe.TargetPatternValue.TargetPatternKey;
 import com.google.devtools.build.lib.skyframe.TransitiveTraversalValue;
 import com.google.devtools.build.lib.skyframe.TraversalInfoRootPackageExtractor;
-import com.google.devtools.build.lib.supplier.InterruptibleSupplier;
-import com.google.devtools.build.lib.supplier.MemoizingInterruptibleSupplier;
 import com.google.devtools.build.lib.util.DetailedExitCode;
-import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
-import com.google.devtools.build.skyframe.ErrorInfo;
 import com.google.devtools.build.skyframe.EvaluationContext;
 import com.google.devtools.build.skyframe.EvaluationResult;
 import com.google.devtools.build.skyframe.SkyFunctionName;
@@ -121,18 +125,19 @@ import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
-import java.util.stream.Collectors;
 
 /**
  * {@link AbstractBlazeQueryEnvironment} that introspects the Skyframe graph to find forward and
@@ -154,88 +159,98 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
 
   private final BlazeTargetAccessor accessor = new BlazeTargetAccessor(this);
   protected final int loadingPhaseThreads;
+  protected final boolean trackIncrementalState;
   protected final WalkableGraphFactory graphFactory;
   protected final UniverseScope universeScope;
-  protected boolean blockUniverseEvaluationErrors;
-  protected ExtendedEventHandler universeEvalEventHandler;
+  protected final TargetPattern.Parser mainRepoTargetParser;
   protected final PathFragment parserPrefix;
   protected final PathPackageLocator pkgPath;
   protected final int queryEvaluationParallelismLevel;
   private final boolean visibilityDepsAreAllowed;
+  private final boolean toolchainTypeDepsAreAllowed;
 
   // The following fields are set in the #beforeEvaluateQuery method.
   protected MultisetSemaphore<PackageIdentifier> packageSemaphore;
-  protected WalkableGraph graph;
-  protected InterruptibleSupplier<ImmutableSet<PathFragment>> ignoredPatternsSupplier;
+  public WalkableGraph graph;
   protected GraphBackedRecursivePackageProvider graphBackedRecursivePackageProvider;
   protected ListeningExecutorService executor;
   private TargetPatternResolver<Target> resolver;
+  private final ConcurrentMap<QueryExpression, QueryTaskFuture<Predicate<SkyKey>>>
+      dtcUniversePredicateCache = new ConcurrentHashMap<>();
 
   public SkyQueryEnvironment(
       boolean keepGoing,
       int loadingPhaseThreads,
+      boolean trackIncrementalState,
       ExtendedEventHandler eventHandler,
       Set<Setting> settings,
       Iterable<QueryFunction> extraFunctions,
+      TargetPattern.Parser mainRepoTargetParser,
       PathFragment parserPrefix,
       WalkableGraphFactory graphFactory,
       UniverseScope universeScope,
       PathPackageLocator pkgPath,
-      boolean blockUniverseEvaluationErrors) {
+      LabelPrinter labelPrinter) {
     this(
         keepGoing,
         loadingPhaseThreads,
+        trackIncrementalState,
         // SkyQueryEnvironment operates on a prepopulated Skyframe graph. Therefore, query
         // evaluation is completely CPU-bound.
-        /*queryEvaluationParallelismLevel=*/ DEFAULT_THREAD_COUNT,
+        /* queryEvaluationParallelismLevel= */ DEFAULT_THREAD_COUNT,
         eventHandler,
         settings,
         extraFunctions,
+        mainRepoTargetParser,
         parserPrefix,
         graphFactory,
         universeScope,
         pkgPath,
-        blockUniverseEvaluationErrors);
+        labelPrinter);
   }
 
   protected SkyQueryEnvironment(
       boolean keepGoing,
       int loadingPhaseThreads,
+      boolean trackIncrementalState,
       int queryEvaluationParallelismLevel,
       ExtendedEventHandler eventHandler,
       Set<Setting> settings,
       Iterable<QueryFunction> extraFunctions,
+      TargetPattern.Parser mainRepoTargetParser,
       PathFragment parserPrefix,
       WalkableGraphFactory graphFactory,
       UniverseScope universeScope,
       PathPackageLocator pkgPath,
-      boolean blockUniverseEvaluationErrors) {
+      LabelPrinter labelPrinter) {
     super(
         keepGoing,
-        /*strictScope=*/ true,
-        /*labelFilter=*/ Rule.ALL_LABELS,
+        /* strictScope= */ true,
+        /* labelFilter= */ Rule.ALL_LABELS,
         eventHandler,
         settings,
-        extraFunctions);
+        extraFunctions,
+        labelPrinter);
     this.loadingPhaseThreads = loadingPhaseThreads;
+    this.trackIncrementalState = trackIncrementalState;
     this.graphFactory = graphFactory;
     this.pkgPath = pkgPath;
     this.universeScope = universeScope;
+    this.mainRepoTargetParser = mainRepoTargetParser;
     this.parserPrefix = parserPrefix;
     this.queryEvaluationParallelismLevel = queryEvaluationParallelismLevel;
-    this.blockUniverseEvaluationErrors = blockUniverseEvaluationErrors;
-    this.universeEvalEventHandler =
-        this.blockUniverseEvaluationErrors
-            ? new ErrorBlockingForwardingEventHandler(this.eventHandler)
-            : this.eventHandler;
     // In #getAllowedDeps we have special treatment of deps entailed by the `visibility` attribute.
     // Since this attribute is of the NODEP type, that means we need a special implementation of
     // NO_NODEP_DEPS.
     this.visibilityDepsAreAllowed = !settings.contains(Setting.NO_NODEP_DEPS);
+    // The "toolchains" parameter of rule definition should be treated as an implicit dep despite
+    // not being represented by an attribute.
+    this.toolchainTypeDepsAreAllowed = !settings.contains(Setting.NO_IMPLICIT_DEPS);
   }
 
   @Override
   public void close() {
+    dtcUniversePredicateCache.clear();
     if (executor != null) {
       executor.shutdownNow();
       executor = null;
@@ -250,13 +265,24 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
 
   protected EvaluationContext newEvaluationContext() {
     return EvaluationContext.newBuilder()
-        .setNumThreads(loadingPhaseThreads)
-        .setEventHandler(universeEvalEventHandler)
+        .setParallelism(loadingPhaseThreads)
+        .setEventHandler(eventHandler)
         .build();
   }
 
-  protected void beforeEvaluateQuery(QueryExpression expr)
+  protected void beforeEvaluateQuery(
+      QueryExpression expr, ThreadSafeOutputFormatterCallback<Target> callback)
       throws QueryException, InterruptedException {
+    dtcUniversePredicateCache.clear();
+    if (!trackIncrementalState) {
+      RequiresEdgesQueryExpressionVisitor visitor = new RequiresEdgesQueryExpressionVisitor();
+      if (expr.accept(visitor)) {
+        throw new QueryException(
+            expr,
+            "Queries requiring edge traversal are not supported with --notrack_incremental_state",
+            Code.ILLEGAL_FLAG_COMBINATION);
+      }
+    }
     UniverseSkyKey universeKey = universeScope.getUniverseKey(expr, parserPrefix);
     ImmutableList<String> universeScopeListToUse = universeKey.getPatterns();
     logger.atInfo().log("Using a --universe_scope value of %s", universeScopeListToUse);
@@ -268,11 +294,9 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
     }
 
     if (graph == null || graph != result.getWalkableGraph()) {
-      checkEvaluationResult(universeScopeListToUse, roots, universeKey, result);
+      checkEvaluationResult(universeScopeListToUse, roots, universeKey, result, expr);
       packageSemaphore = makeFreshPackageMultisetSemaphore();
       graph = Preconditions.checkNotNull(result.getWalkableGraph(), result);
-      ignoredPatternsSupplier =
-          MemoizingInterruptibleSupplier.of(new IgnoredPatternSupplier(graph));
       graphBackedRecursivePackageProvider =
           new GraphBackedRecursivePackageProvider(
               graph,
@@ -285,22 +309,24 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
       executor =
           MoreExecutors.listeningDecorator(
               new ThreadPoolExecutor(
-                  /*corePoolSize=*/ queryEvaluationParallelismLevel,
-                  /*maximumPoolSize=*/ queryEvaluationParallelismLevel,
-                  /*keepAliveTime=*/ 1,
-                  /*unit=*/ TimeUnit.SECONDS,
-                  /*workQueue=*/ new BlockingStack<Runnable>(),
+                  /* corePoolSize= */ queryEvaluationParallelismLevel,
+                  /* maximumPoolSize= */ queryEvaluationParallelismLevel,
+                  /* keepAliveTime= */ 1,
+                  /* unit= */ TimeUnit.SECONDS,
+                  /* workQueue= */ new BlockingStack<>(),
                   new ThreadFactoryBuilder().setNameFormat("QueryEnvironment %d").build()));
     }
-    resolver = makeNewTargetPatternResolver();
+    resolver = makeNewTargetPatternResolver(expr, callback);
   }
 
-  protected TargetPatternResolver<Target> makeNewTargetPatternResolver() {
+  protected TargetPatternResolver<Target> makeNewTargetPatternResolver(
+      QueryExpression expr, ThreadSafeOutputFormatterCallback<Target> callback) {
     return new RecursivePackageProviderBackedTargetPatternResolver(
         graphBackedRecursivePackageProvider,
         eventHandler,
         FilteringPolicies.NO_FILTER,
         packageSemaphore,
+        /* maxConcurrentGetTargetsTasks= */ Optional.empty(),
         SimplePackageIdentifierBatchingCallback::new);
   }
 
@@ -309,7 +335,8 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
     return ImmutableList.copyOf(
         Iterables.transform(
             PrepareDepsOfPatternsFunction.getTargetPatternKeys(
-                PrepareDepsOfPatternsFunction.getSkyKeys(universeKey, eventHandler)),
+                PrepareDepsOfPatternsFunction.getSkyKeys(
+                    universeKey, eventHandler, mainRepoTargetParser.getRepoMapping())),
             TargetPatternKey::getParsedPattern));
   }
 
@@ -322,15 +349,17 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
     return packageSemaphore;
   }
 
-  boolean hasDependencyFilter() {
+  /** Returns true if this environment has a dependency filter on any edges. */
+  public boolean hasDependencyFilter() {
     return dependencyFilter != DependencyFilter.ALL_DEPS;
   }
 
-  private void checkEvaluationResult(
+  private static void checkEvaluationResult(
       ImmutableList<String> universeScopeList,
       Set<SkyKey> roots,
       SkyKey universeKey,
-      EvaluationResult<SkyValue> result)
+      EvaluationResult<SkyValue> result,
+      QueryExpression exprForError)
       throws QueryException {
     // If the only root is the universe key, we expect to see either a single successfully evaluated
     // value or a cycle in the result or a catastrophic error.
@@ -352,59 +381,12 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
         "Universe query \"%s\" failed but had no error: %s",
         universeScopeList,
         result);
-    Exception exception = result.getCatastrophe();
-    if (exception != null) {
-      throw throwException(exception, result);
-    }
-
-    // Catastrophe not present: look at top-level keys now.
-    boolean foundCycle = false;
-    for (ErrorInfo errorInfo : result.errorMap().values()) {
-      if (errorInfo == null) {
-        continue;
-      }
-      if (!errorInfo.getCycleInfo().isEmpty()) {
-        foundCycle = true;
-      } else {
-        exception = errorInfo.getException();
-        if (exception instanceof DetailedException) {
-          break;
-        }
-      }
-    }
-
-    if (exception != null) {
-      throw throwException(exception, result);
-    }
-    Preconditions.checkState(
-        foundCycle,
-        "No cycle or exception found in result with error: %s %s %s %s",
-        result,
-        roots,
-        universeKey,
-        universeScopeList);
-  }
-
-  private static QueryException throwException(
-      Exception exception, EvaluationResult<SkyValue> resultForDebugging) throws QueryException {
-    FailureDetail failureDetail;
-    if (!(exception instanceof DetailedException)) {
-      BugReport.sendBugReport(
-          new IllegalStateException(
-              "Non-detailed exception found during universe scope building: " + resultForDebugging,
-              exception));
-      failureDetail =
-          FailureDetail.newBuilder()
-              .setQuery(Query.newBuilder().setCode(Code.NON_DETAILED_ERROR))
-              .build();
-    } else {
-      failureDetail = ((DetailedException) exception).getDetailedExitCode().getFailureDetail();
-    }
-    throw new QueryException(
-        "Building universe scope failed: " + exception.getMessage(), exception, failureDetail);
+    QueryTransitivePackagePreloader.maybeThrowQueryExceptionForResultWithError(
+        result, roots, exprForError, /* operation= */ "Building universe scope");
   }
 
   private static final Duration MIN_LOGGING = Duration.ofMillis(50);
+  private static final int MAX_QUERY_WEIGHT_TO_LOG = 10 * 1024 * 1024;
 
   @Override
   public final QueryExpression transformParsedQuery(QueryExpression queryExpression) {
@@ -413,81 +395,80 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
     try (AutoProfiler p = GoogleAutoProfilerUtils.logged("transforming query", MIN_LOGGING)) {
       transformedQueryExpression = queryExpression.accept(mapper);
     }
-    logger.atInfo().log(
-        "transformed query [%s] to [%s]",
-        queryExpression.toTrunctatedString(), transformedQueryExpression.toTrunctatedString());
+    long queryWeightEstimate = queryExpression.accept(new TotalWeightQueryExpressionVisitor());
+    if (queryWeightEstimate <= MAX_QUERY_WEIGHT_TO_LOG) {
+      logger.atInfo().log(
+          "transformed query [%s] to [%s]",
+          queryExpression.toTrunctatedString(), transformedQueryExpression.toTrunctatedString());
+    } else {
+      logger.atInfo().log(
+          "not logging transformed query with estimated size: %d", queryWeightEstimate);
+    }
     return transformedQueryExpression;
   }
 
   protected QueryExpressionMapper<Void> getQueryExpressionMapper() {
     Optional<ImmutableList<String>> constantUniverseScopeListMaybe =
         universeScope.getConstantValueMaybe();
-    if (!constantUniverseScopeListMaybe.isPresent()) {
+    if (constantUniverseScopeListMaybe.isEmpty()) {
       return QueryExpressionMapper.identity();
     }
     ImmutableList<String> constantUniverseScopeList = constantUniverseScopeListMaybe.get();
     if (constantUniverseScopeList.size() != 1) {
       return QueryExpressionMapper.identity();
     }
-    TargetPattern.Parser targetPatternParser = TargetPattern.mainRepoParser(parserPrefix);
     String universeScopePatternString = Iterables.getOnlyElement(constantUniverseScopeList);
-    TargetPattern absoluteUniverseScopePattern = null;
+    TargetPattern absoluteUniverseScopePattern;
     try {
       absoluteUniverseScopePattern =
-          targetPatternParser.parse(targetPatternParser.absolutize(universeScopePatternString));
+          mainRepoTargetParser.parse(mainRepoTargetParser.absolutize(universeScopePatternString));
     } catch (TargetParsingException e) {
       return QueryExpressionMapper.identity();
     }
     return QueryExpressionMapper.compose(
         ImmutableList.of(
             new RdepsToAllRdepsQueryExpressionMapper(
-                targetPatternParser, absoluteUniverseScopePattern),
+                mainRepoTargetParser, absoluteUniverseScopePattern),
             new FilteredDirectRdepsInUniverseExpressionMapper(
-                targetPatternParser, absoluteUniverseScopePattern)));
+                mainRepoTargetParser, absoluteUniverseScopePattern)));
   }
 
   @Override
   protected void evalTopLevelInternal(
       QueryExpression expr, OutputFormatterCallback<Target> callback)
       throws QueryException, InterruptedException {
-    Throwable throwableToThrow = null;
     try {
       super.evalTopLevelInternal(expr, callback);
-    } catch (Throwable throwable) {
-      throwableToThrow = throwable;
-    } finally {
-      if (throwableToThrow != null) {
-        logger.atInfo().withCause(throwableToThrow).log(
-            "About to shutdown query threadpool because of throwable");
-        ListeningExecutorService obsoleteExecutor = executor;
-        // Signal that executor must be recreated on the next invocation.
-        executor = null;
+    } catch (QueryException | InterruptedException | RuntimeException | Error throwable) {
+      logger.atInfo().withCause(throwable).log(
+          "About to shutdown query threadpool because of throwable");
+      ListeningExecutorService obsoleteExecutor = executor;
+      // Signal that executor must be recreated on the next invocation.
+      executor = null;
 
-        // If evaluation failed abruptly (e.g. was interrupted), attempt to terminate all remaining
-        // tasks and then wait for them all to finish. We don't want to leave any dangling threads
-        // running tasks.
-        obsoleteExecutor.shutdownNow();
-        boolean interrupted = false;
-        boolean executorTerminated = false;
-        try {
-          while (!executorTerminated) {
-            try {
-              executorTerminated =
-                  obsoleteExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-              interrupted = true;
-              handleInterruptedShutdown();
-            }
-          }
-        } finally {
-          if (interrupted) {
-            Thread.currentThread().interrupt();
+      // If evaluation failed abruptly (e.g. was interrupted), attempt to terminate all remaining
+      // tasks and then wait for them all to finish. We don't want to leave any dangling threads
+      // running tasks.
+      obsoleteExecutor.shutdownNow();
+      boolean interrupted = false;
+      boolean executorTerminated = false;
+      try {
+        while (!executorTerminated) {
+          try {
+            executorTerminated =
+                obsoleteExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
+          } catch (InterruptedException e) {
+            interrupted = true;
+            handleInterruptedShutdown();
           }
         }
-
-        Throwables.propagateIfPossible(
-            throwableToThrow, QueryException.class, InterruptedException.class);
+      } finally {
+        if (interrupted) {
+          Thread.currentThread().interrupt();
+        }
       }
+
+      throw throwable;
     }
   }
 
@@ -502,7 +483,7 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
   public QueryEvalResult evaluateQuery(
       QueryExpression expr, ThreadSafeOutputFormatterCallback<Target> callback)
       throws QueryException, InterruptedException, IOException {
-    beforeEvaluateQuery(expr);
+    beforeEvaluateQuery(expr, callback);
 
     // SkyQueryEnvironment batches callback invocations using a BatchStreamedCallback, created here
     // so that there's one per top-level evaluateQuery call. The batch size is large enough that
@@ -514,18 +495,27 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
     BatchStreamedCallback batchCallback =
         new BatchStreamedCallback(
             callback, BATCH_CALLBACK_SIZE, createUniquifierForOuterBatchStreamedCallback(expr));
-    return evaluateQueryInternal(expr, batchCallback);
-  }
-
-  Map<SkyKey, Collection<Target>> targetifyValues(Map<SkyKey, ? extends Iterable<SkyKey>> input)
-      throws InterruptedException {
-    return targetifyValues(
-        input, makePackageKeyToTargetKeyMap(ImmutableSet.copyOf(Iterables.concat(input.values()))));
+    try {
+      return evaluateQueryInternal(expr, batchCallback);
+    } finally {
+      dtcUniversePredicateCache.clear();
+    }
   }
 
   private Map<SkyKey, Collection<Target>> targetifyValues(
       Map<SkyKey, ? extends Iterable<SkyKey>> input,
-      Multimap<SkyKey, SkyKey> packageKeyToTargetKeyMap)
+      ImmutableSet.Builder<SkyKey> missingTargetCollector)
+      throws InterruptedException {
+    return targetifyValues(
+        input,
+        makePackageKeyToTargetKeyMap(ImmutableSet.copyOf(Iterables.concat(input.values()))),
+        missingTargetCollector);
+  }
+
+  private Map<SkyKey, Collection<Target>> targetifyValues(
+      Map<SkyKey, ? extends Iterable<SkyKey>> input,
+      Multimap<SkyKey, SkyKey> packageKeyToTargetKeyMap,
+      ImmutableSet.Builder<SkyKey> missingTargetCollector)
       throws InterruptedException {
     ImmutableMap.Builder<SkyKey, Collection<Target>> result = ImmutableMap.builder();
 
@@ -539,6 +529,8 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
         Target target = allTargets.get(key);
         if (target != null) {
           targets.add(target);
+        } else {
+          missingTargetCollector.add(key);
         }
       }
       result.put(entry.getKey(), targets);
@@ -547,30 +539,48 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
   }
 
   private Map<SkyKey, Collection<Target>> getRawReverseDeps(
-      Iterable<SkyKey> transitiveTraversalKeys) throws InterruptedException {
-    return targetifyValues(getReverseDepLabelsOfLabels(transitiveTraversalKeys));
+      Iterable<SkyKey> transitiveTraversalKeys,
+      ImmutableSetMultimap<SkyKey, SkyKey> extraGlobalDeps)
+      throws InterruptedException {
+    return targetifyValues(
+        getReverseDepLabelsOfLabels(transitiveTraversalKeys, extraGlobalDeps),
+        ImmutableSet.builder());
   }
 
   protected Map<SkyKey, Iterable<SkyKey>> getReverseDepLabelsOfLabels(
-      Iterable<? extends SkyKey> labels) throws InterruptedException {
-    return graph.getReverseDeps(labels);
+      Iterable<? extends SkyKey> labels, ImmutableSetMultimap<SkyKey, SkyKey> extraGlobalDeps)
+      throws InterruptedException {
+    ImmutableSetMultimap<SkyKey, SkyKey> globalLabelToRdeps = extraGlobalDeps.inverse();
+    Map<SkyKey, Iterable<SkyKey>> reverseDeps = graph.getReverseDeps(labels);
+    ImmutableMap.Builder<SkyKey, Iterable<SkyKey>> resultsBuilder = ImmutableMap.builder();
+
+    for (Map.Entry<SkyKey, Iterable<SkyKey>> entry : reverseDeps.entrySet()) {
+      ImmutableSet<SkyKey> rdepsFromGlobals = globalLabelToRdeps.get(entry.getKey());
+      resultsBuilder.put(entry.getKey(), Iterables.concat(entry.getValue(), rdepsFromGlobals));
+    }
+    return resultsBuilder.buildOrThrow();
   }
 
-  private Set<Label> getAllowedDeps(Rule rule) throws InterruptedException {
+  private Set<Label> getAllowedDeps(Rule rule) {
     Set<Label> allowedLabels = new HashSet<>(rule.getTransitions(dependencyFilter).values());
     if (visibilityDepsAreAllowed) {
       // Rule#getTransitions only visits the labels of attribute values, so that means it doesn't
       // know about deps from the labels of the rule's package's default_visibility. Therefore, we
       // need to explicitly handle that here.
-      allowedLabels.addAll(rule.getVisibility().getDependencyLabels());
+      Iterables.addAll(allowedLabels, rule.getVisibilityDependencyLabels());
+    }
+    if (toolchainTypeDepsAreAllowed) {
+      for (ToolchainTypeRequirement toolchainTypeRequirement :
+          rule.getRuleClassObject().getToolchainTypes()) {
+        allowedLabels.add(toolchainTypeRequirement.toolchainType());
+      }
     }
     // We should add deps from aspects, otherwise they are going to be filtered out.
     allowedLabels.addAll(rule.getAspectLabelsSuperset(dependencyFilter));
     return allowedLabels;
   }
 
-  private Collection<Target> filterFwdDeps(Target target, Collection<Target> rawFwdDeps)
-      throws InterruptedException {
+  private Collection<Target> filterFwdDeps(Target target, Collection<Target> rawFwdDeps) {
     if (!(target instanceof Rule)) {
       return rawFwdDeps;
     }
@@ -579,19 +589,32 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
   }
 
   @Override
-  public ThreadSafeMutableSet<Target> getFwdDeps(
+  public final ThreadSafeMutableSet<Target> getFwdDeps(
       Iterable<Target> targets, QueryExpressionContext<Target> context)
+      throws InterruptedException {
+    ImmutableSet.Builder<SkyKey> missingTargetsBuilder = ImmutableSet.builder();
+    ThreadSafeMutableSet<Target> result = getFwdDeps(targets, context, missingTargetsBuilder);
+
+    ImmutableSet<SkyKey> missingTargets = missingTargetsBuilder.build();
+    if (!missingTargets.isEmpty()) {
+      eventHandler.handle(Event.warn("Targets were missing from graph: " + missingTargets));
+    }
+    return result;
+  }
+
+  protected ThreadSafeMutableSet<Target> getFwdDeps(
+      Iterable<Target> targets,
+      QueryExpressionContext<Target> context,
+      ImmutableSet.Builder<SkyKey> missingTargetCollector)
       throws InterruptedException {
     Map<SkyKey, Target> targetsByKey = Maps.newHashMapWithExpectedSize(Iterables.size(targets));
     for (Target target : targets) {
       targetsByKey.put(TARGET_TO_SKY_KEY.apply(target), target);
     }
+    ImmutableMap<SkyKey, Iterable<SkyKey>> fwdDepLabels =
+        getFwdDepLabels(targetsByKey.keySet(), context.extraGlobalDeps());
     Map<SkyKey, Collection<Target>> directDeps =
-        targetifyValues(getFwdDepLabels(targetsByKey.keySet()));
-    if (targetsByKey.keySet().size() != directDeps.keySet().size()) {
-      Iterable<SkyKey> missingTargets = Sets.difference(targetsByKey.keySet(), directDeps.keySet());
-      eventHandler.handle(Event.warn("Targets were missing from graph: " + missingTargets));
-    }
+        targetifyValues(fwdDepLabels, missingTargetCollector);
     ThreadSafeMutableSet<Target> result = createThreadSafeMutableSet();
     for (Map.Entry<SkyKey, Collection<Target>> entry : directDeps.entrySet()) {
       result.addAll(filterFwdDeps(targetsByKey.get(entry.getKey()), entry.getValue()));
@@ -599,15 +622,20 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
     return result;
   }
 
-  /** Returns the target dependencies' {@link Label}s of the passed in target {@code Label}s. */
-  protected Map<SkyKey, Iterable<SkyKey>> getFwdDepLabels(Iterable<SkyKey> targetLabels)
+  public ImmutableMap<SkyKey, Iterable<SkyKey>> getFwdDepLabels(
+      Iterable<SkyKey> targetLabels, ImmutableSetMultimap<SkyKey, SkyKey> extraGlobalDeps)
       throws InterruptedException {
     Preconditions.checkState(
         Iterables.all(targetLabels, IS_LABEL), "Expected all labels: %s", targetLabels);
-    return graph.getDirectDeps(targetLabels).entrySet().stream()
-        .collect(
-            ImmutableMap.toImmutableMap(
-                Map.Entry::getKey, entry -> Iterables.filter(entry.getValue(), IS_LABEL)));
+    Map<SkyKey, Iterable<SkyKey>> deps = graph.getDirectDeps(targetLabels);
+    ImmutableMap.Builder<SkyKey, Iterable<SkyKey>> resultsBuilder = ImmutableMap.builder();
+    for (Map.Entry<SkyKey, Iterable<SkyKey>> entry : deps.entrySet()) {
+      Iterable<SkyKey> depsLabels = Iterables.filter(entry.getValue(), IS_LABEL);
+      ImmutableSet<SkyKey> globals = extraGlobalDeps.get(entry.getKey());
+      depsLabels = Iterables.concat(depsLabels, globals);
+      resultsBuilder.put(entry.getKey(), depsLabels);
+    }
+    return resultsBuilder.buildOrThrow();
   }
 
   @Override
@@ -640,8 +668,10 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
               break;
             }
 
-            current = createThreadSafeMutableSet();
-            addTargetsOfDirectDepsAndReportErrorsIfAny(context, caller, current, toProcess);
+            ImmutableSet.Builder<SkyKey> missingTargetBuilder = ImmutableSet.builder();
+            current = getFwdDeps(toProcess, context, missingTargetBuilder);
+            reportUnsuccessfulOrMissingTargetsInternal(
+                current, missingTargetBuilder.build(), caller);
 
             if (current.isEmpty()) {
               // Exit when there are no more nodes to visit.
@@ -651,25 +681,115 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
         });
   }
 
-  protected void addTargetsOfDirectDepsAndReportErrorsIfAny(
+  @Override
+  public QueryTaskFuture<Void> somePath(
+      QueryExpression fromExpression,
+      QueryExpression toExpression,
       QueryExpressionContext<Target> context,
-      QueryExpression caller,
-      ThreadSafeMutableSet<Target> toAddTo,
-      ImmutableList<Target> toProcess)
-      throws InterruptedException, QueryException {
-    Map<SkyKey, Iterable<SkyKey>> keyToDepKeys =
-        getFwdDepLabels(toProcess.stream().map(Target::getLabel).collect(Collectors.toList()));
-    Map<SkyKey, Collection<Target>> targetDepMap = targetifyValues(keyToDepKeys);
+      Callback<Target> callback,
+      QueryExpression caller) {
+    // Note that the body of this method is entirely copied from SomePathFunction, which allows
+    // subclasses of SkyQueryEnvironment to override it.
+    // TODO: b/382066616 - Refactor this and avoid the duplication.
+    final QueryTaskFuture<ThreadSafeMutableSet<Target>> fromValueFuture =
+        QueryUtil.evalAll(this, context, fromExpression);
+    final QueryTaskFuture<ThreadSafeMutableSet<Target>> toValueFuture =
+        QueryUtil.evalAll(this, context, toExpression);
 
-    Map<SkyKey, Target> targetMap = new HashMap<>();
-    Set<SkyKey> depLabels = ImmutableSet.copyOf(Iterables.concat(keyToDepKeys.values()));
-    for (Collection<Target> depTargets : targetDepMap.values()) {
-      for (Target depTarget : depTargets) {
-        targetMap.putIfAbsent(depTarget.getLabel(), depTarget);
-        toAddTo.add(depTarget);
-      }
+    return whenAllSucceedCall(
+        ImmutableList.of(fromValueFuture, toValueFuture),
+        new QueryTaskCallable<Void>() {
+          @Override
+          public Void call() throws QueryException, InterruptedException {
+            // Implementation strategy: for each x in "from", compute its forward
+            // transitive closure.  If it intersects "to", then do a path search from x
+            // to an arbitrary node in the intersection, and return the path.  This
+            // avoids computing the full transitive closure of "from" in some cases.
+
+            ThreadSafeMutableSet<Target> fromValue = fromValueFuture.getIfSuccessful();
+            ThreadSafeMutableSet<Target> toValue = toValueFuture.getIfSuccessful();
+
+            buildTransitiveClosure(caller, fromValue, OptionalInt.empty());
+
+            for (Target x : fromValue) {
+              // TODO(b/122548314): if x was already seen as part of a previous node's tc, we should
+              // skip it here. That's subsumed by the TODO below.
+              ThreadSafeMutableSet<Target> xSet = createThreadSafeMutableSet();
+              xSet.add(x);
+              // TODO(b/122548314): this transitive closure building should stop at any nodes that
+              // have already been visited.
+              ThreadSafeMutableSet<Target> xtc = getTransitiveClosure(xSet, context);
+              SetView<Target> result;
+              if (xtc.size() > toValue.size()) {
+                result = Sets.intersection(toValue, xtc);
+              } else {
+                result = Sets.intersection(xtc, toValue);
+              }
+              if (!result.isEmpty()) {
+                callback.process(getNodesOnPath(x, result.iterator().next(), context));
+                return null;
+              }
+            }
+            callback.process(ImmutableSet.of());
+            return null;
+          }
+        });
+  }
+
+  @Override
+  public QueryTaskFuture<Void> allPaths(
+      QueryExpression fromExpression,
+      QueryExpression toExpression,
+      QueryExpressionContext<Target> context,
+      Callback<Target> callback,
+      QueryExpression caller) {
+    // Note that the body of this method is entirely copied from AllPathsFunction, which allows
+    // subclasses of SkyQueryEnvironment to override it.
+    // TODO: b/382066616 - Refactor this and avoid the duplication.
+    QueryTaskFuture<ThreadSafeMutableSet<Target>> fromValueFuture =
+        QueryUtil.evalAll(this, context, fromExpression);
+    QueryTaskFuture<ThreadSafeMutableSet<Target>> toValueFuture =
+        QueryUtil.evalAll(this, context, toExpression);
+
+    return whenAllSucceedCall(
+        ImmutableList.of(fromValueFuture, toValueFuture),
+        () -> {
+          // Algorithm: compute "reachableFromX", the forward transitive closure of the "from" set,
+          // then find the intersection of "reachableFromX" with the reverse transitive closure of
+          // the "to" set.  The reverse transitive closure and intersection operations are
+          // interleaved for efficiency. "result" holds the intersection.
+
+          ThreadSafeMutableSet<Target> fromValue = fromValueFuture.getIfSuccessful();
+          ThreadSafeMutableSet<Target> toValue = toValueFuture.getIfSuccessful();
+
+          buildTransitiveClosure(caller, fromValue, OptionalInt.empty());
+
+          Set<Target> reachableFromX = getTransitiveClosure(fromValue, context);
+          Predicate<Target> reachable = Predicates.in(reachableFromX);
+          Uniquifier<Target> uniquifier = createUniquifier();
+          ImmutableList<Target> result = uniquifier.unique(intersection(reachableFromX, toValue));
+          callback.process(result);
+          ImmutableList<Target> worklist = result;
+          while (!worklist.isEmpty()) {
+            Iterable<Target> reverseDeps = getReverseDeps(worklist, context);
+            worklist = uniquifier.unique(Iterables.filter(reverseDeps, reachable));
+            callback.process(worklist);
+          }
+          return null;
+        });
+  }
+
+  /**
+   * Returns a (new, mutable, unordered) set containing the intersection of the two specified sets.
+   */
+  private static <T> Set<T> intersection(Set<T> x, Set<T> y) {
+    Set<T> result = new HashSet<>();
+    if (x.size() > y.size()) {
+      Sets.intersection(y, x).copyInto(result);
+    } else {
+      Sets.intersection(x, y).copyInto(result);
     }
-    reportUnsuccessfulOrMissingTargets(targetMap, depLabels, caller);
+    return result;
   }
 
   @Override
@@ -683,19 +803,20 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
   protected Map<SkyKey, Collection<Target>> getReverseDepsOfLabels(
       Iterable<Label> targetLabels, QueryExpressionContext<Target> context)
       throws InterruptedException {
-    return getRawReverseDeps(Iterables.transform(targetLabels, label -> label));
+    return getRawReverseDeps(
+        Iterables.transform(targetLabels, label -> label), context.extraGlobalDeps());
   }
 
   /** Targetify SkyKeys of reverse deps and filter out targets whose deps are not allowed. */
-  Collection<Target> filterRawReverseDepsOfTransitiveTraversalKeys(
+  protected Collection<Target> filterRawReverseDepsOfTransitiveTraversalKeys(
       Map<SkyKey, ? extends Iterable<SkyKey>> rawReverseDeps,
       Multimap<SkyKey, SkyKey> packageKeyToTargetKeyMap)
       throws InterruptedException {
-    return processRawReverseDeps(targetifyValues(rawReverseDeps, packageKeyToTargetKeyMap));
+    return processRawReverseDeps(
+        targetifyValues(rawReverseDeps, packageKeyToTargetKeyMap, ImmutableSet.builder()));
   }
 
-  private Collection<Target> processRawReverseDeps(Map<SkyKey, Collection<Target>> rawReverseDeps)
-      throws InterruptedException {
+  private Set<Target> processRawReverseDeps(Map<SkyKey, Collection<Target>> rawReverseDeps) {
     Set<Target> result = CompactHashSet.create();
     CompactHashSet<Target> visited =
         CompactHashSet.createWithExpectedSize(totalSizeOfCollections(rawReverseDeps.values()));
@@ -732,8 +853,17 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
   public ThreadSafeMutableSet<Target> getTransitiveClosure(
       ThreadSafeMutableSet<Target> targets, QueryExpressionContext<Target> context)
       throws InterruptedException {
+    return getTransitiveClosure(targets, context, createThreadSafeMutableSet());
+  }
+
+  @Override
+  public ThreadSafeMutableSet<Target> getTransitiveClosure(
+      ThreadSafeMutableSet<Target> targets,
+      QueryExpressionContext<Target> context,
+      ThreadSafeMutableSet<Target> visited)
+      throws InterruptedException {
     return SkyQueryUtils.getTransitiveClosure(
-        targets, targets1 -> getFwdDeps(targets1, context), createThreadSafeMutableSet());
+        targets, targets1 -> getFwdDeps(targets1, context), visited);
   }
 
   @Override
@@ -771,6 +901,54 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
     return executeAsync(() -> expr.eval(SkyQueryEnvironment.this, context, callback));
   }
 
+  /**
+   * In {@link SkyQueryEvaluateExpressionImpl}, the constructor will create a {@link
+   * #settableFuture} which returned {@link QueryTaskFuture} delegates to. The {@link
+   * #settableFuture} will set as the return from {@code expr.eval(...)} when {@link
+   * #eval(Callback)} method is called to provide the real callback implementation.
+   */
+  protected class SkyQueryEvaluateExpressionImpl implements EvaluateExpression<Target> {
+    protected final SettableFuture<Void> settableFuture = SettableFuture.create();
+    protected final QueryExpression expression;
+    protected final QueryExpressionContext<Target> context;
+    private boolean wasGracefullyCancelled = false;
+
+    protected SkyQueryEvaluateExpressionImpl(
+        QueryExpression expr, QueryExpressionContext<Target> context) {
+      this.expression = expr;
+      this.context = context;
+    }
+
+    @Override
+    public QueryTaskFuture<Void> eval(Callback<Target> callback) {
+      setSettableFuture(callback);
+      return QueryTaskFutureImpl.ofDelegate(settableFuture);
+    }
+
+    @SuppressWarnings("unchecked")
+    protected void setSettableFuture(Callback<Target> callback) {
+      settableFuture.setFuture(
+          (ListenableFuture<Void>) SkyQueryEnvironment.this.eval(expression, context, callback));
+    }
+
+    @Override
+    public boolean gracefullyCancel() {
+      wasGracefullyCancelled = true;
+      return settableFuture.cancel(true);
+    }
+
+    @Override
+    public boolean isUngracefullyCancelled() {
+      return settableFuture.isCancelled() && !wasGracefullyCancelled;
+    }
+  }
+
+  @Override
+  public EvaluateExpression<Target> createEvaluateExpression(
+      QueryExpression expr, QueryExpressionContext<Target> context) {
+    return new SkyQueryEvaluateExpressionImpl(expr, context);
+  }
+
   @Override
   public <R> QueryTaskFuture<R> execute(QueryTaskCallable<R> callable) {
     return QueryTaskFutureImpl.ofDelegate(safeSubmit(callable));
@@ -798,16 +976,18 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
         Futures.whenAllSucceed(cast(futures)).call(callable, executor));
   }
 
+  @Override
+  public <R> QueryTaskFuture<R> whenSucceedsOrIsCancelledCall(
+      QueryTaskFuture<?> future, QueryTaskCallable<R> callable) {
+    return QueryTaskFutureImpl.whenSucceedsOrIsCancelledCall(
+        (QueryTaskFutureImpl<?>) future, callable, executor);
+  }
+
   @ThreadSafe
   @Override
   public ThreadSafeMutableSet<Target> createThreadSafeMutableSet() {
     return new ThreadSafeMutableKeyExtractorBackedSetImpl<>(
         TargetKeyExtractor.INSTANCE, Target.class, queryEvaluationParallelismLevel);
-  }
-
-  @Override
-  public <V> MutableMap<Target, V> createMutableMap() {
-    return new MutableKeyExtractorBackedMapImpl<>(TargetKeyExtractor.INSTANCE);
   }
 
   @ThreadSafe
@@ -842,8 +1022,13 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
 
   @ThreadSafe
   @Override
-  public Collection<Target> getSiblingTargetsInPackage(Target target) {
-    return target.getPackage().getTargets().values();
+  public Collection<Target> getSiblingTargetsInPackage(Target target)
+      throws QueryException, InterruptedException {
+    try {
+      return graphBackedRecursivePackageProvider.getSiblingTargetsInPackage(eventHandler, target);
+    } catch (NoSuchPackageException e) {
+      throw new QueryException(e.getMessage(), e, e.getDetailedExitCode().getFailureDetail());
+    }
   }
 
   @ThreadSafe
@@ -854,7 +1039,7 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
     try {
       targetPatternKey =
           TargetPatternValue.key(
-              SignedTargetPattern.parse(pattern, TargetPattern.mainRepoParser(parserPrefix)),
+              SignedTargetPattern.parse(pattern, mainRepoTargetParser),
               FilteringPolicies.NO_FILTER);
     } catch (TargetParsingException tpe) {
       try {
@@ -879,12 +1064,18 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
                   Iterables.filter(
                       targets,
                       target ->
-                          targetPatternKey.getPolicy().shouldRetain(target, /*explicit=*/ false)));
+                          targetPatternKey
+                              .getPolicy()
+                              .shouldRetain(target, /* explicit= */ false)));
     }
     ListenableFuture<Void> evalFuture =
         patternToEval.evalAsync(
             resolver,
-            ignoredPatternsSupplier,
+            () ->
+                ((IgnoredSubdirectoriesValue)
+                        graph.getValue(
+                            IgnoredSubdirectoriesValue.key(patternToEval.getRepository())))
+                    .asIgnoredSubdirectories(),
             targetPatternKey.getExcludedSubdirectories(),
             filteredCallback,
             QueryException.class,
@@ -900,69 +1091,49 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
             directExecutor()));
   }
 
-  @ThreadSafe
   @Override
-  public ThreadSafeMutableSet<Target> getBuildFiles(
-      QueryExpression caller,
-      ThreadSafeMutableSet<Target> nodes,
-      boolean buildFiles,
-      boolean loads,
-      QueryExpressionContext<Target> context)
-      throws QueryException, InterruptedException {
-    ThreadSafeMutableSet<Target> dependentFiles = createThreadSafeMutableSet();
-    Set<PackageIdentifier> seenPackages = new HashSet<>();
-    // Keep track of seen labels, to avoid adding a fake subinclude label that also exists as a
-    // real target.
-    Set<Label> seenLabels = new HashSet<>();
-
-    // Adds all the package definition files (BUILD files and build
-    // extensions) for package "pkg", to "buildfiles".
-    for (Target x : nodes) {
-      Package pkg = x.getPackage();
-      if (seenPackages.add(pkg.getPackageIdentifier())) {
-        if (buildFiles) {
-          addIfUniqueLabel(pkg.getBuildFile(), seenLabels, dependentFiles);
-        }
-
-        List<Label> extensions = new ArrayList<>();
-        if (loads) {
-          extensions.addAll(pkg.getStarlarkFileDependencies());
-        }
-
-        for (Label extension : extensions) {
-
-          Target loadTarget = getLoadTarget(extension, pkg);
-          addIfUniqueLabel(loadTarget, seenLabels, dependentFiles);
-
-          // Also add the BUILD file of the extension.
-          if (buildFiles) {
-            Label buildFileLabel = getBuildFileLabel(loadTarget.getLabel().getPackageIdentifier());
-            addIfUniqueLabel(new FakeLoadTarget(buildFileLabel, pkg), seenLabels, dependentFiles);
-          }
-        }
+  public TransitiveLoadFilesHelper<Target> getTransitiveLoadFilesHelper() {
+    return new TransitiveLoadFilesHelperForTargets() {
+      @Override
+      public Target getLoadFileTarget(Target originalTarget, Label bzlLabel)
+          throws InterruptedException {
+        return new FakeLoadTarget(bzlLabel, getBuildFileTarget(originalTarget).getPackageoid());
       }
-    }
-    return dependentFiles;
-  }
 
-  protected Label getBuildFileLabel(PackageIdentifier packageIdentifier) throws QueryException {
-    // TODO(bazel-team): Try avoid filesystem access here.
-    Path buildFileForLoad = null;
-    try {
-      buildFileForLoad = pkgPath.getPackageBuildFile(packageIdentifier);
-    } catch (NoSuchPackageException e) {
-      throw new QueryException(
-          packageIdentifier + " does not exist in graph",
-          e,
-          e.getDetailedExitCode().getFailureDetail());
-    }
-    return Label.createUnvalidated(packageIdentifier, buildFileForLoad.getBaseName());
-  }
+      @Override
+      public Target getBuildFileTarget(Target originalTarget) throws InterruptedException {
+        return graphBackedRecursivePackageProvider.getBuildFile(originalTarget);
+      }
 
-  private static void addIfUniqueLabel(Target node, Set<Label> labels, Set<Target> nodes) {
-    if (labels.add(node.getLabel())) {
-      nodes.add(node);
-    }
+      @Override
+      public Target maybeGetBuildFileTargetForLoadFileTarget(Target originalTarget, Label bzlLabel)
+          throws QueryException, InterruptedException {
+        PackageIdentifier packageIdentifier = bzlLabel.getPackageIdentifier();
+        PackageLookupValue packageLookupValue =
+            (PackageLookupValue) graph.getValue(PackageLookupValue.key(packageIdentifier));
+        if (packageLookupValue == null) {
+          BugReport.sendBugReport(
+              new IllegalStateException(
+                  "PackageLookupValue for package of extension file "
+                      + bzlLabel
+                      + " not in graph"));
+          throw new QueryException(
+              bzlLabel + " does not exist in graph",
+              FailureDetail.newBuilder()
+                  .setMessage("BUILD file not found on package path")
+                  .setPackageLoading(
+                      FailureDetails.PackageLoading.newBuilder()
+                          .setCode(FailureDetails.PackageLoading.Code.BUILD_FILE_MISSING)
+                          .build())
+                  .build());
+        }
+        return new FakeLoadTarget(
+            Label.createUnvalidated(
+                packageIdentifier,
+                packageLookupValue.getBuildFileName().getFilenameFragment().getBaseName()),
+            getBuildFileTarget(originalTarget).getPackageoid());
+      }
+    };
   }
 
   protected int getVisitBatchSizeForParallelVisitation() {
@@ -971,14 +1142,6 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
 
   public VisitTaskStatusCallback getVisitTaskStatusCallback() {
     return VisitTaskStatusCallback.NULL_INSTANCE;
-  }
-
-  private Target getLoadTarget(Label label, Package pkg) {
-    return new FakeLoadTarget(label, pkg);
-  }
-
-  int getQueryEvaluationParallelismLevel() {
-    return queryEvaluationParallelismLevel;
   }
 
   @ThreadSafe
@@ -990,8 +1153,7 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
   @ThreadSafe
   private Package getPackage(PackageIdentifier packageIdentifier)
       throws InterruptedException, QueryException, NoSuchPackageException {
-    SkyKey packageKey = PackageValue.key(packageIdentifier);
-    PackageValue packageValue = (PackageValue) graph.getValue(packageKey);
+    PackageValue packageValue = (PackageValue) graph.getValue(packageIdentifier);
     if (packageValue != null) {
       Package pkg = packageValue.getPackage();
       if (pkg.containsErrors()) {
@@ -999,14 +1161,15 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
       }
       return pkg;
     } else {
-      NoSuchPackageException exception = (NoSuchPackageException) graph.getException(packageKey);
+      NoSuchPackageException exception =
+          (NoSuchPackageException) graph.getException(packageIdentifier);
       if (exception != null) {
         throw exception;
       }
-      if (graph.isCycle(packageKey)) {
+      if (graph.isCycle(packageIdentifier)) {
         throw new NoSuchPackageException(packageIdentifier, "Package depends on a cycle");
       } else {
-        throw new QueryException(packageKey + " does not exist in graph", Query.Code.CYCLE);
+        throw new QueryException(packageIdentifier + " does not exist in graph", Query.Code.CYCLE);
       }
     }
   }
@@ -1030,10 +1193,11 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
     }
     Multimap<PackageIdentifier, Label> packageIdToLabelMap = ArrayListMultimap.create();
     labels.forEach(label -> packageIdToLabelMap.put(label.getPackageIdentifier(), label));
+
+    packageSemaphore.acquireAll(packageIdToLabelMap.keySet());
     Map<PackageIdentifier, Package> packageIdToPackageMap =
         bulkGetPackages(packageIdToLabelMap.keySet());
     ImmutableMap.Builder<Label, Target> resultBuilder = ImmutableMap.builder();
-    packageSemaphore.acquireAll(packageIdToLabelMap.keySet());
     try {
       for (PackageIdentifier pkgId : packageIdToLabelMap.keySet()) {
         Package pkg = packageIdToPackageMap.get(pkgId);
@@ -1059,9 +1223,8 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
   @ThreadSafe
   public Map<PackageIdentifier, Package> bulkGetPackages(Iterable<PackageIdentifier> pkgIds)
       throws InterruptedException {
-    Set<SkyKey> pkgKeys = ImmutableSet.copyOf(PackageValue.keys(pkgIds));
     ImmutableMap.Builder<PackageIdentifier, Package> pkgResults = ImmutableMap.builder();
-    Map<SkyKey, SkyValue> packages = graph.getSuccessfulValues(pkgKeys);
+    Map<SkyKey, SkyValue> packages = graph.getSuccessfulValues(pkgIds);
     for (Map.Entry<SkyKey, SkyValue> pkgEntry : packages.entrySet()) {
       PackageIdentifier pkgId = (PackageIdentifier) pkgEntry.getKey().argument();
       PackageValue pkgValue = (PackageValue) pkgEntry.getValue();
@@ -1070,9 +1233,14 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
     return pkgResults.buildOrThrow();
   }
 
+  public ImmutableSet<PackageIdentifier> bulkIsPackage(Iterable<PackageIdentifier> pkgIds)
+      throws InconsistentFilesystemException, InterruptedException {
+    return graphBackedRecursivePackageProvider.bulkIsPackage(eventHandler, pkgIds);
+  }
+
   @Override
   public void buildTransitiveClosure(
-      QueryExpression caller, ThreadSafeMutableSet<Target> targets, int maxDepth)
+      QueryExpression caller, ThreadSafeMutableSet<Target> targets, OptionalInt maxDepth)
       throws QueryException, InterruptedException {
     // Everything has already been loaded, so here we just check for errors so that we can
     // pre-emptively throw/report if needed.
@@ -1168,8 +1336,8 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
   }
 
   protected static FailureDetail createUnsuccessfulKeyFailure(Exception exception) {
-    return exception instanceof DetailedException
-        ? ((DetailedException) exception).getDetailedExitCode().getFailureDetail()
+    return exception instanceof DetailedException detailedException
+        ? detailedException.getDetailedExitCode().getFailureDetail()
         : FailureDetail.newBuilder()
             .setMessage(exception.getMessage())
             .setQuery(Query.newBuilder().setCode(Code.SKYQUERY_TARGET_EXCEPTION))
@@ -1213,7 +1381,7 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
   public static final Function<SkyKey, Label> SKYKEY_TO_LABEL =
       skyKey -> IS_LABEL.test(skyKey) ? (Label) skyKey.argument() : null;
 
-  static final Function<SkyKey, PackageIdentifier> PACKAGE_SKYKEY_TO_PACKAGE_IDENTIFIER =
+  private static final Function<SkyKey, PackageIdentifier> PACKAGE_SKYKEY_TO_PACKAGE_IDENTIFIER =
       skyKey -> (PackageIdentifier) skyKey.argument();
 
   public static Multimap<SkyKey, SkyKey> makePackageKeyToTargetKeyMap(Iterable<SkyKey> keys) {
@@ -1223,7 +1391,7 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
       if (label == null) {
         continue;
       }
-      packageKeyToTargetKeyMap.put(PackageValue.key(label.getPackageIdentifier()), key);
+      packageKeyToTargetKeyMap.put(label.getPackageIdentifier(), key);
     }
     return packageKeyToTargetKeyMap;
   }
@@ -1236,7 +1404,7 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
   }
 
   @ThreadSafe
-  public Map<SkyKey, Target> getTargetKeyToTargetMapForPackageKeyToTargetKeyMap(
+  Map<SkyKey, Target> getTargetKeyToTargetMapForPackageKeyToTargetKeyMap(
       Multimap<SkyKey, SkyKey> packageKeyToTargetKeyMap) throws InterruptedException {
     ImmutableMap.Builder<SkyKey, Target> resultBuilder = ImmutableMap.builder();
     getTargetsForPackageKeyToTargetKeyMapHelper(packageKeyToTargetKeyMap, resultBuilder::put);
@@ -1273,7 +1441,7 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
     }
   }
 
-  static final Function<Target, SkyKey> TARGET_TO_SKY_KEY =
+  protected static final Function<Target, SkyKey> TARGET_TO_SKY_KEY =
       target -> TransitiveTraversalValue.key(target.getLabel());
 
   /** A strict (i.e. non-lazy) variant of {@link #makeLabels}. */
@@ -1296,7 +1464,7 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
     packageSemaphore.acquireAll(pkgIds);
     try {
       return Iterables.transform(
-          graph.getSuccessfulValues(PackageValue.keys(pkgIds)).values(),
+          graph.getSuccessfulValues(pkgIds).values(),
           skyValue -> ((PackageValue) skyValue).getPackage().getBuildFile());
     } finally {
       packageSemaphore.releaseAll(pkgIds);
@@ -1329,21 +1497,6 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
         .add(new AllRdepsFunction())
         .add(new RBuildFilesFunction())
         .build();
-  }
-
-  private static class IgnoredPatternSupplier
-      implements InterruptibleSupplier<ImmutableSet<PathFragment>> {
-    private final WalkableGraph graph;
-
-    private IgnoredPatternSupplier(WalkableGraph graph) {
-      this.graph = graph;
-    }
-
-    @Override
-    public ImmutableSet<PathFragment> get() throws InterruptedException {
-      return ((IgnoredPackagePrefixesValue) graph.getValue(IgnoredPackagePrefixesValue.key()))
-          .getPatterns();
-    }
   }
 
   private static class SkyKeyKeyExtractor implements KeyExtractor<SkyKey, SkyKey> {
@@ -1387,7 +1540,7 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
     private final NonExceptionalUniquifier<Target> uniquifier;
     private final Object pendingLock = new Object();
     private List<Target> pending = new ArrayList<>();
-    private int batchThreshold;
+    private final int batchThreshold;
 
     private BatchStreamedCallback(
         ThreadSafeOutputFormatterCallback<Target> callback,
@@ -1461,8 +1614,11 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
 
   protected QueryTaskFuture<Predicate<SkyKey>> getUnfilteredUniverseDTCSkyKeyPredicateFuture(
       QueryExpression universe, QueryExpressionContext<Target> context) {
-    return ParallelSkyQueryUtils.getDTCSkyKeyPredicateFuture(
-        this, universe, context, BATCH_CALLBACK_SIZE, queryEvaluationParallelismLevel);
+    return dtcUniversePredicateCache.computeIfAbsent(
+        universe,
+        u ->
+            ParallelSkyQueryUtils.getDTCSkyKeyPredicateFuture(
+                this, u, context, BATCH_CALLBACK_SIZE, queryEvaluationParallelismLevel));
   }
 
   @ThreadSafe
@@ -1493,7 +1649,7 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
         expression,
         context,
         callback,
-        /*depsNeedFiltering=*/ !dependencyFilter.equals(DependencyFilter.ALL_DEPS),
+        /* depsNeedFiltering= */ !dependencyFilter.equals(DependencyFilter.ALL_DEPS),
         caller);
   }
 
@@ -1513,33 +1669,5 @@ public class SkyQueryEnvironment extends AbstractBlazeQueryEnvironment<Target>
         universePredicate ->
             ParallelSkyQueryUtils.getRdepsInUniverseBoundedParallel(
                 this, expression, depth, universePredicate, context, callback));
-  }
-
-  /**
-   * Query evaluation behavior is specified with respect to errors it emits. (Or at least it should
-   * be. Tools rely on it.) Notably, errors that occur during evaluation of a query's universe must
-   * not be emitted during query command evaluation. Consider the case of a simple single target
-   * query when {@code //...} is the universe: errors in far flung parts of the workspace should not
-   * be emitted when that query command is evaluated.
-   *
-   * <p>Non-error message events are not specified. For instance, it's useful (and expected by some
-   * unit tests that should know better) for query commands to emit {@link EventKind#PROGRESS}
-   * events during package loading.
-   *
-   * <p>Therefore, this class is used to forward only non-{@link EventKind#ERROR} events during
-   * universe loading to the {@link SkyQueryEnvironment}'s {@link ExtendedEventHandler}.
-   */
-  protected static class ErrorBlockingForwardingEventHandler extends DelegatingEventHandler {
-
-    public ErrorBlockingForwardingEventHandler(ExtendedEventHandler delegate) {
-      super(delegate);
-    }
-
-    @Override
-    public void handle(Event e) {
-      if (!e.getKind().equals(EventKind.ERROR)) {
-        super.handle(e);
-      }
-    }
   }
 }

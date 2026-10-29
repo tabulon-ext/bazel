@@ -1,0 +1,6 @@
+# Package group restricting access to dormant dependencies.
+
+package_group(
+    name = "dormant_dependency_allowlist",
+    packages = ["public"],
+)

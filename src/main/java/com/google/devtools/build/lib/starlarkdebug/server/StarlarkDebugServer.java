@@ -16,10 +16,12 @@ package com.google.devtools.build.lib.starlarkdebug.server;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Throwables;
+import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.events.EventHandler;
 import com.google.devtools.build.lib.starlarkdebugging.StarlarkDebuggingProtos;
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.util.List;
 import javax.annotation.Nullable;
@@ -34,14 +36,21 @@ public final class StarlarkDebugServer implements Debug.Debugger {
    * Initializes debugging support, setting up any debugging-specific overrides, then opens the
    * debug server socket and blocks waiting for an incoming connection.
    *
+   * @param address the address on which the server should listen for connections
    * @param port the port on which the server should listen for connections
    * @param verboseLogging if true, debug-level events will be logged
    * @throws IOException if an I/O error occurs while opening the socket or waiting for a connection
    */
   public static StarlarkDebugServer createAndWaitForConnection(
-      EventHandler eventHandler, int port, boolean verboseLogging) throws IOException {
-    ServerSocket serverSocket = new ServerSocket(port, /* backlog */ 1);
-    return createAndWaitForConnection(eventHandler, serverSocket, verboseLogging);
+      EventHandler eventHandler,
+      String address,
+      int port,
+      boolean verboseLogging,
+      DebugCallback callback)
+      throws IOException {
+    ServerSocket serverSocket =
+        new ServerSocket(port, /* backlog= */ 1, InetAddress.getByName(address));
+    return createAndWaitForConnection(eventHandler, serverSocket, verboseLogging, callback);
   }
 
   /**
@@ -53,14 +62,19 @@ public final class StarlarkDebugServer implements Debug.Debugger {
    */
   @VisibleForTesting
   static StarlarkDebugServer createAndWaitForConnection(
-      EventHandler eventHandler, ServerSocket serverSocket, boolean verboseLogging)
+      EventHandler eventHandler,
+      ServerSocket serverSocket,
+      boolean verboseLogging,
+      DebugCallback callback)
       throws IOException {
     DebugServerTransport transport =
         DebugServerTransport.createAndWaitForClient(eventHandler, serverSocket, verboseLogging);
-    return new StarlarkDebugServer(eventHandler, transport, verboseLogging);
+    return new StarlarkDebugServer(eventHandler, transport, verboseLogging, callback);
   }
 
   private final EventHandler eventHandler;
+  private final DebugCallback callback;
+
   /** Handles all thread-related state. */
   private final ThreadHandler threadHandler;
   /** The server socket for the debug server. */
@@ -69,8 +83,12 @@ public final class StarlarkDebugServer implements Debug.Debugger {
   private final boolean verboseLogging;
 
   private StarlarkDebugServer(
-      EventHandler eventHandler, DebugServerTransport transport, boolean verboseLogging) {
+      EventHandler eventHandler,
+      DebugServerTransport transport,
+      boolean verboseLogging,
+      DebugCallback callback) {
     this.eventHandler = eventHandler;
+    this.callback = callback;
     this.threadHandler = new ThreadHandler();
     this.transport = transport;
     this.verboseLogging = verboseLogging;
@@ -123,7 +141,7 @@ public final class StarlarkDebugServer implements Debug.Debugger {
         eventHandler.handle(Event.debug("Closing debug server"));
       }
       transport.close();
-
+      callback.onClose();
     } catch (IOException e) {
       eventHandler.handle(
           Event.error(
@@ -156,6 +174,7 @@ public final class StarlarkDebugServer implements Debug.Debugger {
     try {
       switch (request.getPayloadCase()) {
         case START_DEBUGGING:
+          callback.beforeDebuggingStart(threadHandler.getBreakpointFilePaths());
           threadHandler.resumeAllThreads();
           return DebugEventHelper.startDebuggingResponse(sequenceNumber);
         case LIST_FRAMES:
@@ -235,5 +254,28 @@ public final class StarlarkDebugServer implements Debug.Debugger {
       threadHandler.pauseThread(threadId);
     }
     return DebugEventHelper.pauseThreadResponse(sequenceNumber);
+  }
+
+  /**
+   * Callback for {@code StarlarkDebuggerModule} to reset analysis before debugging starts
+   *
+   * <p>We report the breakpoints set before debugging starts so that the corresponding Skyframe
+   * nodes are deleted and re-analysis of those files is triggered.
+   *
+   * <p>The {@link #maybeBlockBeforeStart} method is needed because (for an incremental build) it's
+   * also necessary that we block the build till breakpoints are set, so that the nodes are marked
+   * dirty before any skyframe evaluation occurs.
+   */
+  public interface DebugCallback {
+
+    static DebugCallback noop() {
+      return new DebugCallback() {};
+    }
+
+    default void beforeDebuggingStart(ImmutableSet<String> breakPointPaths) {}
+
+    default void maybeBlockBeforeStart() throws InterruptedException {}
+
+    default void onClose() {}
   }
 }

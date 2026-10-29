@@ -18,45 +18,47 @@ import com.google.common.collect.Sets;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.cmdline.PackageIdentifier;
 import com.google.devtools.build.lib.cmdline.TargetParsingException;
+import com.google.devtools.build.lib.cmdline.TargetPattern;
+import com.google.devtools.build.lib.cmdline.TargetPattern.Parser;
 import com.google.devtools.build.lib.collect.compacthashset.CompactHashSet;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;
 import com.google.devtools.build.lib.events.ExtendedEventHandler;
 import com.google.devtools.build.lib.packages.Attribute;
 import com.google.devtools.build.lib.packages.CachingPackageLocator;
+import com.google.devtools.build.lib.packages.LabelPrinter;
+import com.google.devtools.build.lib.packages.NoSuchPackageException;
 import com.google.devtools.build.lib.packages.NoSuchThingException;
-import com.google.devtools.build.lib.packages.Package;
 import com.google.devtools.build.lib.packages.Target;
-import com.google.devtools.build.lib.pkgcache.QueryTransitivePackagePreloader;
 import com.google.devtools.build.lib.pkgcache.TargetEdgeObserver;
 import com.google.devtools.build.lib.pkgcache.TargetPatternPreloader;
 import com.google.devtools.build.lib.pkgcache.TargetProvider;
 import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
 import com.google.devtools.build.lib.query2.common.AbstractBlazeQueryEnvironment;
+import com.google.devtools.build.lib.query2.common.QueryTransitivePackagePreloader;
 import com.google.devtools.build.lib.query2.compat.FakeLoadTarget;
 import com.google.devtools.build.lib.query2.engine.Callback;
 import com.google.devtools.build.lib.query2.engine.MinDepthUniquifier;
+import com.google.devtools.build.lib.query2.engine.QueryEnvironment;
 import com.google.devtools.build.lib.query2.engine.QueryEnvironment.CustomFunctionQueryEnvironment;
 import com.google.devtools.build.lib.query2.engine.QueryEvalResult;
 import com.google.devtools.build.lib.query2.engine.QueryException;
 import com.google.devtools.build.lib.query2.engine.QueryExpression;
 import com.google.devtools.build.lib.query2.engine.QueryExpressionContext;
 import com.google.devtools.build.lib.query2.engine.QueryUtil.MinDepthUniquifierImpl;
-import com.google.devtools.build.lib.query2.engine.QueryUtil.MutableKeyExtractorBackedMapImpl;
 import com.google.devtools.build.lib.query2.engine.QueryUtil.ThreadSafeMutableKeyExtractorBackedSetImpl;
 import com.google.devtools.build.lib.query2.engine.QueryUtil.UniquifierImpl;
+import com.google.devtools.build.lib.query2.engine.SamePkgDirectRdepsFunction;
 import com.google.devtools.build.lib.query2.engine.SkyframeRestartQueryException;
 import com.google.devtools.build.lib.query2.engine.ThreadSafeOutputFormatterCallback;
 import com.google.devtools.build.lib.query2.engine.Uniquifier;
-import com.google.devtools.build.lib.vfs.PathFragment;
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Map;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.function.Predicate;
 import javax.annotation.Nullable;
@@ -80,11 +82,10 @@ public class GraphlessBlazeQueryEnvironment extends AbstractBlazeQueryEnvironmen
   private static final int MAX_DEPTH_FULL_SCAN_LIMIT = 20;
   private final Map<String, Collection<Target>> resolvedTargetPatterns = new HashMap<>();
   private final TargetPatternPreloader targetPatternPreloader;
-  private final PathFragment relativeWorkingDirectory;
-  private final QueryTransitivePackagePreloader queryTransitivePackagePreloader;
+  private final TargetPattern.Parser mainRepoTargetParser;
+  @Nullable private final QueryTransitivePackagePreloader queryTransitivePackagePreloader;
   private final TargetProvider targetProvider;
   private final CachingPackageLocator cachingPackageLocator;
-  private final String queryIdForDebugging;
   private final ErrorPrintingTargetEdgeErrorObserver errorObserver;
   private final LabelVisitor labelVisitor;
   protected final int loadingPhaseThreads;
@@ -106,11 +107,11 @@ public class GraphlessBlazeQueryEnvironment extends AbstractBlazeQueryEnvironmen
    * @param settings a set of enabled settings
    */
   public GraphlessBlazeQueryEnvironment(
-      QueryTransitivePackagePreloader queryTransitivePackagePreloader,
+      @Nullable QueryTransitivePackagePreloader queryTransitivePackagePreloader,
       TargetProvider targetProvider,
       CachingPackageLocator cachingPackageLocator,
       TargetPatternPreloader targetPatternPreloader,
-      PathFragment relativeWorkingDirectory,
+      Parser mainRepoTargetParser,
       boolean keepGoing,
       boolean strictScope,
       int loadingPhaseThreads,
@@ -118,17 +119,17 @@ public class GraphlessBlazeQueryEnvironment extends AbstractBlazeQueryEnvironmen
       ExtendedEventHandler eventHandler,
       Set<Setting> settings,
       Iterable<QueryFunction> extraFunctions,
-      String queryIdForDebugging) {
-    super(keepGoing, strictScope, labelFilter, eventHandler, settings, extraFunctions);
+      LabelPrinter labelPrinter) {
+    super(
+        keepGoing, strictScope, labelFilter, eventHandler, settings, extraFunctions, labelPrinter);
     this.targetPatternPreloader = targetPatternPreloader;
-    this.relativeWorkingDirectory = relativeWorkingDirectory;
+    this.mainRepoTargetParser = mainRepoTargetParser;
     this.queryTransitivePackagePreloader = queryTransitivePackagePreloader;
     this.targetProvider = targetProvider;
     this.cachingPackageLocator = cachingPackageLocator;
-    this.queryIdForDebugging = queryIdForDebugging;
     this.errorObserver = new ErrorPrintingTargetEdgeErrorObserver(this.eventHandler);
     this.loadingPhaseThreads = loadingPhaseThreads;
-    this.labelVisitor = new LabelVisitor(targetProvider, dependencyFilter, queryIdForDebugging);
+    this.labelVisitor = new LabelVisitor(targetProvider, dependencyFilter);
   }
 
   @Override
@@ -171,8 +172,13 @@ public class GraphlessBlazeQueryEnvironment extends AbstractBlazeQueryEnvironmen
   }
 
   @Override
-  public Collection<Target> getSiblingTargetsInPackage(Target target) {
-    return target.getPackage().getTargets().values();
+  public Collection<Target> getSiblingTargetsInPackage(Target target)
+      throws QueryException, InterruptedException {
+    try {
+      return targetProvider.getSiblingTargetsInPackage(eventHandler, target);
+    } catch (NoSuchPackageException e) {
+      throw new QueryException(e.getMessage(), e, e.getDetailedExitCode().getFailureDetail());
+    }
   }
 
   @Override
@@ -230,16 +236,19 @@ public class GraphlessBlazeQueryEnvironment extends AbstractBlazeQueryEnvironmen
 
   @Override
   public void deps(
-      Iterable<Target> from, int maxDepth, QueryExpression caller, Callback<Target> callback)
+      Iterable<Target> from,
+      OptionalInt maxDepth,
+      QueryExpression caller,
+      Callback<Target> callback)
       throws InterruptedException, QueryException {
     // TODO(ulfjack): There's no need to visit the transitive closure twice. Ideally, preloading
     //  would return the list of targets, but it currently only returns the list of labels.
     try (SilentCloseable closeable = Profiler.instance().profile("preloadTransitiveClosure")) {
-      preloadTransitiveClosure(from, maxDepth);
+      preloadTransitiveClosure(from, maxDepth, caller);
     }
     Set<Target> result = Sets.newConcurrentHashSet();
     try (SilentCloseable closeable = Profiler.instance().profile("syncUncached")) {
-      new LabelVisitor(targetProvider, dependencyFilter, queryIdForDebugging)
+      new LabelVisitor(targetProvider, dependencyFilter)
           .syncUncached(
               eventHandler,
               from,
@@ -278,7 +287,7 @@ public class GraphlessBlazeQueryEnvironment extends AbstractBlazeQueryEnvironmen
       Iterable<Target> from, Iterable<Target> to, QueryExpression caller, Callback<Target> callback)
       throws InterruptedException, QueryException {
     try (SilentCloseable closeable = Profiler.instance().profile("preloadTransitiveClosure")) {
-      preloadTransitiveClosure(from, /*maxDepth=*/ Integer.MAX_VALUE);
+      preloadTransitiveClosure(from, /*maxDepth=*/ OptionalInt.empty(), caller);
     }
     Iterable<Target> results =
         new PathLabelVisitor(targetProvider, dependencyFilter, errorObserver)
@@ -297,7 +306,7 @@ public class GraphlessBlazeQueryEnvironment extends AbstractBlazeQueryEnvironmen
       Iterable<Target> from, Iterable<Target> to, QueryExpression caller, Callback<Target> callback)
       throws InterruptedException, QueryException {
     try (SilentCloseable closeable = Profiler.instance().profile("preloadTransitiveClosure")) {
-      preloadTransitiveClosure(from, /*maxDepth=*/ Integer.MAX_VALUE);
+      preloadTransitiveClosure(from, /*maxDepth=*/ OptionalInt.empty(), caller);
     }
     Iterable<Target> results =
         new PathLabelVisitor(targetProvider, dependencyFilter, errorObserver)
@@ -320,7 +329,8 @@ public class GraphlessBlazeQueryEnvironment extends AbstractBlazeQueryEnvironmen
       targetsToPreload.addAll(getSiblingTargetsInPackage(t));
     }
     try (SilentCloseable closeable = Profiler.instance().profile("preloadTransitiveClosure")) {
-      preloadTransitiveClosure(targetsToPreload, /*maxDepth=*/ 1);
+      preloadTransitiveClosure(
+          targetsToPreload, /*maxDepth=*/ SamePkgDirectRdepsFunction.DEPTH_ONE, caller);
     }
     Iterable<Target> results =
         new PathLabelVisitor(targetProvider, dependencyFilter, errorObserver)
@@ -338,12 +348,19 @@ public class GraphlessBlazeQueryEnvironment extends AbstractBlazeQueryEnvironmen
   public void rdeps(
       Iterable<Target> from,
       Iterable<Target> universe,
-      int maxDepth,
+      OptionalInt maxDepth,
       QueryExpression caller,
       Callback<Target> callback)
       throws InterruptedException, QueryException {
     try (SilentCloseable closeable = Profiler.instance().profile("preloadTransitiveClosure")) {
-      preloadTransitiveClosure(universe, maxDepth);
+      preloadTransitiveClosure(
+          universe,
+          // PathLabelVisitor#rdeps, called below, necessarily needs to crawl the full DTC of
+          // `universe` in order to be able to reify the reverse edges needed to determine the rdeps
+          // of `from` at the specified depth. Therefore we preload the full DTC of `universe` in
+          // parallel, so that PathLabelVisitor#rdeps doesn't need to do novel package loading.
+          /* maxDepth= */ OptionalInt.empty(),
+          caller);
     }
     Iterable<Target> results =
         new PathLabelVisitor(targetProvider, dependencyFilter, errorObserver)
@@ -359,10 +376,10 @@ public class GraphlessBlazeQueryEnvironment extends AbstractBlazeQueryEnvironmen
 
   @Override
   public void buildTransitiveClosure(
-      QueryExpression caller, ThreadSafeMutableSet<Target> targetNodes, int maxDepth)
+      QueryExpression caller, ThreadSafeMutableSet<Target> targetNodes, OptionalInt maxDepth)
       throws QueryException, InterruptedException {
     try (SilentCloseable closeable = Profiler.instance().profile("preloadTransitiveClosure")) {
-      preloadTransitiveClosure(targetNodes, maxDepth);
+      preloadTransitiveClosure(targetNodes, maxDepth, caller);
     }
     try (SilentCloseable closeable = Profiler.instance().profile("syncWithVisitor")) {
       labelVisitor.syncWithVisitor(
@@ -391,11 +408,6 @@ public class GraphlessBlazeQueryEnvironment extends AbstractBlazeQueryEnvironmen
   }
 
   @Override
-  public <V> MutableMap<Target, V> createMutableMap() {
-    return new MutableKeyExtractorBackedMapImpl<>(TargetKeyExtractor.INSTANCE);
-  }
-
-  @Override
   public Uniquifier<Target> createUniquifier() {
     return new UniquifierImpl<>(TargetKeyExtractor.INSTANCE);
   }
@@ -405,9 +417,41 @@ public class GraphlessBlazeQueryEnvironment extends AbstractBlazeQueryEnvironmen
     return new MinDepthUniquifierImpl<>(TargetKeyExtractor.INSTANCE, /*concurrencyLevel=*/ 1);
   }
 
-  private void preloadTransitiveClosure(Iterable<Target> targets, int maxDepth)
-      throws InterruptedException {
-    if (maxDepth >= MAX_DEPTH_FULL_SCAN_LIMIT && queryTransitivePackagePreloader != null) {
+  @Override
+  public TransitiveLoadFilesHelper<Target> getTransitiveLoadFilesHelper() {
+    return new TransitiveLoadFilesHelperForTargets() {
+      @Override
+      public Target getLoadFileTarget(Target originalTarget, Label bzlLabel)
+          throws InterruptedException {
+        return new FakeLoadTarget(bzlLabel, getBuildFileTarget(originalTarget).getPackageoid());
+      }
+
+      @Override
+      public Target getBuildFileTarget(Target originalTarget) throws InterruptedException {
+        return targetProvider.getBuildFile(originalTarget);
+      }
+
+      @Nullable
+      @Override
+      public Target maybeGetBuildFileTargetForLoadFileTarget(Target originalTarget, Label bzlLabel)
+          throws InterruptedException {
+        PackageIdentifier pkgIdOfBzlLabel = bzlLabel.getPackageIdentifier();
+        String baseName = cachingPackageLocator.getBaseNameForLoadedPackage(pkgIdOfBzlLabel);
+        if (baseName == null) {
+          return null;
+        }
+        return new FakeLoadTarget(
+            Label.createUnvalidated(pkgIdOfBzlLabel, baseName),
+            getBuildFileTarget(originalTarget).getPackageoid());
+      }
+    };
+  }
+
+  private void preloadTransitiveClosure(
+      Iterable<Target> targets, OptionalInt maxDepth, QueryExpression callerForError)
+      throws InterruptedException, QueryException {
+    if (QueryEnvironment.shouldVisit(maxDepth, MAX_DEPTH_FULL_SCAN_LIMIT)
+        && queryTransitivePackagePreloader != null) {
       // Only do the full visitation if "maxDepth" is large enough. Otherwise, the benefits of
       // preloading will be outweighed by the cost of doing more work than necessary.
       Set<Label> labels = CompactHashSet.create();
@@ -415,7 +459,13 @@ public class GraphlessBlazeQueryEnvironment extends AbstractBlazeQueryEnvironmen
         labels.add(t.getLabel());
       }
       queryTransitivePackagePreloader.preloadTransitiveTargets(
-          eventHandler, labels, keepGoing, loadingPhaseThreads);
+          eventHandler,
+          labels,
+          keepGoing,
+          loadingPhaseThreads,
+          // Don't throw an error if in keep-going mode or if the depth was limited: it's possible
+          // that an encountered error was deeper than the depth bound.
+          keepGoing || maxDepth.isPresent() ? null : callerForError);
     }
   }
 
@@ -426,53 +476,6 @@ public class GraphlessBlazeQueryEnvironment extends AbstractBlazeQueryEnvironmen
       throw new SkyframeRestartQueryException();
     }
     return target;
-  }
-
-  @Override
-  public ThreadSafeMutableSet<Target> getBuildFiles(
-      final QueryExpression caller,
-      ThreadSafeMutableSet<Target> nodes,
-      boolean buildFiles,
-      boolean loads,
-      QueryExpressionContext<Target> context)
-      throws QueryException {
-    ThreadSafeMutableSet<Target> dependentFiles = createThreadSafeMutableSet();
-    Set<PackageIdentifier> seenPackages = new HashSet<>();
-
-    // Adds all the package definition files (BUILD files and build extensions) for package "pkg",
-    // to dependentFiles.
-    for (Target x : nodes) {
-      Package pkg = x.getPackage();
-      if (seenPackages.add(pkg.getPackageIdentifier())) {
-        if (buildFiles) {
-          dependentFiles.add(pkg.getBuildFile());
-        }
-
-        List<Label> extensions = new ArrayList<>();
-        if (loads) {
-          extensions.addAll(pkg.getStarlarkFileDependencies());
-        }
-
-        for (Label extension : extensions) {
-          Target loadTarget = new FakeLoadTarget(extension, pkg);
-          dependentFiles.add(loadTarget);
-
-          // Also add the BUILD file of the extension.
-          if (buildFiles) {
-            // Can be null in genquery: see http://b/123795023#comment6.
-            String baseName =
-                cachingPackageLocator.getBaseNameForLoadedPackage(
-                    loadTarget.getLabel().getPackageIdentifier());
-            if (baseName != null) {
-              Label buildFileLabel =
-                  Label.createUnvalidated(loadTarget.getLabel().getPackageIdentifier(), baseName);
-              dependentFiles.add(new FakeLoadTarget(buildFileLabel, pkg));
-            }
-          }
-        }
-      }
-    }
-    return dependentFiles;
   }
 
   @Override
@@ -487,7 +490,7 @@ public class GraphlessBlazeQueryEnvironment extends AbstractBlazeQueryEnvironmen
     // being called from within a SkyFunction.
     resolvedTargetPatterns.putAll(
         targetPatternPreloader.preloadTargetPatterns(
-            eventHandler, relativeWorkingDirectory, patterns, keepGoing));
+            eventHandler, mainRepoTargetParser, patterns, keepGoing));
   }
 
   @Override

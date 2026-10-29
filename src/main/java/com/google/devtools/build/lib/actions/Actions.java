@@ -14,6 +14,8 @@
 
 package com.google.devtools.build.lib.actions;
 
+import static com.google.common.collect.Iterables.elementsEqual;
+import static java.util.Comparator.comparing;
 import static java.util.concurrent.TimeUnit.MINUTES;
 
 import com.google.common.base.Preconditions;
@@ -23,13 +25,9 @@ import com.google.common.collect.Iterators;
 import com.google.common.escape.Escaper;
 import com.google.common.escape.Escapers;
 import com.google.common.flogger.GoogleLogger;
-import com.google.devtools.build.lib.actions.MutableActionGraph.ActionConflictException;
-import com.google.devtools.build.lib.bugreport.BugReport;
-import com.google.devtools.build.lib.cmdline.Label;
-import com.google.devtools.build.lib.packages.OutputFile;
-import com.google.devtools.build.lib.skyframe.SkyframeAwareAction;
-import com.google.devtools.build.lib.vfs.OsPathPolicy;
+import com.google.devtools.build.lib.actions.Artifact.DerivedArtifact;
 import com.google.devtools.build.lib.vfs.PathFragment;
+import com.google.devtools.build.skyframe.WalkableGraph;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
@@ -44,12 +42,14 @@ import javax.annotation.Nullable;
 public final class Actions {
   private static final GoogleLogger logger = GoogleLogger.forEnclosingClass();
 
-  private static final Escaper PATH_ESCAPER = Escapers.builder()
-      .addEscape('_', "_U")
-      .addEscape('/', "_S")
-      .addEscape('\\', "_B")
-      .addEscape(':', "_C")
-      .build();
+  private static final Escaper PATH_ESCAPER =
+      Escapers.builder()
+          .addEscape('_', "_U")
+          .addEscape('/', "_S")
+          .addEscape('\\', "_B")
+          .addEscape(':', "_C")
+          .addEscape('@', "_A")
+          .build();
 
   private Actions() {}
 
@@ -70,7 +70,7 @@ public final class Actions {
     if (action instanceof NotifyOnActionCacheHit) {
       return true;
     }
-    return ((Action) action).isVolatile() && !(action instanceof SkyframeAwareAction);
+    return ((Action) action).isVolatile();
   }
 
   /**
@@ -85,17 +85,33 @@ public final class Actions {
   public static boolean canBeShared(
       ActionKeyContext actionKeyContext, ActionAnalysisMetadata a, ActionAnalysisMetadata b)
       throws InterruptedException {
-    return a.isShareable()
-        && b.isShareable()
-        && a.getMnemonic().equals(b.getMnemonic())
+    if (!(a.getMnemonic().equals(b.getMnemonic())
         // Non-Actions cannot be shared.
         && a instanceof Action
         && b instanceof Action
-        && a.getKey(actionKeyContext, /*artifactExpander=*/ null)
-            .equals(b.getKey(actionKeyContext, /*artifactExpander=*/ null))
-        && artifactsEqualWithoutOwner(
-            a.getMandatoryInputs().toList(), b.getMandatoryInputs().toList())
-        && artifactsEqualWithoutOwner(a.getOutputs(), b.getOutputs());
+        && a.getKey(actionKeyContext, /* inputMetadataProvider= */ null)
+            .equals(b.getKey(actionKeyContext, /* inputMetadataProvider= */ null)))) {
+      return false;
+    }
+    // Uses a standard comparison technique for shareable actions.
+    if (a.isShareable() && b.isShareable()) {
+      return artifactsEqualWithoutOwner(
+              a.getMandatoryInputs().toList(), b.getMandatoryInputs().toList())
+          && artifactsEqualWithoutOwner(a.getOutputs(), b.getOutputs());
+    }
+
+    // If this is reached, at least one action is not shareable. If the actions differ on this, they
+    // cannot be shared.
+    if (a.isShareable() || b.isShareable()) {
+      return false;
+    }
+
+    // If the artifacts are in fact equal (with owners), these are aliases of the same action and
+    // not in conflict with each other. This can occur under remote analysis. Without remote
+    // analysis, this won't be reached because the actions would have reference equality. The
+    // MapBasedActionGraph doesn't consider actions that are the same object instance for conflicts.
+    return a.getMandatoryInputs().toList().equals(b.getMandatoryInputs().toList())
+        && elementsEqual(a.getOutputs(), b.getOutputs());
   }
 
   /**
@@ -146,25 +162,21 @@ public final class Actions {
   /**
    * Assigns generating action keys to artifacts, and finds action conflicts. An action conflict
    * happens if two actions generate the same output artifact. Shared actions are not allowed. See
-   * {@link #canBeShared} for details. Should only be called for special action lookup values: does
-   * not handle normal configured targets. In particular, {@link
-   * GeneratingActions#getArtifactsByOutputLabel} will be empty.
+   * {@link #canBeShared} for details.
    *
    * @param actions a list of actions to check for action conflict.
-   * @return a structure giving the actions, with a level of indirection.
    * @throws ActionConflictException iff there are two actions generate the same output
    */
-  public static GeneratingActions assignOwnersAndFindAndThrowActionConflict(
+  public static void assignOwnersAndThrowIfConflict(
       ActionKeyContext actionKeyContext,
       ImmutableList<ActionAnalysisMetadata> actions,
       ActionLookupKey actionLookupKey)
-      throws ActionConflictException, InterruptedException, ArtifactGeneratedByOtherRuleException {
-    return Actions.assignOwnersAndMaybeFilterSharedActionsAndThrowIfConflict(
-        actionKeyContext,
-        actions,
-        actionLookupKey,
-        /*allowSharedAction=*/ false,
-        /*outputFiles=*/ null);
+      throws ActionConflictException,
+          InterruptedException,
+          ArtifactGeneratedByOtherRuleException,
+          SourceArtifactUsedAsOutputException {
+    assignOwnersAndThrowIfConflictMaybeToleratingSharedActions(
+        actionKeyContext, actions, actionLookupKey, /* allowSharedAction= */ false);
   }
 
   /**
@@ -176,26 +188,23 @@ public final class Actions {
    *
    * @param actions a list of actions to check for action conflicts, all generated by the same
    *     configured target/aspect.
-   * @return a structure giving the actions, with a level of indirection.
    * @throws ActionConflictException iff there are two unshareable actions generating the same
    *     output
    */
-  public static GeneratingActions assignOwnersAndFilterSharedActionsAndThrowActionConflict(
+  public static void assignOwnersAndThrowIfConflictToleratingSharedActions(
       ActionKeyContext actionKeyContext,
       ImmutableList<ActionAnalysisMetadata> actions,
-      ActionLookupKey actionLookupKey,
-      @Nullable Collection<OutputFile> outputFiles)
-      throws ActionConflictException, InterruptedException, ArtifactGeneratedByOtherRuleException {
-    return Actions.assignOwnersAndMaybeFilterSharedActionsAndThrowIfConflict(
-        actionKeyContext,
-        actions,
-        actionLookupKey,
-        /*allowSharedAction=*/ true,
-        outputFiles);
+      ActionLookupKey actionLookupKey)
+      throws ActionConflictException,
+          InterruptedException,
+          ArtifactGeneratedByOtherRuleException,
+          SourceArtifactUsedAsOutputException {
+    assignOwnersAndThrowIfConflictMaybeToleratingSharedActions(
+        actionKeyContext, actions, actionLookupKey, /* allowSharedAction= */ true);
   }
 
   private static void verifyGeneratingActionKeys(
-      Artifact.DerivedArtifact output,
+      DerivedArtifact output,
       ActionLookupData otherKey,
       boolean allowSharedAction,
       ActionKeyContext actionKeyContext,
@@ -214,7 +223,7 @@ public final class Actions {
         && (!allowSharedAction
             || !Actions.canBeSharedLogForPotentialFalsePositives(
                 actionKeyContext, actions.get(actionIndex), actions.get(otherIndex)))) {
-      throw new ActionConflictException(
+      throw ActionConflictException.create(
           actionKeyContext, output, actions.get(actionIndex), actions.get(otherIndex));
     }
   }
@@ -225,74 +234,41 @@ public final class Actions {
    * <p>Conflicts can happen in one of two ways: the same artifact can be the output of multiple
    * unshareable actions (or shareable actions if {@code allowSharedAction} is false), or two
    * artifacts with the same execPath can be the outputs of different unshareable actions.
-   *
-   * <p>If {@code outputFiles} is non-null, also builds a map of output-file labels to artifacts,
-   * for use by output file configured targets when they are retrieving their artifacts from this
-   * associated rule configured target.
    */
-  private static GeneratingActions assignOwnersAndMaybeFilterSharedActionsAndThrowIfConflict(
+  private static void assignOwnersAndThrowIfConflictMaybeToleratingSharedActions(
       ActionKeyContext actionKeyContext,
       ImmutableList<ActionAnalysisMetadata> actions,
       ActionLookupKey actionLookupKey,
-      boolean allowSharedAction,
-      @Nullable Collection<OutputFile> outputFiles)
-      throws ActionConflictException, InterruptedException, ArtifactGeneratedByOtherRuleException {
-    Map<PathFragment, Artifact.DerivedArtifact> seenArtifacts = new HashMap<>();
-    @Nullable ImmutableMap<String, Label> outputFileNames = null;
-    if (outputFiles != null && !outputFiles.isEmpty()) {
-      ImmutableMap.Builder<String, Label> outputFileNamesBuilder =
-          ImmutableMap.builderWithExpectedSize(outputFiles.size());
-      outputFiles.forEach(o -> outputFileNamesBuilder.put(o.getLabel().getName(), o.getLabel()));
-      outputFileNames = outputFileNamesBuilder.build();
-    }
-    @Nullable
-    ImmutableMap.Builder<Label, Artifact> artifactsByOutputLabel =
-        outputFileNames != null ? ImmutableMap.builderWithExpectedSize(outputFiles.size()) : null;
-    @Nullable Label label = actionLookupKey.getLabel();
-    @Nullable
-    PathFragment packageName =
-        outputFileNames != null
-            ? Preconditions.checkNotNull(label, actionLookupKey)
-                .getPackageIdentifier()
-                .getPackageFragment()
-            : null;
+      boolean allowSharedAction)
+      throws ActionConflictException,
+          InterruptedException,
+          ArtifactGeneratedByOtherRuleException,
+          SourceArtifactUsedAsOutputException {
+    Map<PathFragment, DerivedArtifact> seenArtifacts = new HashMap<>();
     // Loop over the actions, looking at all outputs for conflicts.
     int actionIndex = 0;
     for (ActionAnalysisMetadata action : actions) {
       ActionLookupData generatingActionKey =
-          dependsOnBuildId(action)
+          // Runfiles tree actions have the unfortunate property that their RichArtifactData
+          // contains a NestedSet of Artifacts, which we currently deem to be not worth serializing.
+          // TODO: b/401575099 - See if we can factor out the NestedSet and remove this exclusion.
+          dependsOnBuildId(action) || action instanceof RunfilesTreeAction
               ? ActionLookupData.createUnshareable(actionLookupKey, actionIndex)
               : ActionLookupData.create(actionLookupKey, actionIndex);
       for (Artifact artifact : action.getOutputs()) {
-        Preconditions.checkState(
-            !artifact.isSourceArtifact(),
-            "Source in outputs: %s %s %s",
-            artifact,
-            generatingActionKey,
-            action);
-        Artifact.DerivedArtifact output = (Artifact.DerivedArtifact) artifact;
+        if (artifact.isSourceArtifact()) {
+          throw new SourceArtifactUsedAsOutputException(
+              String.format(
+                  "File '%s' is listed as an output of %s but is a source file",
+                  artifact.prettyPrint(), action.prettyPrint()));
+        }
+        DerivedArtifact output = (DerivedArtifact) artifact;
         // Has an artifact with this execPath been seen before?
-        Artifact.DerivedArtifact equalOutput =
-            seenArtifacts.putIfAbsent(output.getExecPath(), output);
+        DerivedArtifact equalOutput = seenArtifacts.putIfAbsent(output.getExecPath(), output);
         if (equalOutput != null) {
           // Yes: assert that its generating action and this artifact's are compatible.
           verifyGeneratingActionKeys(
-              equalOutput,
-              generatingActionKey,
-              allowSharedAction,
-              actionKeyContext,
-              actions);
-        } else {
-          // No: populate the output label map with this artifact if applicable: if this
-          // artifact corresponds to a target that is an OutputFile with associated rule this label.
-          PathFragment outputPath = output.getRepositoryRelativePath();
-          if (packageName != null && outputPath.startsWith(packageName)) {
-            PathFragment packageRelativePath = outputPath.relativeTo(packageName);
-            Label outputLabel = outputFileNames.get(packageRelativePath.getPathString());
-            if (outputLabel != null) {
-              artifactsByOutputLabel.put(outputLabel, artifact);
-            }
-          }
+              equalOutput, generatingActionKey, allowSharedAction, actionKeyContext, actions);
         }
         // Was this output already seen, so it has a generating action key set?
         if (!output.hasGeneratingActionKey()) {
@@ -311,44 +287,34 @@ public final class Actions {
           }
           // Key is already set: verify that the generating action and this action are compatible.
           verifyGeneratingActionKeys(
-              output,
-              generatingActionKey,
-              allowSharedAction,
-              actionKeyContext,
-              actions);
+              output, generatingActionKey, allowSharedAction, actionKeyContext, actions);
         }
       }
       actionIndex++;
     }
-    return new GeneratingActions(
-        actions,
-        artifactsByOutputLabel != null ? artifactsByOutputLabel.build() : ImmutableMap.of());
   }
 
   private static final Comparator<Artifact> EXEC_PATH_PREFIX_COMPARATOR =
-      (lhs, rhs) -> {
-        // We need to use the OS path policy in case the OS is case insensitive.
-        OsPathPolicy os = OsPathPolicy.getFilePathOs();
-        String str1 = lhs.getExecPathString();
-        String str2 = rhs.getExecPathString();
-        int len1 = str1.length();
-        int len2 = str2.length();
-        int n = Math.min(len1, len2);
-        for (int i = 0; i < n; ++i) {
-          char c1 = str1.charAt(i);
-          char c2 = str2.charAt(i);
-          int res = os.compare(c1, c2);
-          if (res != 0) {
-            if (c1 == PathFragment.SEPARATOR_CHAR) {
-              return -1;
-            } else if (c2 == PathFragment.SEPARATOR_CHAR) {
-              return 1;
-            }
-            return res;
-          }
-        }
-        return len1 - len2;
-      };
+      comparing(Artifact::getExecPath, PathFragment.HIERARCHICAL_COMPARATOR);
+
+  /**
+   * Check whether two artifacts are a runfiles tree - runfiles output manifest pair.
+   *
+   * <p>This is necessary because these are exempt from the "path of one artifact cannot be a prefix
+   * of another" rule. This is like this for historical reasons.
+   */
+  public static boolean isRunfilesArtifactPair(Artifact runfilesTree, Artifact runfilesManifest) {
+    if (!runfilesTree.isRunfilesTree()) {
+      // The outside artifact is not a runfiles tree. No go.
+      return false;
+    }
+
+    // Now check whether the path of the inner artifact matches the expected path of a runfiles
+    // output manifest.
+    return runfilesManifest
+        .getExecPathString()
+        .equals(runfilesTree.getExecPath().getRelative("MANIFEST").getPathString());
+  }
 
   /**
    * Finds Artifact prefix conflicts between generated artifacts. An artifact prefix conflict
@@ -357,14 +323,11 @@ public final class Actions {
    *
    * @param actionGraph the {@link ActionGraph} to query for artifact conflicts
    * @param artifacts all generated artifacts in the build
-   * @param strictConflictChecks report path prefix conflicts, regardless of {@link
-   *     ActionAnalysisMetadata#shouldReportPathPrefixConflict}
    * @return An immutable map between actions that generated the conflicting artifacts and their
-   *     associated {@link ArtifactPrefixConflictException}
+   *     associated {@link ActionConflictException}
    */
-  public static ImmutableMap<ActionAnalysisMetadata, ArtifactPrefixConflictException>
-      findArtifactPrefixConflicts(
-          ActionGraph actionGraph, Collection<Artifact> artifacts, boolean strictConflictChecks) {
+  public static ImmutableMap<ActionAnalysisMetadata, ActionConflictException>
+      findArtifactPrefixConflicts(ActionGraph actionGraph, Collection<Artifact> artifacts) {
     // No actions in graph -- currently happens only in tests. Special-cased because .next() call
     // below is unconditional.
     if (artifacts.isEmpty()) {
@@ -375,7 +338,7 @@ public final class Actions {
     Arrays.parallelSort(artifactArray, EXEC_PATH_PREFIX_COMPARATOR);
 
     // Keep deterministic ordering of bad actions.
-    Map<ActionAnalysisMetadata, ArtifactPrefixConflictException> badActions = new LinkedHashMap<>();
+    Map<ActionAnalysisMetadata, ActionConflictException> badActions = new LinkedHashMap<>();
     Iterator<Artifact> iter = Iterators.forArray(artifactArray);
 
     // Report an error for every derived artifact which is a strict prefix of another.
@@ -396,35 +359,16 @@ public final class Actions {
         // Check length first so that we only detect strict prefix conflicts. Equal exec paths are
         // possible from shared actions.
         if (pathJ.getPathString().length() > pathI.getPathString().length()
-            && pathJ.startsWith(pathI)) {
-          // TODO(b/159733792): Test this check with compressed tree artifact input.
-          // TODO(b/214351268): Remove this check.
-          // We ignore the artifact prefix conflict between a TreeFileArtifact and its parent
-          // TreeArtifact.
-          // We can only have such a conflict here if the TreeArtifact is generated by an
-          // ActionTemplate and the TreeFileArtifact is generated by an expanded action created at
-          // execution time from the ActionTemplate.
-          if (artifactJ.hasParent() && artifactJ.getParent().equals(artifactI)) {
-            BugReport.sendBugReport(
-                new IllegalStateException(
-                    String.format(
-                        "Impossible state: TreeFileArtifact %s (child of %s) shouldn't be available"
-                            + " before execution",
-                        artifactJ, artifactI)));
-            continue;
-          }
-
+            && pathJ.startsWith(pathI)
+            && !isRunfilesArtifactPair(artifactI, artifactJ)) {
           ActionAnalysisMetadata actionI =
               Preconditions.checkNotNull(actionGraph.getGeneratingAction(artifactI), artifactI);
           ActionAnalysisMetadata actionJ =
               Preconditions.checkNotNull(actionGraph.getGeneratingAction(artifactJ), artifactJ);
-          if (strictConflictChecks || actionI.shouldReportPathPrefixConflict(actionJ)) {
-            ArtifactPrefixConflictException exception =
-                new ArtifactPrefixConflictException(
-                    pathI, pathJ, actionI.getOwner().getLabel(), actionJ.getOwner().getLabel());
-            badActions.put(actionI, exception);
-            badActions.put(actionJ, exception);
-          }
+          ActionConflictException exception =
+              ActionConflictException.createPrefix(artifactI, artifactJ, actionI, actionJ);
+          badActions.put(actionI, exception);
+          badActions.put(actionJ, exception);
         } else { // pathJ didn't have prefix pathI, so no conflict possible for pathI.
           break;
         }
@@ -434,58 +378,18 @@ public final class Actions {
   }
 
   /**
-   * Returns the escaped name for a given relative path as a string. This takes
-   * a short relative path and turns it into a string suitable for use as a
-   * filename. Invalid filename characters are escaped with an '_' + a single
-   * character token.
+   * Returns the escaped name for a given relative path as a string. This takes a short relative
+   * path and turns it into a string suitable for use as a filename. Invalid filename characters are
+   * escaped with an '_' + a single character token.
    */
   public static String escapedPath(String path) {
     return PATH_ESCAPER.escape(path);
   }
 
-  /**
-   * Returns a string that is usable as a unique path component for a label. It is guaranteed
-   * that no other label maps to this string.
-   */
-  public static String escapeLabel(Label label) {
-    return PATH_ESCAPER.escape(label.getPackageName() + ":" + label.getName());
-  }
-
-  /**
-   * Container class for actions, ensuring they have already been checked for conflicts and their
-   * generated artifacts have had owners assigned.
-   */
-  public static class GeneratingActions {
-    public static final GeneratingActions EMPTY =
-        new GeneratingActions(ImmutableList.of(), ImmutableMap.of());
-
-    private final ImmutableList<ActionAnalysisMetadata> actions;
-    private final ImmutableMap<Label, Artifact> artifactsByOutputLabel;
-
-    private GeneratingActions(
-        ImmutableList<ActionAnalysisMetadata> actions,
-        ImmutableMap<Label, Artifact> artifactsByOutputLabel) {
-      this.actions = actions;
-      this.artifactsByOutputLabel = artifactsByOutputLabel;
-    }
-
-    /** Used only for the workspace status action. Does not handle duplicate artifacts. */
-    public static GeneratingActions fromSingleAction(
-        ActionAnalysisMetadata action, ActionLookupKey actionLookupKey) {
-      Preconditions.checkState(actionLookupKey.getLabel() == null, actionLookupKey);
-      ActionLookupData generatingActionKey = ActionLookupData.createUnshareable(actionLookupKey, 0);
-      for (Artifact output : action.getOutputs()) {
-        ((Artifact.DerivedArtifact) output).setGeneratingActionKey(generatingActionKey);
-      }
-      return new GeneratingActions(ImmutableList.of(action), ImmutableMap.of());
-    }
-
-    public ImmutableList<ActionAnalysisMetadata> getActions() {
-      return actions;
-    }
-
-    public ImmutableMap<Label, Artifact> getArtifactsByOutputLabel() {
-      return artifactsByOutputLabel;
+  /** Signals the case of a rule that claims to generate a file that is a source file. */
+  public static class SourceArtifactUsedAsOutputException extends Exception {
+    private SourceArtifactUsedAsOutputException(String message) {
+      super(message);
     }
   }
 
@@ -497,5 +401,28 @@ public final class Actions {
     private ArtifactGeneratedByOtherRuleException(String message) {
       super(message);
     }
+  }
+
+  @Nullable
+  public static ActionAnalysisMetadata getGeneratingAction(WalkableGraph graph, Artifact artifact)
+      throws InterruptedException {
+    if (artifact.isSourceArtifact()) {
+      return null;
+    }
+
+    return getGeneratingAction(graph, (DerivedArtifact) artifact);
+  }
+
+  @Nullable
+  public static ActionAnalysisMetadata getGeneratingAction(
+      WalkableGraph graph, DerivedArtifact artifact) throws InterruptedException {
+    return getAction(graph, artifact.getGeneratingActionKey());
+  }
+
+  public static ActionAnalysisMetadata getAction(
+      WalkableGraph graph, ActionLookupData actionLookupData) throws InterruptedException {
+    var actionLookupKey = actionLookupData.getActionLookupKey();
+    var actionLookupValue = (ActionLookupValue) graph.getValue(actionLookupKey);
+    return actionLookupValue.getActions().get(actionLookupData.getActionIndex());
   }
 }

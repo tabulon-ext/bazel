@@ -14,19 +14,16 @@
 
 package com.google.devtools.build.lib.analysis.platform;
 
+import static com.google.devtools.build.lib.util.StringEncoding.internalToUnicode;
+
 import build.bazel.remote.execution.v2.Platform;
 import build.bazel.remote.execution.v2.Platform.Property;
-import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSortedMap;
 import com.google.common.collect.Ordering;
 import com.google.devtools.build.lib.actions.Spawn;
 import com.google.devtools.build.lib.actions.UserExecException;
 import com.google.devtools.build.lib.remote.options.RemoteOptions;
-import com.google.devtools.build.lib.server.FailureDetails;
-import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
-import com.google.devtools.build.lib.server.FailureDetails.Spawn.Code;
-import com.google.protobuf.TextFormat;
-import com.google.protobuf.TextFormat.ParseException;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -53,7 +50,10 @@ public final class PlatformUtils {
     Platform.Builder builder = Platform.newBuilder();
     for (Map.Entry<String, String> keyValue : executionProperties.entrySet()) {
       Property property =
-          Property.newBuilder().setName(keyValue.getKey()).setValue(keyValue.getValue()).build();
+          Property.newBuilder()
+              .setName(internalToUnicode(keyValue.getKey()))
+              .setValue(internalToUnicode(keyValue.getValue()))
+              .build();
       builder.addProperties(property);
     }
 
@@ -64,64 +64,82 @@ public final class PlatformUtils {
   @Nullable
   public static Platform getPlatformProto(Spawn spawn, @Nullable RemoteOptions remoteOptions)
       throws UserExecException {
+    return getPlatformProto(spawn, remoteOptions, ImmutableMap.of());
+  }
+
+  private static boolean shouldProducePlatformProto(
+      Spawn spawn,
+      SortedMap<String, String> defaultExecProperties,
+      Map<String, String> additionalProperties) {
+    PlatformInfo executionPlatform = spawn.getExecutionPlatform();
+    if (executionPlatform != null) {
+      if (!executionPlatform.execProperties().isEmpty()) {
+        return true;
+      }
+    }
+    if (!spawn.getCombinedExecProperties().isEmpty()) {
+      return true;
+    }
+    if (!defaultExecProperties.isEmpty()) {
+      return true;
+    }
+    if (!additionalProperties.isEmpty()) {
+      return true;
+    }
+    return false;
+  }
+
+  @Nullable
+  public static Platform getPlatformProto(
+      Spawn spawn, @Nullable RemoteOptions remoteOptions, Map<String, String> additionalProperties)
+      throws UserExecException {
     SortedMap<String, String> defaultExecProperties =
         remoteOptions != null
             ? remoteOptions.getRemoteDefaultExecProperties()
             : ImmutableSortedMap.of();
 
-    if (spawn.getExecutionPlatform() == null
-        && spawn.getCombinedExecProperties().isEmpty()
-        && defaultExecProperties.isEmpty()) {
+    if (!shouldProducePlatformProto(spawn, defaultExecProperties, additionalProperties)) {
+      // Execution platform is null or functionally empty
       return null;
     }
 
-    Platform.Builder platformBuilder = Platform.newBuilder();
-
+    Map<String, String> properties = new HashMap<>();
     if (!spawn.getCombinedExecProperties().isEmpty()) {
-      Map<String, String> combinedExecProperties;
       // Apply default exec properties if the execution platform does not already set
       // exec_properties
       if (spawn.getExecutionPlatform() == null
           || spawn.getExecutionPlatform().execProperties().isEmpty()) {
-        combinedExecProperties = new HashMap<>();
-        combinedExecProperties.putAll(defaultExecProperties);
-        combinedExecProperties.putAll(spawn.getCombinedExecProperties());
+        properties.putAll(defaultExecProperties);
+        properties.putAll(spawn.getCombinedExecProperties());
       } else {
-        combinedExecProperties = spawn.getCombinedExecProperties();
+        properties = spawn.getCombinedExecProperties();
       }
+    } else if (spawn.getExecutionPlatform() != null) {
+      properties.putAll(spawn.getExecutionPlatform().execProperties());
+    }
 
-      for (Map.Entry<String, String> entry : combinedExecProperties.entrySet()) {
-        platformBuilder.addPropertiesBuilder().setName(entry.getKey()).setValue(entry.getValue());
-      }
-    } else if (spawn.getExecutionPlatform() != null
-        && !Strings.isNullOrEmpty(spawn.getExecutionPlatform().remoteExecutionProperties())) {
-      // Try and get the platform info from the execution properties.
-      try {
-        TextFormat.getParser()
-            .merge(spawn.getExecutionPlatform().remoteExecutionProperties(), platformBuilder);
-      } catch (ParseException e) {
-        String message =
-            String.format(
-                "Failed to parse remote_execution_properties from platform %s",
-                spawn.getExecutionPlatform().label());
-        throw new UserExecException(
-            e, createFailureDetail(message, Code.INVALID_REMOTE_EXECUTION_PROPERTIES));
-      }
-    } else {
-      for (Map.Entry<String, String> property : defaultExecProperties.entrySet()) {
-        platformBuilder.addProperties(
-            Property.newBuilder().setName(property.getKey()).setValue(property.getValue()).build());
+    if (properties.isEmpty()) {
+      properties = defaultExecProperties;
+    }
+
+    if (!additionalProperties.isEmpty()) {
+      if (properties.isEmpty()) {
+        properties = additionalProperties;
+      } else {
+        // Merge the two maps.
+        properties = new HashMap<>(properties);
+        properties.putAll(additionalProperties);
       }
     }
 
+    Platform.Builder platformBuilder = Platform.newBuilder();
+    for (Map.Entry<String, String> entry : properties.entrySet()) {
+      platformBuilder
+          .addPropertiesBuilder()
+          .setName(internalToUnicode(entry.getKey()))
+          .setValue(internalToUnicode(entry.getValue()));
+    }
     sortPlatformProperties(platformBuilder);
     return platformBuilder.build();
-  }
-
-  private static FailureDetail createFailureDetail(String message, Code detailedCode) {
-    return FailureDetail.newBuilder()
-        .setMessage(message)
-        .setSpawn(FailureDetails.Spawn.newBuilder().setCode(detailedCode))
-        .build();
   }
 }

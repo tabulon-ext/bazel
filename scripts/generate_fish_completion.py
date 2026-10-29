@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#    http:#www.apache.org/licenses/LICENSE-2.0
+#    http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,6 +17,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import os
 import re
 import subprocess
 import tempfile
@@ -67,15 +68,18 @@ end
 class BazelCompletionWriter(object):
   """Constructs a Fish completion script for Bazel."""
 
-  def __init__(self, bazel, output_user_root):
+  def __init__(self, bazel, workspace, output_user_root):
     """Initializes writer state.
 
     Args:
-        bazel: String containing a path the a bazel binary to run.
-        output_user_root: String path to user root directory used for
-          running bazel commands.
+        bazel: String containing a path to the bazel binary to run.
+        workspace: String path to an empty workspace directory to run bazel
+          commands in, so that bazel does not pick up an enclosing workspace.
+        output_user_root: String path to user root directory used for running
+          bazel commands. Must not be inside `workspace`.
     """
     self._bazel = bazel
+    self._workspace = workspace
     self._output_user_root = output_user_root
     self._startup_options = self._get_options_from_bazel(
         ('help', 'startup_options'))
@@ -102,9 +106,16 @@ class BazelCompletionWriter(object):
 
   def _get_bazel_output(self, args):
     return subprocess.check_output(
-        (self._bazel, '--output_user_root={}'.format(self._output_user_root)) +
-        tuple(args),
-        universal_newlines=True)
+        (
+            self._bazel,
+            '--ignore_all_rc_files',
+            '--batch',
+            '--output_user_root={}'.format(self._output_user_root),
+        )
+        + tuple(args),
+        cwd=self._workspace,
+        universal_newlines=True,
+    )
 
   def _get_options_from_bazel(self, bazel_args, **kwargs):
     output = self._get_bazel_output(bazel_args)
@@ -240,7 +251,7 @@ class Arg(object):
     Args:
         output_file: File object to write completions into. Must be open in
           a writable mode.
-        command: String containg the command name (i.e. "bazel").
+        command: String containing the command name (i.e. "bazel").
     """
     args = self._get_complete_args_base(
         command=command, subcommand=self.expected_subcommand)
@@ -312,8 +323,14 @@ class Arg(object):
 def main(argv):
   """Generates fish completion using provided flags."""
   del argv  # Unused.
-  with tempfile.TemporaryDirectory() as output_user_root:
-    writer = BazelCompletionWriter(FLAGS.bazel, output_user_root)
+  with tempfile.TemporaryDirectory() as tmpdir:
+    workspace = os.path.join(tmpdir, 'workspace')
+    output_user_root = os.path.join(tmpdir, 'root')
+    os.mkdir(workspace)
+    open(os.path.join(workspace, 'MODULE.bazel'), 'w').close()
+    writer = BazelCompletionWriter(
+        os.path.abspath(FLAGS.bazel), workspace, output_user_root
+    )
     with open(FLAGS.output, mode='w') as output:
       writer.write_completion(output)
 

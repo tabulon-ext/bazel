@@ -17,8 +17,7 @@ import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;
 import com.google.devtools.build.lib.supplier.InterruptibleSupplier;
 import com.google.devtools.build.lib.supplier.MemoizingInterruptibleSupplier;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
-import java.util.Collection;
-import java.util.Map;
+import java.util.List;
 import javax.annotation.Nullable;
 
 /**
@@ -34,42 +33,65 @@ import javax.annotation.Nullable;
  */
 @ThreadSafe
 public interface ProcessableGraph extends QueryableGraph {
+
   /** Remove the value with given name from the graph. */
   void remove(SkyKey key);
-  /**
-   * Like {@link QueryableGraph#getBatch}, except it creates a new node for each key not already
-   * present in the graph. Thus, the returned map will have an entry for each key in {@code keys}.
-   *
-   * @param requestor if non-{@code null}, the node on behalf of which the given {@code keys} are
-   *     being requested.
-   * @param reason the reason the nodes are being requested.
-   */
-  Map<SkyKey, ? extends NodeEntry> createIfAbsentBatch(
-      @Nullable SkyKey requestor, Reason reason, Iterable<SkyKey> keys) throws InterruptedException;
 
   /**
-   * Like {@link QueryableGraph#getBatchAsync}, except it creates a new node for each key not
-   * already present in the graph. Thus, the returned map will have an entry for each key in {@code
-   * keys}.
+   * Like {@link QueryableGraph#getBatch}, except creates a new node for each key not already
+   * present in the graph.
+   *
+   * <p>By the time this method returns, nodes are guaranteed to have been created if necessary for
+   * each requested key. It is not necessary to call {@link NodeBatch#get} to trigger node creation.
+   *
+   * <p>Calling {@link NodeBatch#get} on the returned batch will never return {@code null} for any
+   * key in {@code keys}. Even if there is an intervening call to {@link #remove}, the call to
+   * {@link NodeBatch#get} will re-create a {@link NodeEntry} if necessary.
    *
    * @param requestor if non-{@code null}, the node on behalf of which the given {@code keys} are
    *     being requested.
    * @param reason the reason the nodes are being requested.
    */
   @CanIgnoreReturnValue
-  default InterruptibleSupplier<Map<SkyKey, ? extends NodeEntry>> createIfAbsentBatchAsync(
+  NodeBatch createIfAbsentBatch(
+      @Nullable SkyKey requestor, Reason reason, Iterable<? extends SkyKey> keys)
+      throws InterruptedException;
+
+  /**
+   * Like {@link QueryableGraph#getBatchAsync}, except creates a new node for each key not already
+   * present in the graph. Thus, calling {@link NodeBatch#get} on the returned batch will never
+   * return {@code null} for any of the requested {@code keys}.
+   *
+   * @param requestor if non-{@code null}, the node on behalf of which the given {@code keys} are
+   *     being requested.
+   * @param reason the reason the nodes are being requested.
+   */
+  @CanIgnoreReturnValue
+  default InterruptibleSupplier<NodeBatch> createIfAbsentBatchAsync(
       @Nullable SkyKey requestor, Reason reason, Iterable<SkyKey> keys) {
     return MemoizingInterruptibleSupplier.of(() -> createIfAbsentBatch(requestor, reason, keys));
   }
+
+  /**
+   * Cancel all in-flight graph lookups. This may be a no-op for many graph implementations, but is
+   * particularly useful to clean up pending work when graph lookups consist of I/O operations or
+   * RPCs.
+   */
+  default void cancelLookups() {}
 
   /**
    * Optional optimization: graph may use internal knowledge to filter out keys in {@code deps} that
    * have not been recomputed since the last computation of {@code parent}. When determining if
    * {@code parent} needs to be re-evaluated, this may be used to avoid unnecessary graph accesses.
    *
-   * <p>Returns deps that may have new values since the node of {@code parent} was last computed,
-   * and therefore which may force re-evaluation of the node of {@code parent}.
+   * <p>If this graph partakes in the optional optimization, returns deps that may have new values
+   * since the node of {@code parent} was last computed, and therefore which may force re-evaluation
+   * of the node of {@code parent}. Otherwise, returns {@link DepsReport#NO_INFORMATION}.
+   *
+   * @param parent the key in {@link NodeEntry.LifecycleState#CHECK_DEPENDENCIES}
+   * @param deps the {@linkplain NodeEntry#getNextDirtyDirectDeps next dirty dep group} of {@code
+   *     parent}; only called when all previous dep groups were clean, so it is known that {@code
+   *     deps} are still dependencies of {@code parent} on the incremental build
    */
-  DepsReport analyzeDepsDoneness(SkyKey parent, Collection<SkyKey> deps)
-      throws InterruptedException;
+  DepsReport analyzeDepsDoneness(SkyKey parent, List<SkyKey> deps) throws InterruptedException;
 }

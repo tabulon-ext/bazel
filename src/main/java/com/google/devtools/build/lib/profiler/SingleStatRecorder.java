@@ -18,22 +18,22 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Range;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;
 import com.google.devtools.build.lib.profiler.MetricData.HistogramElement;
-import java.util.concurrent.atomic.AtomicInteger;
+import com.google.devtools.build.lib.skybridge.ScOnly;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAccumulator;
 
 /**
- * A stat recorder that can record time histograms, count of calls, average time, Std. Deviation
- * and max time.
+ * A stat recorder that can record time histograms, count of calls, average time, Std. Deviation and
+ * max time.
  */
+@ScOnly
 @ThreadSafe
 public class SingleStatRecorder implements StatRecorder {
 
   private final int buckets;
   private final Object description;
   private final AtomicIntegerArray histogram;
-  private final AtomicInteger count = new AtomicInteger(0);
   private final AtomicLong sum = new AtomicLong(0);
   private final AtomicLong sumSquared = new AtomicLong(0);
   private final LongAccumulator max = new LongAccumulator(Math::max, -1);
@@ -57,7 +57,10 @@ public class SingleStatRecorder implements StatRecorder {
       from = to;
     }
     result.add(new HistogramElement(Range.atLeast(from), histogram.get(histogram.length() - 1)));
-    int n = count.get();
+    int n = 0;
+    for (int i = 0; i < histogram.length(); i++) {
+      n += histogram.get(i);
+    }
     double stddev;
     if (n == 1) {
       stddev = 0;
@@ -65,13 +68,12 @@ public class SingleStatRecorder implements StatRecorder {
       stddev = Math.sqrt((sumSquared.longValue() - sum.get() * sum.doubleValue() / n) / n);
     }
     return new MetricData(
-        description, result.build(), count.get(), sum.doubleValue() / n, stddev, max.intValue());
+        description, result.build(), n, sum.doubleValue() / n, stddev, max.intValue());
   }
 
   @Override
   public void addStat(int duration, Object obj) {
     int histogramBucket = Math.min(32 - Integer.numberOfLeadingZeros(duration), buckets - 1);
-    count.incrementAndGet();
     sum.addAndGet(duration);
     sumSquared.addAndGet(duration * duration);
     max.accumulate(duration);

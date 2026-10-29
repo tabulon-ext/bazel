@@ -29,10 +29,12 @@ import com.google.devtools.build.lib.starlarkbuildapi.LateBoundDefaultApi;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.Map;
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.Immutable;
 import net.starlark.java.annot.StarlarkAnnotations;
 import net.starlark.java.annot.StarlarkBuiltin;
 import net.starlark.java.eval.Printer;
+import net.starlark.java.eval.StarlarkSemantics;
 
 /**
  * An implementation of {@link LateBoundDefault} which obtains a late-bound attribute value (of type
@@ -65,14 +67,16 @@ public class StarlarkLateBoundDefault<FragmentT> extends AbstractLabelLateBoundD
   }
 
   /** Returns the {@link StarlarkConfigurationField} annotation corresponding to this method. */
+  @Nullable
   private static Label getDefaultLabel(
       StarlarkConfigurationField annotation, RepositoryName toolsRepository) {
     if (annotation.defaultLabel().isEmpty()) {
       return null;
     }
-    Label defaultLabel = annotation.defaultInToolRepository()
-        ? Label.parseAbsoluteUnchecked(toolsRepository + annotation.defaultLabel())
-        : Label.parseAbsoluteUnchecked(annotation.defaultLabel());
+    Label defaultLabel =
+        annotation.defaultInToolRepository()
+            ? Label.parseCanonicalUnchecked(toolsRepository + annotation.defaultLabel())
+            : Label.parseCanonicalUnchecked(annotation.defaultLabel());
     return defaultLabel;
   }
 
@@ -118,7 +122,7 @@ public class StarlarkLateBoundDefault<FragmentT> extends AbstractLabelLateBoundD
   }
 
   @Override
-  public void repr(Printer printer) {
+  public void repr(Printer printer, StarlarkSemantics semantics) {
     printer.append("<late-bound default>");
   }
 
@@ -147,10 +151,9 @@ public class StarlarkLateBoundDefault<FragmentT> extends AbstractLabelLateBoundD
     public boolean equals(Object object) {
       if (object == this) {
         return true;
-      } else if (!(object instanceof CacheKey)) {
+      } else if (!(object instanceof CacheKey cacheKey)) {
         return false;
       } else {
-        CacheKey cacheKey = (CacheKey) object;
         return fragmentClass.equals(cacheKey.fragmentClass)
             && toolsRepository.equals(cacheKey.toolsRepository);
       }

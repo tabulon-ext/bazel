@@ -15,19 +15,43 @@
 
 package com.google.devtools.build.lib.bazel.bzlmod;
 
+import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static com.google.common.truth.Truth.assertThat;
-import static com.google.common.truth.Truth8.assertThat;
 import static com.google.devtools.build.lib.bazel.bzlmod.BzlmodTestUtil.createModuleKey;
+import static com.google.devtools.build.lib.util.StringEncoding.unicodeToInternal;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assume.assumeTrue;
 
 import com.google.common.base.Suppliers;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Maps;
+import com.google.common.eventbus.Subscribe;
+import com.google.common.hash.Hashing;
+import com.google.devtools.build.lib.authandtls.BasicHttpAuthenticationEncoder;
+import com.google.devtools.build.lib.authandtls.Netrc;
+import com.google.devtools.build.lib.authandtls.NetrcCredentials;
+import com.google.devtools.build.lib.authandtls.NetrcParser;
+import com.google.devtools.build.lib.bazel.repository.RepositoryOptions.LockfileMode;
+import com.google.devtools.build.lib.bazel.repository.cache.DownloadCache;
+import com.google.devtools.build.lib.bazel.repository.downloader.Checksum;
+import com.google.devtools.build.lib.bazel.repository.downloader.DownloadManager;
 import com.google.devtools.build.lib.bazel.repository.downloader.HttpDownloader;
 import com.google.devtools.build.lib.testutil.FoundationTestCase;
+import com.google.devtools.build.lib.util.OS;
+import com.google.devtools.build.lib.vfs.PathFragment;
+import java.io.ByteArrayInputStream;
 import java.io.File;
+import java.io.IOException;
 import java.io.Writer;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -38,15 +62,38 @@ import org.junit.runners.JUnit4;
 /** Tests for {@link IndexRegistry}. */
 @RunWith(JUnit4.class)
 public class IndexRegistryTest extends FoundationTestCase {
-  @Rule public final TestHttpServer server = new TestHttpServer();
+  private static class EventRecorder {
+    private final List<RegistryFileDownloadEvent> downloadEvents = new ArrayList<>();
+
+    @Subscribe
+    public void onRegistryFileDownloadEvent(RegistryFileDownloadEvent downloadEvent) {
+      downloadEvents.add(downloadEvent);
+    }
+
+    public ImmutableMap<String, Optional<Checksum>> getRecordedHashes() {
+      return downloadEvents.stream()
+          .collect(
+              toImmutableMap(RegistryFileDownloadEvent::uri, RegistryFileDownloadEvent::checksum));
+    }
+  }
+
+  private final String authToken = BasicHttpAuthenticationEncoder.encode("rinne", "rinnepass");
+  private DownloadManager downloadManager;
+  private EventRecorder eventRecorder;
+  @Rule public final TestHttpServer server = new TestHttpServer(authToken);
   @Rule public final TemporaryFolder tempFolder = new TemporaryFolder();
 
-  private RegistryFactory registryFactory;
+  private RegistryFactoryImpl registryFactory;
+  private DownloadCache downloadCache;
 
   @Before
   public void setUp() throws Exception {
-    registryFactory =
-        new RegistryFactoryImpl(new HttpDownloader(), Suppliers.ofInstance(ImmutableMap.of()));
+    eventRecorder = new EventRecorder();
+    eventBus.register(eventRecorder);
+    downloadCache = new DownloadCache();
+    HttpDownloader httpDownloader = new HttpDownloader();
+    downloadManager = new DownloadManager(downloadCache, httpDownloader, httpDownloader, reporter);
+    registryFactory = new RegistryFactoryImpl(Suppliers.ofInstance(ImmutableMap.of()));
   }
 
   @Test
@@ -54,10 +101,58 @@ public class IndexRegistryTest extends FoundationTestCase {
     server.serve("/myreg/modules/foo/1.0/MODULE.bazel", "lol");
     server.start();
 
-    Registry registry = registryFactory.getRegistryWithUrl(server.getUrl() + "/myreg");
-    assertThat(registry.getModuleFile(createModuleKey("foo", "1.0"), reporter))
-        .hasValue("lol".getBytes(UTF_8));
-    assertThat(registry.getModuleFile(createModuleKey("bar", "1.0"), reporter)).isEmpty();
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl() + "/myreg",
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    assertThat(registry.getModuleFile(createModuleKey("foo", "1.0"), reporter, downloadManager))
+        .isEqualTo(
+            ModuleFile.create(
+                "lol".getBytes(UTF_8), server.getUrl() + "/myreg/modules/foo/1.0/MODULE.bazel"));
+    assertThrows(
+        Registry.NotFoundException.class,
+        () -> registry.getModuleFile(createModuleKey("bar", "1.0"), reporter, downloadManager));
+  }
+
+  @Test
+  public void testHttpUrlWithNetrcCreds() throws Exception {
+    server.serve("/myreg/modules/foo/1.0/MODULE.bazel", "lol".getBytes(UTF_8), true);
+    server.start();
+    Netrc netrc =
+        NetrcParser.parseAndClose(
+            new ByteArrayInputStream(
+                "machine [::1] login rinne password rinnepass\n".getBytes(UTF_8)));
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl() + "/myreg",
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+
+    var e =
+        assertThrows(
+            IOException.class,
+            () -> registry.getModuleFile(createModuleKey("foo", "1.0"), reporter, downloadManager));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Failed to fetch registry file %s: GET returned 401 Unauthorized"
+                .formatted(server.getUrl() + "/myreg/modules/foo/1.0/MODULE.bazel"));
+
+    downloadManager.setNetrcCreds(new NetrcCredentials(netrc));
+    assertThat(registry.getModuleFile(createModuleKey("foo", "1.0"), reporter, downloadManager))
+        .isEqualTo(
+            ModuleFile.create(
+                "lol".getBytes(UTF_8), server.getUrl() + "/myreg/modules/foo/1.0/MODULE.bazel"));
+    assertThrows(
+        Registry.NotFoundException.class,
+        () -> registry.getModuleFile(createModuleKey("bar", "1.0"), reporter, downloadManager));
   }
 
   @Test
@@ -69,15 +164,375 @@ public class IndexRegistryTest extends FoundationTestCase {
     }
 
     Registry registry =
-        registryFactory.getRegistryWithUrl(
-            new File(tempFolder.getRoot(), "fakereg").toURI().toString());
-    assertThat(registry.getModuleFile(createModuleKey("foo", "1.0"), reporter))
-        .hasValue("lol".getBytes(UTF_8));
-    assertThat(registry.getModuleFile(createModuleKey("bar", "1.0"), reporter)).isEmpty();
+        registryFactory.createRegistry(
+            new File(tempFolder.getRoot(), "fakereg").toURI().toString(),
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    assertThat(registry.getModuleFile(createModuleKey("foo", "1.0"), reporter, downloadManager))
+        .isEqualTo(ModuleFile.create("lol".getBytes(UTF_8), file.toURI().toString()));
+    assertThrows(
+        Registry.NotFoundException.class,
+        () -> registry.getModuleFile(createModuleKey("bar", "1.0"), reporter, downloadManager));
   }
 
   @Test
-  public void testGetRepoSpec() throws Exception {
+  public void testGetArchiveRepoSpec() throws Exception {
+    server.serve(
+        "/bazel_registry.json",
+        "{",
+        "  \"mirrors\": [",
+        "    \"https://mirror.bazel.build/\",",
+        "    \"file:///home/bazel/mymirror/\"",
+        "  ]",
+        "}");
+    server.serve(
+        "/modules/foo/1.0/source.json",
+        "{",
+        "  \"url\": \"http://mysite.com/thing.zip\",",
+        "  \"mirror_urls\":"
+            + " [\"http://my.mirror/mysite.com/thing.zip\",\"http://another.mirror/mysite.com/thing.zip\"],",
+        "  \"integrity\": \"sha256-blah\",",
+        "  \"strip_prefix\": \"pref\"",
+        "}");
+    server.serve("/modules/foo/1.0/MODULE.bazel", "module(name = \"foo\", version = \"1.0\")");
+    server.serve(
+        "/modules/bar/2.0/source.json",
+        "{",
+        "  \"url\": \"https://example.com/archive.jar?with=query\",",
+        "  \"integrity\": \"sha256-bleh\",",
+        "  \"patches\": {",
+        "    \"1.fix-this.patch\": \"sha256-lol\",",
+        "    \"2.fix-that.patch\": \"sha256-kek\"",
+        "  },",
+        "  \"patch_strip\": 3",
+        "}");
+    server.serve("/modules/bar/2.0/MODULE.bazel", "module(name = \"bar\", version = \"2.0\")");
+    server.serve(
+        "/modules/baz/3.0/source.json",
+        """
+        {
+            "url": "https://example.com/archive.jar?with=query",
+            "integrity": "sha256-bleh",
+            "overlay": {
+                "BUILD.bazel": "sha256-bleh-overlay"
+            }
+        }
+        """);
+    server.serve("/modules/baz/3.0/MODULE.bazel", "module(name = \"baz\", version = \"3.0\")");
+    server.start();
+    var moduleFileRegistryHashes =
+        ImmutableMap.of(
+            server.getUrl() + "/modules/foo/1.0/MODULE.bazel",
+            Optional.of(sha256("module(name = \"foo\", version = \"1.0\")")),
+            server.getUrl() + "/modules/baz/3.0/MODULE.bazel",
+            Optional.of(sha256("module(name = \"baz\", version = \"3.0\")")),
+            server.getUrl() + "/modules/bar/2.0/MODULE.bazel",
+            Optional.of(sha256("module(name = \"bar\", version = \"2.0\")")));
+
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of("https://my.mirror"));
+    assertThat(
+            registry.getRepoSpec(
+                createModuleKey("foo", "1.0"), moduleFileRegistryHashes, reporter, downloadManager))
+        .isEqualTo(
+            new ArchiveRepoSpecBuilder()
+                .setUrls(
+                    ImmutableList.of(
+                        "https://my.mirror/mysite.com/thing.zip",
+                        "https://mirror.bazel.build/mysite.com/thing.zip",
+                        "file:///home/bazel/mymirror/mysite.com/thing.zip",
+                        "http://mysite.com/thing.zip",
+                        "http://my.mirror/mysite.com/thing.zip",
+                        "http://another.mirror/mysite.com/thing.zip"))
+                .setIntegrity("sha256-blah")
+                .setStripPrefix("pref")
+                .setRemotePatches(ImmutableMap.of())
+                .setOverlay(ImmutableMap.of())
+                .setRemoteModuleFile(
+                    new ArchiveRepoSpecBuilder.RemoteFile(
+                        sha256("module(name = \"foo\", version = \"1.0\")")
+                            .toSubresourceIntegrity(),
+                        ImmutableList.of(server.getUrl() + "/modules/foo/1.0/MODULE.bazel")))
+                .setRemotePatchStrip(0)
+                .build());
+    assertThat(
+            registry.getRepoSpec(
+                createModuleKey("bar", "2.0"), moduleFileRegistryHashes, reporter, downloadManager))
+        .isEqualTo(
+            new ArchiveRepoSpecBuilder()
+                .setUrls(
+                    ImmutableList.of(
+                        "https://my.mirror/example.com/archive.jar?with=query",
+                        "https://mirror.bazel.build/example.com/archive.jar?with=query",
+                        "file:///home/bazel/mymirror/example.com/archive.jar?with=query",
+                        "https://example.com/archive.jar?with=query"))
+                .setIntegrity("sha256-bleh")
+                .setStripPrefix("")
+                .setRemotePatches(
+                    ImmutableMap.of(
+                        server.getUrl() + "/modules/bar/2.0/patches/1.fix-this.patch", "sha256-lol",
+                        server.getUrl() + "/modules/bar/2.0/patches/2.fix-that.patch",
+                            "sha256-kek"))
+                .setOverlay(ImmutableMap.of())
+                .setRemoteModuleFile(
+                    new ArchiveRepoSpecBuilder.RemoteFile(
+                        sha256("module(name = \"bar\", version = \"2.0\")")
+                            .toSubresourceIntegrity(),
+                        ImmutableList.of(server.getUrl() + "/modules/bar/2.0/MODULE.bazel")))
+                .setRemotePatchStrip(3)
+                .build());
+    assertThat(
+            registry.getRepoSpec(
+                createModuleKey("baz", "3.0"), moduleFileRegistryHashes, reporter, downloadManager))
+        .isEqualTo(
+            new ArchiveRepoSpecBuilder()
+                .setUrls(
+                    ImmutableList.of(
+                        "https://my.mirror/example.com/archive.jar?with=query",
+                        "https://mirror.bazel.build/example.com/archive.jar?with=query",
+                        "file:///home/bazel/mymirror/example.com/archive.jar?with=query",
+                        "https://example.com/archive.jar?with=query"))
+                .setIntegrity("sha256-bleh")
+                .setStripPrefix("")
+                .setRemotePatches(ImmutableMap.of())
+                .setOverlay(
+                    ImmutableMap.of(
+                        "BUILD.bazel",
+                        new ArchiveRepoSpecBuilder.RemoteFile(
+                            "sha256-bleh-overlay",
+                            // URLs in the registry itself are not mirrored.
+                            ImmutableList.of(
+                                server.getUrl() + "/modules/baz/3.0/overlay/BUILD.bazel"))))
+                .setRemoteModuleFile(
+                    new ArchiveRepoSpecBuilder.RemoteFile(
+                        sha256("module(name = \"baz\", version = \"3.0\")")
+                            .toSubresourceIntegrity(),
+                        ImmutableList.of(server.getUrl() + "/modules/baz/3.0/MODULE.bazel")))
+                .setRemotePatchStrip(0)
+                .build());
+  }
+
+  @Test
+  public void testGetArchiveRepoSpec_nonAscii() throws Exception {
+    server.serve(
+        "/régistry€/modules/foo/1.0/source.json",
+        """
+        {
+          "url": "https://example.com/café€.zip",
+          "mirror_urls": ["https://mirror.example/café€.zip"],
+          "integrity": "sha256-blah",
+          "strip_prefix": "café€-1.0",
+          "patches": {
+            "fïx.patch": "sha256-lol"
+          },
+          "overlay": {
+            "dïr/BUILD.bazel": "sha256-bleh-overlay"
+          }
+        }
+        """);
+    server.serve(
+        "/régistry€/modules/foo/1.0/MODULE.bazel", "module(name = \"foo\", version = \"1.0\")");
+    server.start();
+    String registryUrl = unicodeToInternal(server.getUrl() + "/régistry€");
+    String moduleFileUrl = registryUrl + "/modules/foo/1.0/MODULE.bazel";
+
+    Registry registry =
+        registryFactory.createRegistry(
+            registryUrl,
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of(unicodeToInternal("https://my.mirror/ä")));
+    assertThat(registry.getUrl()).isEqualTo(registryUrl);
+    assertThat(registry.getModuleFile(createModuleKey("foo", "1.0"), reporter, downloadManager))
+        .isEqualTo(
+            ModuleFile.create(
+                "module(name = \"foo\", version = \"1.0\")".getBytes(UTF_8), moduleFileUrl));
+    assertThat(
+            registry.getRepoSpec(
+                createModuleKey("foo", "1.0"),
+                ImmutableMap.of(
+                    moduleFileUrl,
+                    Optional.of(sha256("module(name = \"foo\", version = \"1.0\")"))),
+                reporter,
+                downloadManager))
+        .isEqualTo(
+            new ArchiveRepoSpecBuilder()
+                .setUrls(
+                    ImmutableList.of(
+                        unicodeToInternal("https://my.mirror/ä/example.com/café€.zip"),
+                        unicodeToInternal("https://example.com/café€.zip"),
+                        unicodeToInternal("https://mirror.example/café€.zip")))
+                .setIntegrity("sha256-blah")
+                .setStripPrefix(unicodeToInternal("café€-1.0"))
+                .setRemotePatches(
+                    ImmutableMap.of(
+                        registryUrl + unicodeToInternal("/modules/foo/1.0/patches/fïx.patch"),
+                        "sha256-lol"))
+                .setOverlay(
+                    ImmutableMap.of(
+                        unicodeToInternal("dïr/BUILD.bazel"),
+                        new ArchiveRepoSpecBuilder.RemoteFile(
+                            "sha256-bleh-overlay",
+                            ImmutableList.of(
+                                registryUrl
+                                    + unicodeToInternal(
+                                        "/modules/foo/1.0/overlay/dïr/BUILD.bazel")))))
+                .setRemoteModuleFile(
+                    new ArchiveRepoSpecBuilder.RemoteFile(
+                        sha256("module(name = \"foo\", version = \"1.0\")")
+                            .toSubresourceIntegrity(),
+                        ImmutableList.of(moduleFileUrl)))
+                .setRemotePatchStrip(0)
+                .build());
+  }
+
+  @Test
+  public void testGetGitRepoSpec() throws Exception {
+    server.serve(
+        "/bazel_registry.json",
+        """
+        {
+          "mirrors": [
+            "https://mirror.bazel.build/",
+            "file:///home/bazel/mymirror/"
+          ]
+        }
+        """);
+    server.serve(
+        "/modules/foo/1.0/source.json",
+        """
+        {
+            "type": "git_repository",
+            "remote": "https://github.com/raspberrypi/pico-sdk.git",
+            "commit": "4b6e647590213f253f2789ad9026df1d00f38c5d",
+            "patches": {
+                "foo.patch": "sha256-totallyarealhash"
+            },
+            "patch_strip": 1,
+            "add_prefix": "addedSubfolder"
+        }
+        """);
+    server.serve("/modules/foo/1.0/MODULE.bazel", "module(name = \"foo\", version = \"1.0\")");
+    server.start();
+    var moduleFileRegistryHashes =
+        ImmutableMap.of(
+            server.getUrl() + "/modules/foo/1.0/MODULE.bazel",
+            Optional.of(sha256("module(name = \"foo\", version = \"1.0\")")));
+
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    assertThat(
+            registry.getRepoSpec(
+                createModuleKey("foo", "1.0"), moduleFileRegistryHashes, reporter, downloadManager))
+        .isEqualTo(
+            new GitRepoSpecBuilder()
+                .setRemote("https://github.com/raspberrypi/pico-sdk.git")
+                .setCommit("4b6e647590213f253f2789ad9026df1d00f38c5d")
+                .setInitSubmodules(false)
+                .setVerbose(false)
+                .setAddPrefix("addedSubfolder")
+                .setRemoteModuleFile(
+                    new ArchiveRepoSpecBuilder.RemoteFile(
+                        sha256("module(name = \"foo\", version = \"1.0\")")
+                            .toSubresourceIntegrity(),
+                        ImmutableList.of(server.getUrl() + "/modules/foo/1.0/MODULE.bazel")))
+                .setRemotePatches(
+                    ImmutableMap.of(
+                        server.getUrl() + "/modules/foo/1.0/patches/foo.patch",
+                        "sha256-totallyarealhash"))
+                .setRemotePatchStrip(1)
+                .build());
+  }
+
+  @Test
+  public void testGetLocalPathRepoSpec() throws Exception {
+    server.serve("/bazel_registry.json", "{", "  \"module_base_path\": \"/hello/foo\"", "}");
+    server.serve(
+        "/modules/foo/1.0/source.json",
+        "{",
+        "  \"type\": \"local_path\",",
+        "  \"path\": \"../bar/project_x\"",
+        "}");
+    server.start();
+
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    assertThat(
+            registry.getRepoSpec(
+                createModuleKey("foo", "1.0"), ImmutableMap.of(), reporter, downloadManager))
+        .isEqualTo(LocalPathRepoSpecs.create("/hello/bar/project_x"));
+  }
+
+  @Test
+  public void testGetRepoInvalidRegistryJsonSpec() throws Exception {
+    server.serve("/bazel_registry.json", "", "", "", "");
+    server.start();
+    server.serve(
+        "/modules/foo/1.0/source.json",
+        "{",
+        "  \"url\": \"http://mysite.com/thing.zip\",",
+        "  \"integrity\": \"sha256-blah\",",
+        "  \"strip_prefix\": \"pref\"",
+        "}");
+    server.serve("/modules/foo/1.0/MODULE.bazel", "module(name = \"foo\", version = \"1.0\")");
+
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    assertThat(
+            registry.getRepoSpec(
+                createModuleKey("foo", "1.0"),
+                ImmutableMap.of(
+                    server.getUrl() + "/modules/foo/1.0/MODULE.bazel",
+                    Optional.of(sha256("module(name = \"foo\", version = \"1.0\")"))),
+                reporter,
+                downloadManager))
+        .isEqualTo(
+            new ArchiveRepoSpecBuilder()
+                .setUrls(ImmutableList.of("http://mysite.com/thing.zip"))
+                .setIntegrity("sha256-blah")
+                .setStripPrefix("pref")
+                .setRemotePatches(ImmutableMap.of())
+                .setOverlay(ImmutableMap.of())
+                .setRemoteModuleFile(
+                    new ArchiveRepoSpecBuilder.RemoteFile(
+                        sha256("module(name = \"foo\", version = \"1.0\")")
+                            .toSubresourceIntegrity(),
+                        ImmutableList.of(server.getUrl() + "/modules/foo/1.0/MODULE.bazel")))
+                .setRemotePatchStrip(0)
+                .build());
+  }
+
+  @Test
+  public void testGetRepoInvalidModuleJsonSpec() throws Exception {
     server.serve(
         "/bazel_registry.json",
         "{",
@@ -91,53 +546,728 @@ public class IndexRegistryTest extends FoundationTestCase {
         "{",
         "  \"url\": \"http://mysite.com/thing.zip\",",
         "  \"integrity\": \"sha256-blah\",",
-        "  \"strip_prefix\": \"pref\"",
-        "}");
-    server.serve(
-        "/modules/bar/2.0/source.json",
-        "{",
-        "  \"url\": \"https://example.com/archive.jar?with=query\",",
-        "  \"integrity\": \"sha256-bleh\",",
-        "  \"patches\": {",
-        "    \"1.fix-this.patch\": \"sha256-lol\",",
-        "    \"2.fix-that.patch\": \"sha256-kek\"",
-        "  },",
-        "  \"patch_strip\": 3",
+        "  \"strip_prefix\": \"pref\",",
         "}");
     server.start();
 
-    Registry registry = registryFactory.getRegistryWithUrl(server.getUrl());
-    assertThat(registry.getRepoSpec(createModuleKey("foo", "1.0"), "foorepo", reporter))
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    assertThrows(
+        IOException.class,
+        () ->
+            registry.getRepoSpec(
+                createModuleKey("foo", "1.0"), ImmutableMap.of(), reporter, downloadManager));
+  }
+
+  @Test
+  public void testGetYankedVersion() throws Exception {
+    server.serve(
+        "/modules/red-pill/metadata.json",
+        "{\n"
+            + "    'homepage': 'https://docs.matrix.org/red-pill',\n"
+            + "    'maintainers': [\n"
+            + "        {\n"
+            + "            'email': 'neo@matrix.org',\n"
+            + "            'github': 'neo',\n"
+            + "            'name': 'Neo'\n"
+            + "        }\n"
+            + "    ],\n"
+            + "    'versions': [\n"
+            + "        '1.0',\n"
+            + "        '2.0'\n"
+            + "    ],\n"
+            + "    'yanked_versions': {"
+            + "        '1.0': 'red-pill 1.0 is yanked due to CVE-2000-101, please upgrade to 2.0'\n"
+            + "    }\n"
+            + "}");
+    server.start();
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    Optional<ImmutableMap<Version, String>> yankedVersion =
+        registry.getYankedVersions("red-pill", reporter, downloadManager);
+    assertThat(yankedVersion)
+        .hasValue(
+            ImmutableMap.of(
+                Version.parse("1.0"),
+                "red-pill 1.0 is yanked due to CVE-2000-101, please upgrade to 2.0"));
+  }
+
+  @Test
+  public void testArchiveWithExplicitType() throws Exception {
+    server.serve(
+        "/modules/archive_type/1.0/source.json",
+        "{",
+        "  \"url\": \"https://mysite.com/thing?format=zip\",",
+        "  \"integrity\": \"sha256-blah\",",
+        "  \"archive_type\": \"zip\"",
+        "}");
+    server.serve(
+        "/modules/archive_type/1.0/MODULE.bazel",
+        "module(name = \"archive_type\", version = \"1.0\")");
+    server.start();
+
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    assertThat(
+            registry.getRepoSpec(
+                createModuleKey("archive_type", "1.0"),
+                ImmutableMap.of(
+                    server.getUrl() + "/modules/archive_type/1.0/MODULE.bazel",
+                    Optional.of(sha256("module(name = \"archive_type\", version = \"1.0\")"))),
+                reporter,
+                downloadManager))
         .isEqualTo(
             new ArchiveRepoSpecBuilder()
-                .setRepoName("foorepo")
-                .setUrls(
-                    ImmutableList.of(
-                        "https://mirror.bazel.build/mysite.com/thing.zip",
-                        "file:///home/bazel/mymirror/mysite.com/thing.zip",
-                        "http://mysite.com/thing.zip"))
+                .setUrls(ImmutableList.of("https://mysite.com/thing?format=zip"))
                 .setIntegrity("sha256-blah")
-                .setStripPrefix("pref")
-                .setRemotePatches(ImmutableMap.of())
-                .setRemotePatchStrip(0)
-                .build());
-    assertThat(registry.getRepoSpec(createModuleKey("bar", "2.0"), "barrepo", reporter))
-        .isEqualTo(
-            new ArchiveRepoSpecBuilder()
-                .setRepoName("barrepo")
-                .setUrls(
-                    ImmutableList.of(
-                        "https://mirror.bazel.build/example.com/archive.jar?with=query",
-                        "file:///home/bazel/mymirror/example.com/archive.jar?with=query",
-                        "https://example.com/archive.jar?with=query"))
-                .setIntegrity("sha256-bleh")
                 .setStripPrefix("")
-                .setRemotePatches(
-                    ImmutableMap.<String, String>of(
-                        server.getUrl() + "/modules/bar/2.0/patches/1.fix-this.patch", "sha256-lol",
-                        server.getUrl() + "/modules/bar/2.0/patches/2.fix-that.patch",
-                            "sha256-kek"))
-                .setRemotePatchStrip(3)
+                .setRemotePatches(ImmutableMap.of())
+                .setOverlay(ImmutableMap.of())
+                .setRemoteModuleFile(
+                    new ArchiveRepoSpecBuilder.RemoteFile(
+                        sha256("module(name = \"archive_type\", version = \"1.0\")")
+                            .toSubresourceIntegrity(),
+                        ImmutableList.of(
+                            server.getUrl() + "/modules/archive_type/1.0/MODULE.bazel")))
+                .setRemotePatchStrip(0)
+                .setArchiveType("zip")
                 .build());
+  }
+
+  @Test
+  public void testGetModuleFileChecksums() throws Exception {
+    downloadCache.setPath(scratch.dir("cache"));
+
+    server.serve("/myreg/modules/foo/1.0/MODULE.bazel", "old");
+    server.serve("/myreg/modules/foo/2.0/MODULE.bazel", "new");
+    server.start();
+
+    var knownFiles =
+        ImmutableMap.of(
+            server.getUrl() + "/myreg/modules/foo/1.0/MODULE.bazel",
+            Optional.of(sha256("old")),
+            server.getUrl() + "/myreg/modules/unused/1.0/MODULE.bazel",
+            Optional.of(sha256("unused")));
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl() + "/myreg",
+            LockfileMode.UPDATE,
+            knownFiles,
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    assertThat(registry.getModuleFile(createModuleKey("foo", "1.0"), reporter, downloadManager))
+        .isEqualTo(
+            ModuleFile.create(
+                "old".getBytes(UTF_8), server.getUrl() + "/myreg/modules/foo/1.0/MODULE.bazel"));
+    assertThat(registry.getModuleFile(createModuleKey("foo", "2.0"), reporter, downloadManager))
+        .isEqualTo(
+            ModuleFile.create(
+                "new".getBytes(UTF_8), server.getUrl() + "/myreg/modules/foo/2.0/MODULE.bazel"));
+    var e =
+        assertThrows(
+            Registry.NotFoundException.class,
+            () -> registry.getModuleFile(createModuleKey("bar", "1.0"), reporter, downloadManager));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(server.getUrl() + "/myreg/modules/bar/1.0/MODULE.bazel: not found");
+
+    var recordedChecksums = eventRecorder.getRecordedHashes();
+    assertThat(
+            Maps.transformValues(
+                recordedChecksums, maybeChecksum -> maybeChecksum.map(Checksum::toString)))
+        .containsExactly(
+            server.getUrl() + "/myreg/modules/foo/1.0/MODULE.bazel",
+            Optional.of(sha256("old").toString()),
+            server.getUrl() + "/myreg/modules/foo/2.0/MODULE.bazel",
+            Optional.of(sha256("new").toString()),
+            server.getUrl() + "/myreg/modules/bar/1.0/MODULE.bazel",
+            Optional.empty())
+        .inOrder();
+
+    Registry registry2 =
+        registryFactory.createRegistry(
+            server.getUrl() + "/myreg",
+            LockfileMode.UPDATE,
+            recordedChecksums,
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    // Test that the recorded hashes are used for repo cache hits even when the server content
+    // changes.
+    server.unserve("/myreg/modules/foo/1.0/MODULE.bazel");
+    server.unserve("/myreg/modules/foo/2.0/MODULE.bazel");
+    server.serve("/myreg/modules/bar/1.0/MODULE.bazel", "no longer 404");
+    assertThat(registry2.getModuleFile(createModuleKey("foo", "1.0"), reporter, downloadManager))
+        .isEqualTo(
+            ModuleFile.create(
+                "old".getBytes(UTF_8), server.getUrl() + "/myreg/modules/foo/1.0/MODULE.bazel"));
+    assertThat(registry2.getModuleFile(createModuleKey("foo", "2.0"), reporter, downloadManager))
+        .isEqualTo(
+            ModuleFile.create(
+                "new".getBytes(UTF_8), server.getUrl() + "/myreg/modules/foo/2.0/MODULE.bazel"));
+    e =
+        assertThrows(
+            Registry.NotFoundException.class,
+            () ->
+                registry2.getModuleFile(createModuleKey("bar", "1.0"), reporter, downloadManager));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            server.getUrl()
+                + "/myreg/modules/bar/1.0/MODULE.bazel: previously not found (as recorded in"
+                + " MODULE.bazel.lock, refresh with --lockfile_mode=refresh)");
+  }
+
+  @Test
+  public void testGetModuleFileChecksumMismatch() throws Exception {
+    downloadCache.setPath(scratch.dir("cache"));
+
+    server.serve("/myreg/modules/foo/1.0/MODULE.bazel", "fake");
+    server.start();
+
+    var knownFiles =
+        ImmutableMap.of(
+            server.getUrl() + "/myreg/modules/foo/1.0/MODULE.bazel",
+            Optional.of(sha256("original")));
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl() + "/myreg",
+            LockfileMode.UPDATE,
+            knownFiles,
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    var e =
+        assertThrows(
+            IOException.class,
+            () -> registry.getModuleFile(createModuleKey("foo", "1.0"), reporter, downloadManager));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Failed to fetch registry file %s: Checksum was %s but wanted %s"
+                .formatted(
+                    server.getUrl() + "/myreg/modules/foo/1.0/MODULE.bazel",
+                    sha256("fake"),
+                    sha256("original")));
+  }
+
+  @Test
+  public void testGetModuleFileChecksumMismatchIgnoredWithLockfileModeOff() throws Exception {
+    downloadCache.setPath(scratch.dir("cache"));
+
+    server.serve("/myreg/modules/foo/1.0/MODULE.bazel", "fake");
+    server.start();
+
+    // With --lockfile_mode=off, hashes recorded in the lockfile must not be consulted, so a stale
+    // hash must not cause a checksum mismatch error.
+    var knownFiles =
+        ImmutableMap.of(
+            server.getUrl() + "/myreg/modules/foo/1.0/MODULE.bazel",
+            Optional.of(sha256("original")));
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl() + "/myreg",
+            LockfileMode.OFF,
+            knownFiles,
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    assertThat(registry.getModuleFile(createModuleKey("foo", "1.0"), reporter, downloadManager))
+        .isEqualTo(
+            ModuleFile.create(
+                "fake".getBytes(UTF_8), server.getUrl() + "/myreg/modules/foo/1.0/MODULE.bazel"));
+  }
+
+  @Test
+  public void testGetRepoSpecChecksum() throws Exception {
+    downloadCache.setPath(scratch.dir("cache"));
+
+    String registryJson =
+        """
+        {
+          "module_base_path": "/hello/foo"
+        }
+        """;
+    server.serve("/bazel_registry.json", registryJson);
+    String sourceJson =
+        """
+        {
+          "type": "local_path",
+          "path": "../bar/project_x"
+        }
+        """;
+    server.serve("/modules/foo/1.0/source.json", sourceJson.getBytes(UTF_8));
+    server.start();
+
+    var knownFiles =
+        ImmutableMap.of(
+            server.getUrl() + "/modules/foo/2.0/source.json", Optional.of(sha256("unused")));
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            knownFiles,
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    assertThat(
+            registry.getRepoSpec(
+                createModuleKey("foo", "1.0"), ImmutableMap.of(), reporter, downloadManager))
+        .isEqualTo(LocalPathRepoSpecs.create("/hello/bar/project_x"));
+
+    var recordedChecksums = eventRecorder.getRecordedHashes();
+    assertThat(
+            Maps.transformValues(recordedChecksums, checksum -> checksum.map(Checksum::toString)))
+        .containsExactly(
+            server.getUrl() + "/bazel_registry.json",
+            Optional.of(sha256(registryJson).toString()),
+            server.getUrl() + "/modules/foo/1.0/source.json",
+            Optional.of(sha256(sourceJson).toString()));
+
+    registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            recordedChecksums,
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    // Test that the recorded hashes are used for repo cache hits even when the server content
+    // changes.
+    server.unserve("/bazel_registry.json");
+    server.unserve("/modules/foo/1.0/source.json");
+    assertThat(
+            registry.getRepoSpec(
+                createModuleKey("foo", "1.0"), ImmutableMap.of(), reporter, downloadManager))
+        .isEqualTo(LocalPathRepoSpecs.create("/hello/bar/project_x"));
+  }
+
+  @Test
+  public void testGetRepoSpecChecksumMismatch() throws Exception {
+    downloadCache.setPath(scratch.dir("cache"));
+
+    String registryJson =
+        """
+        {
+          "module_base_path": "/hello/foo"
+        }
+        """;
+    server.serve("/bazel_registry.json", registryJson.getBytes(UTF_8));
+    String sourceJson =
+        """
+        {
+          "type": "local_path",
+          "path": "../bar/project_x"
+        }
+        """;
+    String maliciousSourceJson = sourceJson.replace("project_x", "malicious");
+    server.serve("/modules/foo/1.0/source.json", maliciousSourceJson.getBytes(UTF_8));
+    server.start();
+
+    var knownFiles =
+        ImmutableMap.of(
+            server.getUrl() + "/bazel_registry.json",
+            Optional.of(sha256(registryJson)),
+            server.getUrl() + "/modules/foo/1.0/source.json",
+            Optional.of(sha256(sourceJson)));
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            knownFiles,
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    var e =
+        assertThrows(
+            IOException.class,
+            () ->
+                registry.getRepoSpec(
+                    createModuleKey("foo", "1.0"), ImmutableMap.of(), reporter, downloadManager));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Failed to fetch registry file %s: Checksum was %s but wanted %s"
+                .formatted(
+                    server.getUrl() + "/modules/foo/1.0/source.json",
+                    sha256(maliciousSourceJson),
+                    sha256(sourceJson)));
+  }
+
+  @Test
+  public void testBazelRegistryChecksumMismatch() throws Exception {
+    downloadCache.setPath(scratch.dir("cache"));
+
+    String registryJson =
+        """
+        {
+          "module_base_path": "/hello/foo"
+        }
+        """;
+    String maliciousRegistryJson = registryJson.replace("foo", "malicious");
+    server.serve("/bazel_registry.json", maliciousRegistryJson.getBytes(UTF_8));
+    String sourceJson =
+        """
+        {
+          "type": "local_path",
+          "path": "../bar/project_x"
+        }
+        """;
+    server.serve("/modules/foo/1.0/source.json", sourceJson.getBytes(UTF_8));
+    server.start();
+
+    var knownFiles =
+        ImmutableMap.of(
+            server.getUrl() + "/bazel_registry.json",
+            Optional.of(sha256(registryJson)),
+            server.getUrl() + "/modules/foo/1.0/source.json",
+            Optional.of(sha256(sourceJson)));
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            knownFiles,
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    var e =
+        assertThrows(
+            IOException.class,
+            () ->
+                registry.getRepoSpec(
+                    createModuleKey("foo", "1.0"), ImmutableMap.of(), reporter, downloadManager));
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Failed to fetch registry file %s: Checksum was %s but wanted %s"
+                .formatted(
+                    server.getUrl() + "/bazel_registry.json",
+                    sha256(maliciousRegistryJson),
+                    sha256(registryJson)));
+  }
+
+  @Test
+  public void testGetArchiveRepoSpec_emptyMainIntegrity() throws Exception {
+    server.serve(
+        "/modules/foo/1.0/source.json",
+        "{",
+        "  \"url\": \"http://mysite.com/thing.zip\",",
+        "  \"integrity\": \"\"",
+        "}");
+    server.serve("/modules/foo/1.0/MODULE.bazel", "module(name = \"foo\", version = \"1.0\")");
+    server.start();
+
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    IOException e =
+        assertThrows(
+            IOException.class,
+            () ->
+                registry.getRepoSpec(
+                    createModuleKey("foo", "1.0"),
+                    ImmutableMap.of(
+                        server.getUrl() + "/modules/foo/1.0/MODULE.bazel",
+                        Optional.of(sha256("module(name = \"foo\", version = \"1.0\")"))),
+                    reporter,
+                    downloadManager));
+    assertThat(e).hasMessageThat().contains("Missing integrity for module foo@1.0");
+  }
+
+  @Test
+  public void testGetArchiveRepoSpec_emptyPatchIntegrity() throws Exception {
+    server.serve(
+        "/modules/foo/1.0/source.json",
+        "{",
+        "  \"url\": \"http://mysite.com/thing.zip\",",
+        "  \"integrity\": \"sha256-blah\",",
+        "  \"patches\": {",
+        "    \"fix.patch\": \"\"",
+        "  }",
+        "}");
+    server.serve("/modules/foo/1.0/MODULE.bazel", "module(name = \"foo\", version = \"1.0\")");
+    server.start();
+
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    IOException e =
+        assertThrows(
+            IOException.class,
+            () ->
+                registry.getRepoSpec(
+                    createModuleKey("foo", "1.0"),
+                    ImmutableMap.of(
+                        server.getUrl() + "/modules/foo/1.0/MODULE.bazel",
+                        Optional.of(sha256("module(name = \"foo\", version = \"1.0\")"))),
+                    reporter,
+                    downloadManager));
+    assertThat(e)
+        .hasMessageThat()
+        .contains("Missing integrity for patch fix.patch of module foo@1.0");
+  }
+
+  @Test
+  public void testGetArchiveRepoSpec_emptyOverlayIntegrity() throws Exception {
+    server.serve(
+        "/modules/foo/1.0/source.json",
+        "{",
+        "  \"url\": \"http://mysite.com/thing.zip\",",
+        "  \"integrity\": \"sha256-blah\",",
+        "  \"overlay\": {",
+        "    \"BUILD.bazel\": \"\"",
+        "  }",
+        "}");
+    server.serve("/modules/foo/1.0/MODULE.bazel", "module(name = \"foo\", version = \"1.0\")");
+    server.start();
+
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    IOException e =
+        assertThrows(
+            IOException.class,
+            () ->
+                registry.getRepoSpec(
+                    createModuleKey("foo", "1.0"),
+                    ImmutableMap.of(
+                        server.getUrl() + "/modules/foo/1.0/MODULE.bazel",
+                        Optional.of(sha256("module(name = \"foo\", version = \"1.0\")"))),
+                    reporter,
+                    downloadManager));
+    assertThat(e)
+        .hasMessageThat()
+        .contains("Missing integrity for overlay file BUILD.bazel of module foo@1.0");
+  }
+
+  @Test
+  public void testGetGitRepoSpec_emptyPatchIntegrity() throws Exception {
+    server.serve(
+        "/modules/foo/1.0/source.json",
+        """
+        {
+            "type": "git_repository",
+            "remote": "https://github.com/raspberrypi/pico-sdk.git",
+            "commit": "4b6e647590213f253f2789ad9026df1d00f38c5d",
+            "patches": {
+                "foo.patch": ""
+            }
+        }
+        """);
+    server.serve("/modules/foo/1.0/MODULE.bazel", "module(name = \"foo\", version = \"1.0\")");
+    server.start();
+
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    IOException e =
+        assertThrows(
+            IOException.class,
+            () ->
+                registry.getRepoSpec(
+                    createModuleKey("foo", "1.0"),
+                    ImmutableMap.of(
+                        server.getUrl() + "/modules/foo/1.0/MODULE.bazel",
+                        Optional.of(sha256("module(name = \"foo\", version = \"1.0\")"))),
+                    reporter,
+                    downloadManager));
+    assertThat(e)
+        .hasMessageThat()
+        .contains("Missing integrity for patch foo.patch of module foo@1.0");
+  }
+
+  @Test
+  public void testGetArchiveRepoSpec_whitespacePatchIntegrity() throws Exception {
+    server.serve(
+        "/modules/foo/1.0/source.json",
+        "{",
+        "  \"url\": \"http://mysite.com/thing.zip\",",
+        "  \"integrity\": \"sha256-blah\",",
+        "  \"patches\": {",
+        "    \"fix.patch\": \"  \"",
+        "  }",
+        "}");
+    server.serve("/modules/foo/1.0/MODULE.bazel", "module(name = \"foo\", version = \"1.0\")");
+    server.start();
+
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    IOException e =
+        assertThrows(
+            IOException.class,
+            () ->
+                registry.getRepoSpec(
+                    createModuleKey("foo", "1.0"),
+                    ImmutableMap.of(
+                        server.getUrl() + "/modules/foo/1.0/MODULE.bazel",
+                        Optional.of(sha256("module(name = \"foo\", version = \"1.0\")"))),
+                    reporter,
+                    downloadManager));
+    assertThat(e)
+        .hasMessageThat()
+        .contains("Missing integrity for patch fix.patch of module foo@1.0");
+  }
+
+  @Test
+  public void testGetArchiveRepoSpec_whitespaceOverlayIntegrity() throws Exception {
+    server.serve(
+        "/modules/foo/1.0/source.json",
+        "{",
+        "  \"url\": \"http://mysite.com/thing.zip\",",
+        "  \"integrity\": \"sha256-blah\",",
+        "  \"overlay\": {",
+        "    \"BUILD.bazel\": \"\t\"",
+        "  }",
+        "}");
+    server.serve("/modules/foo/1.0/MODULE.bazel", "module(name = \"foo\", version = \"1.0\")");
+    server.start();
+
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    IOException e =
+        assertThrows(
+            IOException.class,
+            () ->
+                registry.getRepoSpec(
+                    createModuleKey("foo", "1.0"),
+                    ImmutableMap.of(
+                        server.getUrl() + "/modules/foo/1.0/MODULE.bazel",
+                        Optional.of(sha256("module(name = \"foo\", version = \"1.0\")"))),
+                    reporter,
+                    downloadManager));
+    assertThat(e)
+        .hasMessageThat()
+        .contains("Missing integrity for overlay file BUILD.bazel of module foo@1.0");
+  }
+
+  @Test
+  public void testGetArchiveRepoSpec_whitespaceIntegrity() throws Exception {
+    server.serve(
+        "/modules/foo/1.0/source.json",
+        "{",
+        "  \"url\": \"http://mysite.com/thing.zip\",",
+        "  \"integrity\": \" \"",
+        "}");
+    server.serve("/modules/foo/1.0/MODULE.bazel", "module(name = \"foo\", version = \"1.0\")");
+    server.start();
+
+    Registry registry =
+        registryFactory.createRegistry(
+            server.getUrl(),
+            LockfileMode.UPDATE,
+            ImmutableMap.of(),
+            ImmutableMap.of(),
+            Optional.empty(),
+            ImmutableSet.of());
+    IOException e =
+        assertThrows(
+            IOException.class,
+            () ->
+                registry.getRepoSpec(
+                    createModuleKey("foo", "1.0"),
+                    ImmutableMap.of(
+                        server.getUrl() + "/modules/foo/1.0/MODULE.bazel",
+                        Optional.of(sha256("module(name = \"foo\", version = \"1.0\")"))),
+                    reporter,
+                    downloadManager));
+    assertThat(e).hasMessageThat().contains("Missing integrity for module foo@1.0");
+  }
+
+  private static Checksum sha256(String content) throws Checksum.InvalidChecksumException {
+    return Checksum.fromString(
+        DownloadCache.KeyType.SHA256, Hashing.sha256().hashString(content, UTF_8).toString());
+  }
+
+  @Test
+  public void getLocalRegistryPath_unixAbsolutePath() throws Exception {
+    assumeTrue(OS.getCurrent() != OS.WINDOWS);
+    assertThat(IndexRegistry.getLocalRegistryPath(new URI("file:///tmp/registry")))
+        .isEqualTo(PathFragment.create("/tmp/registry"));
+  }
+
+  @Test
+  public void getLocalRegistryPath_windowsDriveInPath() throws Exception {
+    assumeTrue(OS.getCurrent() == OS.WINDOWS);
+    assertThat(IndexRegistry.getLocalRegistryPath(new URI("file:///C:/ws/registry")))
+        .isEqualTo(PathFragment.create("C:/ws/registry"));
+  }
+
+  @Test
+  public void getLocalRegistryPath_windowsRejectsDriveLetterAsHost() {
+    assumeTrue(OS.getCurrent() == OS.WINDOWS);
+    var e =
+        assertThrows(
+            URISyntaxException.class,
+            () -> IndexRegistry.getLocalRegistryPath(new URI("file://C:/ws/registry")));
+    assertThat(e).hasMessageThat().contains("must have an absolute path");
+  }
+
+  @Test
+  public void getLocalRegistryPath_rejectsRelativePath() {
+    var e =
+        assertThrows(
+            URISyntaxException.class,
+            () -> IndexRegistry.getLocalRegistryPath(new URI("file:relative/registry")));
+    assertThat(e).hasMessageThat().contains("must have an absolute path");
+  }
+
+  @Test
+  public void getLocalRegistryPath_rejectsEmptyPath() {
+    var e =
+        assertThrows(
+            URISyntaxException.class,
+            () -> IndexRegistry.getLocalRegistryPath(new URI("file://server")));
+    assertThat(e).hasMessageThat().contains("must have an absolute path");
   }
 }

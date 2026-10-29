@@ -13,63 +13,118 @@
 // limitations under the License.
 package com.google.devtools.build.lib.remote.util;
 
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.Comparator.comparing;
 
 import build.bazel.remote.execution.v2.Action;
 import build.bazel.remote.execution.v2.Digest;
 import build.bazel.remote.execution.v2.DigestFunction;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Splitter;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.hash.HashCode;
+import com.google.common.hash.HashFunction;
+import com.google.common.hash.Hasher;
 import com.google.common.io.BaseEncoding;
-import com.google.devtools.build.lib.actions.cache.VirtualActionInput;
-import com.google.devtools.build.lib.remote.common.RemoteCacheClient.ActionKey;
+import com.google.devtools.build.lib.remote.common.ActionKey;
+import com.google.devtools.build.lib.util.DeterministicWriter;
 import com.google.devtools.build.lib.vfs.DigestHashFunction;
 import com.google.devtools.build.lib.vfs.DigestUtils;
+import com.google.devtools.build.lib.vfs.FileStatus;
 import com.google.devtools.build.lib.vfs.Path;
-import com.google.devtools.build.lib.vfs.SyscallCache;
+import com.google.devtools.build.lib.vfs.XattrProvider;
+import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
 
 /** Utility methods to work with {@link Digest}. */
 public class DigestUtil {
-  private final SyscallCache syscallCache;
-  private final DigestHashFunction hashFn;
+  public static final Comparator<Digest> DIGEST_COMPARATOR =
+      comparing(Digest::getHashBytes, ByteString.unsignedLexicographicalComparator())
+          .thenComparingLong(Digest::getSizeBytes);
 
-  public DigestUtil(SyscallCache syscallCache, DigestHashFunction hashFn) {
-    this.syscallCache = syscallCache;
+  private final XattrProvider xattrProvider;
+  private final DigestHashFunction hashFn;
+  private final DigestFunction.Value digestFunction;
+
+  public DigestUtil(XattrProvider xattrProvider, DigestHashFunction hashFn) {
+    this.xattrProvider = xattrProvider;
     this.hashFn = hashFn;
+    this.digestFunction = getDigestFunctionFromHashFunction(hashFn);
   }
 
-  /** Returns the currently used digest function. */
-  public DigestFunction.Value getDigestFunction() {
+  private static final ImmutableSet<String> DIGEST_FUNCTION_NAMES =
+      Arrays.stream(DigestFunction.Value.values()).map(Enum::name).collect(toImmutableSet());
+
+  private static DigestFunction.Value getDigestFunctionFromHashFunction(DigestHashFunction hashFn) {
     for (String name : hashFn.getNames()) {
-      try {
+      if (DIGEST_FUNCTION_NAMES.contains(name)) {
         return DigestFunction.Value.valueOf(name);
-      } catch (IllegalArgumentException e) {
-        // continue.
       }
     }
     return DigestFunction.Value.UNKNOWN;
   }
 
+  /** Returns the currently used digest function. */
+  public DigestFunction.Value getDigestFunction() {
+    return digestFunction;
+  }
+
   public Digest compute(byte[] blob) {
-    return buildDigest(hashFn.getHashFunction().hashBytes(blob).toString(), blob.length);
+    return buildDigest(hashFn.getHashFunction().hashBytes(blob).asBytes(), blob.length);
   }
 
-  public Digest compute(Path file) throws IOException {
-    return compute(file, file.getFileSize());
+  /**
+   * Computes a digest for a portion of a byte array. This is useful for uploading an individual
+   * chunk from a larger file.
+   *
+   * @param data the byte array
+   * @param offset the start offset in the array
+   * @param length the number of bytes to hash
+   */
+  public Digest compute(byte[] data, int offset, int length) {
+    return buildDigest(hashFn.getHashFunction().hashBytes(data, offset, length).asBytes(), length);
   }
 
-  public Digest compute(Path file, long fileSize) throws IOException {
+  /** Computes a digest of the given {@link ByteString} without copying its contents. */
+  public Digest compute(ByteString blob) {
+    Hasher hasher = hashFn.getHashFunction().newHasher();
+    for (ByteBuffer buffer : blob.asReadOnlyByteBufferList()) {
+      hasher.putBytes(buffer);
+    }
+    return buildDigest(hasher.hash().asBytes(), blob.size());
+  }
+
+  /**
+   * Computes a digest for a file.
+   *
+   * @param path the file path
+   * @param status a recently obtained file status
+   */
+  public Digest compute(Path path, FileStatus status) throws IOException {
     return buildDigest(
-        DigestUtils.getDigestWithManualFallback(file, fileSize, syscallCache), fileSize);
+        DigestUtils.getDigestWithManualFallback(path, xattrProvider, status), status.getSize());
   }
 
-  public Digest compute(VirtualActionInput input) throws IOException {
-    ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-    input.writeTo(buffer);
-    return compute(buffer.toByteArray());
+  public static Digest compute(DeterministicWriter input, HashFunction hashFunction)
+      throws IOException {
+    // Stream the input as parameter files, which can be very large, are lazily computed from the
+    // in-memory CommandLine object. This avoids allocating large byte arrays.
+    try (DigestOutputStream digestOutputStream =
+        new DigestOutputStream(hashFunction, OutputStream.nullOutputStream())) {
+      input.writeTo(digestOutputStream);
+      return digestOutputStream.digest();
+    }
+  }
+
+  public Digest compute(DeterministicWriter input) throws IOException {
+    return compute(input, hashFn.getHashFunction());
   }
 
   /**
@@ -97,13 +152,26 @@ public class DigestUtil {
     return new ActionKey(digest);
   }
 
+  public com.google.devtools.build.lib.exec.Protos.Digest asSpawnLogProto(ActionKey actionKey) {
+    return com.google.devtools.build.lib.exec.Protos.Digest.newBuilder()
+        .setHash(actionKey.digest().getHash())
+        .setSizeBytes(actionKey.digest().getSizeBytes())
+        .setHashFunctionName(getDigestFunction().toString())
+        .build();
+  }
+
   /** Returns the hash of {@code data} in binary. */
   public byte[] hash(byte[] data) {
     return hashFn.getHashFunction().hashBytes(data).asBytes();
   }
 
+  /** Builds a {@link Digest} from a binary hash. */
   public static Digest buildDigest(byte[] hash, long size) {
-    return buildDigest(HashCode.fromBytes(hash).toString(), size);
+    Preconditions.checkArgument(hash.length > 0, "A hash must contain at least 1 byte.");
+    return Digest.newBuilder()
+        .setHashBytes(DigestUtils.toHexByteString(hash))
+        .setSizeBytes(size)
+        .build();
   }
 
   public static Digest buildDigest(String hexHash, long size) {
@@ -122,7 +190,21 @@ public class DigestUtil {
     return digest.getHash() + "/" + digest.getSizeBytes();
   }
 
+  public static Digest fromString(String digest) {
+    List<String> parts = Splitter.on('/').splitToList(digest);
+    Preconditions.checkArgument(parts.size() == 2, "Invalid digest format: %s", digest);
+    return buildDigest(parts.get(0), Long.parseLong(parts.get(1)));
+  }
+
   public static byte[] toBinaryDigest(Digest digest) {
     return HashCode.fromString(digest.getHash()).asBytes();
+  }
+
+  public static boolean isOldStyleDigestFunction(DigestFunction.Value digestFunction) {
+    // Old-style digest functions (SHA256, etc) are distinguishable by the length
+    // of their hash alone and do not require extra specification, but newer
+    // digest functions (which may have the same length hashes as the older
+    // functions!) must be explicitly specified in the upload resource name.
+    return digestFunction.getNumber() <= 7;
   }
 }

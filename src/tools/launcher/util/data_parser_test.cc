@@ -12,15 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "src/tools/launcher/util/data_parser.h"
+
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
-#include "src/main/cpp/util/strings.h"
-#include "src/tools/launcher/util/data_parser.h"
 #include "gtest/gtest.h"
+#include "src/main/cpp/util/strings.h"
 #include "src/tools/launcher/util/launcher_util.h"
 
 namespace bazel {
@@ -112,7 +116,7 @@ class LaunchDataParserTest : public ::testing::Test {
 TEST_F(LaunchDataParserTest, GetLaunchInfoTest) {
   vector<pair<string, string>> launch_info = {
       {"binary_type", "Bash"},
-      {"workspace_name", "__main__"},
+      {"workspace_name", "_main"},
       {"bash_bin_path", "C:\\foo\\bar\\bash.exe"},
       {"bash_main_file", "./bazel-bin/foo/bar/bin.sh"},
       {"empty_value_key", ""},

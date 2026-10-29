@@ -21,53 +21,51 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
-/** Tests for @{link RepositoryMapping}. */
+/** Tests for {@link RepositoryMapping}. */
 @RunWith(JUnit4.class)
 public final class RepositoryMappingTest {
-
-  @Test
-  public void maybeFallback() throws Exception {
-    RepositoryMapping mapping =
-        RepositoryMapping.createAllowingFallback(
-            ImmutableMap.of(RepositoryName.create("@A"), RepositoryName.create("@com_foo_bar_a")));
-    assertThat(mapping.get(RepositoryName.create("@A")))
-        .isEqualTo(RepositoryName.create("@com_foo_bar_a"));
-    assertThat(mapping.get(RepositoryName.create("@B"))).isEqualTo(RepositoryName.create("@B"));
-  }
 
   @Test
   public void neverFallback() throws Exception {
     RepositoryMapping mapping =
         RepositoryMapping.create(
-            ImmutableMap.of(RepositoryName.create("@A"), RepositoryName.create("@com_foo_bar_a")),
-            "fake_owner_repo");
-    assertThat(mapping.get(RepositoryName.create("@A")))
-        .isEqualTo(RepositoryName.create("@com_foo_bar_a"));
-    assertThat(mapping.get(RepositoryName.create("@B")))
-        .isEqualTo(RepositoryName.create("@B").toNonVisible("fake_owner_repo"));
-
-    // Special repos should still be visible
-    assertThat(mapping.get(RepositoryName.create("@bazel_tools")))
-        .isEqualTo(RepositoryName.create("@bazel_tools"));
-    assertThat(mapping.get(RepositoryName.create("@local_config_platform")))
-        .isEqualTo(RepositoryName.create("@local_config_platform"));
+            ImmutableMap.of("A", RepositoryName.create("com_foo_bar_a")),
+            RepositoryName.create("fake_owner_repo"));
+    assertThat(mapping.get("A")).isEqualTo(RepositoryName.create("com_foo_bar_a"));
+    assertThat(mapping.get("B"))
+        .isEqualTo(
+            RepositoryName.create("B").toNonVisible(RepositoryName.create("fake_owner_repo")));
   }
 
   @Test
-  public void additionalMappings() throws Exception {
+  public void additionalMappings_basic() throws Exception {
     RepositoryMapping mapping =
         RepositoryMapping.create(
-                ImmutableMap.of(
-                    RepositoryName.create("@A"), RepositoryName.create("@com_foo_bar_a")),
-                "fake_owner_repo")
-            .withAdditionalMappings(
-                ImmutableMap.of(
-                    RepositoryName.create("@B"), RepositoryName.create("@com_foo_bar_b")));
-    assertThat(mapping.get(RepositoryName.create("@A")))
-        .isEqualTo(RepositoryName.create("@com_foo_bar_a"));
-    assertThat(mapping.get(RepositoryName.create("@B")))
-        .isEqualTo(RepositoryName.create("@com_foo_bar_b"));
-    assertThat(mapping.get(RepositoryName.create("@C")))
-        .isEqualTo(RepositoryName.create("@C").toNonVisible("fake_owner_repo"));
+                ImmutableMap.of("A", RepositoryName.create("com_foo_bar_a")),
+                RepositoryName.create("fake_owner_repo"))
+            .withAdditionalMappings(ImmutableMap.of("B", RepositoryName.create("com_foo_bar_b")));
+    assertThat(mapping.get("A")).isEqualTo(RepositoryName.create("com_foo_bar_a"));
+    assertThat(mapping.get("B")).isEqualTo(RepositoryName.create("com_foo_bar_b"));
+    assertThat(mapping.get("C"))
+        .isEqualTo(
+            RepositoryName.create("C").toNonVisible(RepositoryName.create("fake_owner_repo")));
+  }
+
+  @Test
+  public void additionalMappings_precedence() throws Exception {
+    RepositoryMapping mapping =
+        RepositoryMapping.create(
+                ImmutableMap.of("A", RepositoryName.create("A1")), RepositoryName.MAIN)
+            .withAdditionalMappings(ImmutableMap.of("A", RepositoryName.create("A2")));
+    assertThat(mapping.get("A")).isEqualTo(RepositoryName.create("A1"));
+  }
+
+  @Test
+  public void unknownRepoDidYouMean() throws LabelSyntaxException {
+    RepositoryMapping mapping =
+        RepositoryMapping.create(
+            ImmutableMap.of("foo", RepositoryName.create("foo_internal")), RepositoryName.MAIN);
+    assertThat(mapping.get("boo").getNameWithAt())
+        .isEqualTo("@@[unknown repo 'boo' requested from @@ (did you mean 'foo'?)]");
   }
 }

@@ -17,9 +17,11 @@ package com.google.devtools.build.lib.util;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import com.google.common.io.ByteStreams;
+import com.google.devtools.build.lib.unsafe.StringUnsafe;
 import com.google.devtools.build.lib.vfs.DigestHashFunction;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.CodedOutputStream;
 import java.io.IOException;
@@ -59,7 +61,7 @@ import javax.annotation.Nullable;
  *
  * @see java.security.MessageDigest
  */
-public final class Fingerprint {
+public final class Fingerprint implements BytesSink {
 
   // Make novel use of a CodedOutputStream, which is good at efficiently serializing data. By
   // flushing at the end of each digest we can continue to use the stream.
@@ -68,19 +70,22 @@ public final class Fingerprint {
 
   /** Creates and initializes a new instance. */
   public Fingerprint(DigestHashFunction digestFunction) {
-    messageDigest = digestFunction.cloneOrCreateMessageDigest();
-    // This is a lot of indirection, but CodedOutputStream does a reasonable job of converting
-    // strings to bytes without creating a whole bunch of garbage, which pays off.
+    messageDigest = digestFunction.newMessageDigest();
     codedOut =
         CodedOutputStream.newInstance(
             new DigestOutputStream(ByteStreams.nullOutputStream(), messageDigest),
-            /*bufferSize=*/ 1024);
+            /* bufferSize= */ 1024);
   }
 
   public Fingerprint() {
     // TODO(b/112460990): Use the value from DigestHashFunction.getDefault(), but check for
     // contention.
     this(DigestHashFunction.SHA256);
+  }
+
+  /** Returns the length in bytes of the digests produced by this instance. */
+  public int getDigestLength() {
+    return messageDigest.getDigestLength();
   }
 
   /**
@@ -131,6 +136,7 @@ public final class Fingerprint {
    * <p>The fingerprint directly injects the bytes with no framing or tags added. Thus, not
    * guaranteed to be unambiguous; especially if input length is data-dependent.
    */
+  @CanIgnoreReturnValue
   public Fingerprint addBytes(ByteString bytes) {
     try {
       codedOut.writeRawBytes(bytes);
@@ -141,6 +147,7 @@ public final class Fingerprint {
   }
 
   /** Appends the specified bytes to the fingerprint message. */
+  @CanIgnoreReturnValue
   public Fingerprint addBytes(byte[] input) {
     addBytes(input, 0, input.length);
     return this;
@@ -152,6 +159,7 @@ public final class Fingerprint {
    * <p>The bytes are directly injected into the fingerprint with no framing or tags added. Thus,
    * not guaranteed to be unambiguous; especially if len is data-dependent.
    */
+  @CanIgnoreReturnValue
   public Fingerprint addBytes(byte[] input, int offset, int len) {
     try {
       codedOut.write(input, offset, len);
@@ -161,7 +169,13 @@ public final class Fingerprint {
     return this;
   }
 
+  @Override // implementation of BytesSink
+  public void acceptBytes(byte[] buf, int offset, int len) {
+    addBytes(buf, offset, len);
+  }
+
   /** Updates the digest with a boolean value. */
+  @CanIgnoreReturnValue
   public Fingerprint addBoolean(boolean input) {
     try {
       codedOut.writeBoolNoTag(input);
@@ -172,6 +186,7 @@ public final class Fingerprint {
   }
 
   /** Same as {@link #addBoolean(boolean)}, except considers nullability. */
+  @CanIgnoreReturnValue
   public Fingerprint addNullableBoolean(Boolean input) {
     if (input == null) {
       addBoolean(false);
@@ -183,6 +198,7 @@ public final class Fingerprint {
   }
 
   /** Appends an int to the fingerprint message. */
+  @CanIgnoreReturnValue
   public Fingerprint addInt(int x) {
     try {
       codedOut.writeInt32NoTag(x);
@@ -193,6 +209,7 @@ public final class Fingerprint {
   }
 
   /** Appends a long to the fingerprint message. */
+  @CanIgnoreReturnValue
   public Fingerprint addLong(long x) {
     try {
       codedOut.writeInt64NoTag(x);
@@ -203,6 +220,7 @@ public final class Fingerprint {
   }
 
   /** Same as {@link #addInt(int)}, except considers nullability. */
+  @CanIgnoreReturnValue
   public Fingerprint addNullableInt(@Nullable Integer input) {
     if (input == null) {
       addBoolean(false);
@@ -214,16 +232,18 @@ public final class Fingerprint {
   }
 
   /** Appends a {@link UUID} to the fingerprint message. */
+  @CanIgnoreReturnValue
   public Fingerprint addUUID(UUID uuid) {
     addLong(uuid.getLeastSignificantBits());
     addLong(uuid.getMostSignificantBits());
     return this;
   }
 
-  /** Appends a String to the fingerprint message. */
+  /** Appends a string in Bazel's {@linkplain StringEncoding internal encoding}. */
+  @CanIgnoreReturnValue
   public Fingerprint addString(String input) {
     try {
-      codedOut.writeStringNoTag(input);
+      codedOut.writeByteArrayNoTag(StringUnsafe.getInternalStringBytes(input));
     } catch (IOException e) {
       throw new IllegalStateException("failed to write string", e);
     }
@@ -231,6 +251,7 @@ public final class Fingerprint {
   }
 
   /** Same as {@link #addString(String)}, except considers nullability. */
+  @CanIgnoreReturnValue
   public Fingerprint addNullableString(@Nullable String input) {
     if (input == null) {
       addBoolean(false);
@@ -242,6 +263,7 @@ public final class Fingerprint {
   }
 
   /** Appends a {@link Path} to the fingerprint message. */
+  @CanIgnoreReturnValue
   public Fingerprint addPath(Path input) {
     addString(input.getPathString());
     return this;
@@ -259,6 +281,7 @@ public final class Fingerprint {
    * <p>The fingerprint effectively records the sequence of calls, not just the elements. That is,
    * addStrings(x+y).addStrings(z) is different from addStrings(x).addStrings(y+z).
    */
+  @CanIgnoreReturnValue
   public Fingerprint addStrings(Collection<String> inputs) {
     addInt(inputs.size());
     for (String input : inputs) {
@@ -274,6 +297,7 @@ public final class Fingerprint {
    * <p>This is slightly less efficient than {@link #addStrings}.
    */
   // TODO(b/150312032): Deprecate this method.
+  @CanIgnoreReturnValue
   public Fingerprint addIterableStrings(Iterable<String> inputs) {
     for (String input : inputs) {
       addBoolean(true);
@@ -284,7 +308,8 @@ public final class Fingerprint {
     return this;
   }
 
-  /**  Updates the digest with the supplied map. */
+  /** Updates the digest with the supplied map. */
+  @CanIgnoreReturnValue
   public Fingerprint addStringMap(Map<String, String> inputs) {
     addInt(inputs.size());
     for (Map.Entry<String, String> entry : inputs.entrySet()) {
@@ -296,6 +321,7 @@ public final class Fingerprint {
   }
 
   /** Like {@link #addStrings} but for {@link PathFragment}. */
+  @CanIgnoreReturnValue
   public Fingerprint addPaths(Collection<PathFragment> inputs) {
     addInt(inputs.size());
     for (PathFragment input : inputs) {
@@ -326,7 +352,6 @@ public final class Fingerprint {
     // use the value from DigestHashFunction.getDefault(). However, this gets called during class
     // loading in a few places, before setDefault() has been called, so these call-sites should be
     // removed before this can be done safely.
-    return hexDigest(
-        DigestHashFunction.SHA256.cloneOrCreateMessageDigest().digest(input.getBytes(UTF_8)));
+    return hexDigest(DigestHashFunction.SHA256.newMessageDigest().digest(input.getBytes(UTF_8)));
   }
 }

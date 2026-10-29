@@ -17,7 +17,6 @@ package com.google.devtools.build.lib.packages;
 import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableRangeMap;
-import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
 import com.google.common.collect.RangeMap;
 import com.google.devtools.common.options.Converter;
@@ -31,10 +30,9 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import javax.annotation.Nullable;
 
-/**
- * Symbolic labels of test timeout. Borrows heavily from {@link TestSize}.
- */
+/** Symbolic labels of test timeout. Borrows heavily from {@link TestSize}. */
 public enum TestTimeout {
 
   // These symbolic labels are used in the build files.
@@ -43,9 +41,8 @@ public enum TestTimeout {
   LONG(900),
   ETERNAL(3600);
 
-  /**
-   * Default --test_timeout flag, used when collecting code coverage.
-   */
+  /** Default --test_timeout flag, used when collecting code coverage. */
+  // Do not increase these values without consulting b/459811767#comment3.
   public static final String COVERAGE_CMD_TIMEOUT = "--test_timeout=300,600,1200,3600";
 
   /** Map from test time to suggested TestTimeout. */
@@ -118,6 +115,7 @@ public enum TestTimeout {
    * Returns the enum associated with a test's timeout or null if the tag is not lower case or an
    * unknown size.
    */
+  @Nullable
   public static TestTimeout getTestTimeout(String attr) {
     if (!attr.equals(attr.toLowerCase())) {
       return null;
@@ -130,11 +128,20 @@ public enum TestTimeout {
   }
 
   /**
-   * Returns test timeout of the given test target using explicitly specified timeout or default
-   * through to the size label's associated default.
+   * Returns test timeout of the given target using explicitly specified timeout or default through
+   * the size label's associated default or null if the target is not a test.
    */
-  public static TestTimeout getTestTimeout(Rule testTarget) {
-    String attr = NonconfigurableAttributeMapper.of(testTarget).get("timeout", Type.STRING);
+  @Nullable
+  public static TestTimeout getTestTimeout(Rule target) {
+    String attr = NonconfigurableAttributeMapper.attributeOrNull(target, "timeout", Type.STRING);
+    if (attr == null) {
+      // The target is not a test. This is reached by serialization code as it tries to serialize
+      // essential target fields. There's not enough context there to pre-determine whether a
+      // target is a test or not, so it simply serializes any String timeout field.
+      //
+      // TODO(b/297857068): refactor ConfiguredTargetAndData and remove this branch.
+      return null;
+    }
     if (!attr.equals(attr.toLowerCase())) {
       return null; // attribute values must be lowercase
     }
@@ -150,9 +157,7 @@ public enum TestTimeout {
     return super.toString().toLowerCase();
   }
 
-  /**
-   * We print to upper case to make the test timeout warnings more readable.
-   */
+  /** We print to upper case to make the test timeout warnings more readable. */
   public String prettyPrint() {
     return super.toString().toUpperCase();
   }
@@ -187,10 +192,9 @@ public enum TestTimeout {
     return SUGGESTED_TIMEOUT.get(timeInSeconds);
   }
 
-  /**
-   * Converter for the --test_timeout option.
-   */
-  public static class TestTimeoutConverter implements Converter<Map<TestTimeout, Duration>> {
+  /** Converter for the --test_timeout option. */
+  public static class TestTimeoutConverter
+      extends Converter.Contextless<Map<TestTimeout, Duration>> {
     public TestTimeoutConverter() {}
 
     @Override
@@ -208,7 +212,7 @@ public enum TestTimeout {
           }
         }
       }
-      EnumMap<TestTimeout, Duration> timeouts = Maps.newEnumMap(TestTimeout.class);
+      EnumMap<TestTimeout, Duration> timeouts = new EnumMap<>(TestTimeout.class);
       if (values.size() == 1) {
         timeouts.put(SHORT, values.get(0));
         timeouts.put(MODERATE, values.get(0));
@@ -236,9 +240,7 @@ public enum TestTimeout {
     }
   }
 
-  /**
-   * Converter for the --test_timeout_filters option.
-   */
+  /** Converter for the --test_timeout_filters option. */
   public static class TestTimeoutFilterConverter extends EnumFilterConverter<TestTimeout> {
     public TestTimeoutFilterConverter() {
       super(TestTimeout.class, "test timeout");
@@ -247,9 +249,9 @@ public enum TestTimeout {
     /**
      * {@inheritDoc}
      *
-     * <p>This override is necessary to prevent OptionsData
-     * from throwing a "must be assignable from the converter return type" exception.
-     * OptionsData doesn't recognize the generic type and actual type are the same.
+     * <p>This override is necessary to prevent OptionsData from throwing a "must be assignable from
+     * the converter return type" exception. OptionsData doesn't recognize the generic type and
+     * actual type are the same.
      */
     @Override
     public final Set<TestTimeout> convert(String input) throws OptionsParsingException {

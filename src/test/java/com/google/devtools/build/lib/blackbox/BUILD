@@ -28,7 +28,7 @@ java_library(
         "//src/main/java/com/google/devtools/build/lib/util",
         "//src/main/java/com/google/devtools/build/lib/util:string",
         "//src/main/java/com/google/devtools/build/lib/util/io",
-        "//src/test/java/com/google/devtools/build/lib:test_runner",
+        "//src/test/java/com/google/devtools/build/lib:AllTests",
         "//src/test/java/com/google/devtools/build/lib/testutil",
         "//third_party:junit4",
         "//third_party:truth",
@@ -39,10 +39,10 @@ filegroup(
     name = "srcs",
     testonly = 0,
     srcs = glob(["**"]) + [
-        "//src/test/java/com/google/devtools/build/lib/blackbox/framework:srcs",
         "//src/test/java/com/google/devtools/build/lib/blackbox/bazel:srcs",
-        "//src/test/java/com/google/devtools/build/lib/blackbox/tests:srcs",
+        "//src/test/java/com/google/devtools/build/lib/blackbox/framework:srcs",
         "//src/test/java/com/google/devtools/build/lib/blackbox/junit:srcs",
+        "//src/test/java/com/google/devtools/build/lib/blackbox/tests:srcs",
     ],
     visibility = ["//src/test/java/com/google/devtools/build/lib:__pkg__"],
 )

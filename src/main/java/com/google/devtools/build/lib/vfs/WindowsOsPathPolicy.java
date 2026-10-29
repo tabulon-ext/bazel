@@ -14,21 +14,25 @@
 package com.google.devtools.build.lib.vfs;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.CharMatcher;
 import com.google.common.base.Splitter;
-import com.google.common.collect.Iterables;
-import com.google.devtools.build.lib.windows.WindowsFileOperations;
-import com.google.devtools.build.lib.windows.WindowsShortPath;
+import com.google.devtools.build.lib.util.OS;
+import com.google.devtools.build.lib.windows.WindowsPathOperations;
 import java.io.IOException;
 
 @VisibleForTesting
 class WindowsOsPathPolicy implements OsPathPolicy {
 
-  static final WindowsOsPathPolicy INSTANCE = new WindowsOsPathPolicy();
+  static final WindowsOsPathPolicy INSTANCE =
+      new WindowsOsPathPolicy(new DefaultShortPathResolver());
+
+  static final WindowsOsPathPolicy CROSS_PLATFORM_INSTANCE =
+      new WindowsOsPathPolicy(new CrossPlatformShortPathResolver());
 
   static final int NEEDS_SHORT_PATH_NORMALIZATION = NEEDS_NORMALIZE + 1;
 
   private static final Splitter WINDOWS_PATH_SPLITTER =
-      Splitter.onPattern("[\\\\/]+").omitEmptyStrings();
+      Splitter.on(CharMatcher.anyOf("\\/")).omitEmptyStrings();
 
   private final ShortPathResolver shortPathResolver;
 
@@ -39,18 +43,33 @@ class WindowsOsPathPolicy implements OsPathPolicy {
   static class DefaultShortPathResolver implements ShortPathResolver {
     @Override
     public String resolveShortPath(String path) {
+      if (!OS.getCurrent().equals(OS.WINDOWS)) {
+        // Short path resolution only makes sense on a Windows host.
+        return path;
+      }
       try {
-        return WindowsFileOperations.getLongPath(path);
+        return WindowsPathOperations.getLongPath(path);
       } catch (IOException e) {
         return path;
       }
     }
   }
 
-  WindowsOsPathPolicy() {
-    this(new DefaultShortPathResolver());
+  static class CrossPlatformShortPathResolver implements ShortPathResolver {
+    @Override
+    public String resolveShortPath(String path) {
+      // Short paths can only be resolved on a Windows host.
+      // Skipping short path resolution when running on a non-Windows host can
+      // result in paths considered different that are actually the same.
+      // TODO: Consider failing when a short path is detected on a non-Windows
+      //  host. Since short path segments can arise from most operations on
+      //  PathFragment, this would however require exception handling in many
+      //  places.
+      return path;
+    }
   }
 
+  @VisibleForTesting
   WindowsOsPathPolicy(ShortPathResolver shortPathResolver) {
     this.shortPathResolver = shortPathResolver;
   }
@@ -59,6 +78,10 @@ class WindowsOsPathPolicy implements OsPathPolicy {
   public int needsToNormalize(String path) {
     int n = path.length();
     int normalizationLevel = NORMALIZED;
+    int driveStrLength = getDriveStrLength(path);
+    if (driveStrLength == 3 && Character.isLowerCase(path.charAt(0))) {
+      normalizationLevel = NEEDS_NORMALIZE;
+    }
     int dotCount = 0;
     char prevChar = 0;
     int segmentBeginIndex = 0; // The start index of the current path index
@@ -77,25 +100,36 @@ class WindowsOsPathPolicy implements OsPathPolicy {
           normalizationLevel = Math.max(normalizationLevel, NEEDS_NORMALIZE);
         }
         if (segmentHasShortPathChar) {
-          if (WindowsShortPath.isShortPath(path.substring(segmentBeginIndex, i))) {
+          if (WindowsPathOperations.isShortPath(path.substring(segmentBeginIndex, i))) {
             normalizationLevel = Math.max(normalizationLevel, NEEDS_SHORT_PATH_NORMALIZATION);
           }
         }
         segmentBeginIndex = i + 1;
         segmentHasShortPathChar = false;
-      } else if (c == '~') {
-        // This path segment might be a Windows short path segment
-        segmentHasShortPathChar = true;
+        dotCount = 0;
+      } else {
+        if (c == '~') {
+          // This path segment might be a Windows short path segment
+          segmentHasShortPathChar = true;
+        }
+        if (c == '.' && dotCount >= 0) {
+          dotCount++;
+        } else {
+          dotCount = -1;
+        }
       }
-      dotCount = c == '.' ? dotCount + 1 : 0;
       prevChar = c;
     }
     if (segmentHasShortPathChar) {
-      if (WindowsShortPath.isShortPath(path.substring(segmentBeginIndex))) {
+      if (WindowsPathOperations.isShortPath(path.substring(segmentBeginIndex))) {
         normalizationLevel = Math.max(normalizationLevel, NEEDS_SHORT_PATH_NORMALIZATION);
       }
     }
-    if ((n > 1 && isSeparator(prevChar)) || dotCount == 1 || dotCount == 2) {
+    boolean isUnnormalizedTrailingSlash =
+        isSeparator(prevChar)
+            && (n > driveStrLength
+                || (driveStrLength == 3 && Character.isLowerCase(path.charAt(0))));
+    if (isUnnormalizedTrailingSlash || dotCount == 1 || dotCount == 2) {
       normalizationLevel = Math.max(normalizationLevel, NEEDS_NORMALIZE);
     }
     return normalizationLevel;
@@ -118,7 +152,7 @@ class WindowsOsPathPolicy implements OsPathPolicy {
         path = resolvedPath;
       }
     }
-    String[] segments = Iterables.toArray(WINDOWS_PATH_SPLITTER.splitToList(path), String.class);
+    String[] segments = WINDOWS_PATH_SPLITTER.splitToList(path).toArray(new String[0]);
     int driveStrLength = getDriveStrLength(path);
     boolean isAbsolute = driveStrLength > 0;
     int segmentSkipCount = isAbsolute && driveStrLength > 1 ? 1 : 0;
@@ -170,63 +204,6 @@ class WindowsOsPathPolicy implements OsPathPolicy {
   }
 
   @Override
-  public int compare(String s1, String s2) {
-    // Windows is case-insensitive
-    return s1.compareToIgnoreCase(s2);
-  }
-
-  @Override
-  public int compare(char c1, char c2) {
-    return Character.compare(Character.toLowerCase(c1), Character.toLowerCase(c2));
-  }
-
-  @Override
-  public boolean equals(String s1, String s2) {
-    return (s1 == null && s2 == null) || (s1 != null && s1.equalsIgnoreCase(s2));
-  }
-
-  @Override
-  public int hash(String s) {
-    // Windows is case-insensitive
-    if (s == null) {
-      return 0;
-    }
-    return s.toLowerCase().hashCode();
-  }
-
-  @Override
-  public boolean startsWith(String path, String prefix) {
-    int pathn = path.length();
-    int prefixn = prefix.length();
-    if (pathn < prefixn) {
-      return false;
-    }
-    for (int i = 0; i < prefixn; ++i) {
-      if (Character.toLowerCase(path.charAt(i)) != Character.toLowerCase(prefix.charAt(i))) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  @Override
-  public boolean endsWith(String path, String suffix) {
-    int pathn = path.length();
-    int suffixLength = suffix.length();
-    if (pathn < suffixLength) {
-      return false;
-    }
-    int offset = pathn - suffixLength;
-    for (int i = 0; i < suffixLength; ++i) {
-      if (Character.toLowerCase(path.charAt(i + offset))
-          != Character.toLowerCase(suffix.charAt(i))) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  @Override
   public boolean isSeparator(char c) {
     return c == '/' || c == '\\';
   }
@@ -237,7 +214,10 @@ class WindowsOsPathPolicy implements OsPathPolicy {
   }
 
   @Override
-  public boolean isCaseSensitive() {
-    return false;
+  public String postProcessPathStringForExecution(String callablePathString) {
+    // On Windows, .bat scripts (and possibly others) cannot be executed with forward slashes in
+    // the path. Since backslashes are the standard path separator on Windows, we replace all
+    // forward slashes with backslashes instead of trying to enumerate these special cases.
+    return callablePathString.replace('/', '\\');
   }
 }

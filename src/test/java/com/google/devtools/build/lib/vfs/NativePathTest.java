@@ -14,11 +14,13 @@
 package com.google.devtools.build.lib.vfs;
 
 import static com.google.common.truth.Truth.assertThat;
+import static java.nio.charset.StandardCharsets.ISO_8859_1;
 import static org.junit.Assert.assertThrows;
 
 import com.google.common.collect.Lists;
 import com.google.common.testing.EqualsTester;
 import com.google.devtools.build.lib.testutil.TestUtils;
+import com.google.devtools.build.lib.vfs.UnixGlob.FilesystemOps;
 import com.google.devtools.build.lib.vfs.util.FileSystems;
 import com.google.devtools.build.lib.vfs.util.TestUnixGlobPathDiscriminator;
 import java.io.File;
@@ -62,14 +64,14 @@ public class NativePathTest {
   }
 
   @Test
-  public void testExists() {
+  public void testExists() throws Exception {
     assertThat(fs.getPath(aDirectory.getPath()).exists()).isTrue();
     assertThat(fs.getPath(aFile.getPath()).exists()).isTrue();
     assertThat(fs.getPath("/does/not/exist").exists()).isFalse();
   }
 
   @Test
-  public void testDirectoryEntriesForDirectory() throws IOException {
+  public void testDirectoryEntriesForDirectory() throws Exception {
     assertThat(fs.getPath(tmpDir.getPath()).getDirectoryEntries()).containsExactly(
       fs.getPath(tmpDir.getPath() + "/a_file"),
       fs.getPath(tmpDir.getPath() + "/a_directory"));
@@ -82,12 +84,12 @@ public class NativePathTest {
   }
 
   @Test
-  public void testIsFileIsTrueForFile() {
+  public void testIsFileIsTrueForFile() throws Exception {
     assertThat(fs.getPath(aFile.getPath()).isFile()).isTrue();
   }
 
   @Test
-  public void testIsFileIsFalseForDirectory() {
+  public void testIsFileIsFalseForDirectory() throws Exception {
     assertThat(fs.getPath(aDirectory.getPath()).isFile()).isFalse();
   }
 
@@ -102,7 +104,7 @@ public class NativePathTest {
   }
 
   @Test
-  public void testIsDirectory() {
+  public void testIsDirectory() throws Exception {
     assertThat(fs.getPath(aDirectory.getPath()).isDirectory()).isTrue();
     assertThat(fs.getPath(aFile.getPath()).isDirectory()).isFalse();
     assertThat(fs.getPath("/does/not/exist").isDirectory()).isFalse();
@@ -125,15 +127,16 @@ public class NativePathTest {
 
   @Test
   public void testGlob() throws Exception {
-    Collection<Path> textFiles = UnixGlob.forPath(fs.getPath(tmpDir.getPath()))
-        .addPattern("*/*.txt")
-        .globInterruptible();
+    Collection<Path> textFiles =
+        new UnixGlob.Builder(fs.getPath(tmpDir.getPath()), FilesystemOps.DIRECT)
+            .addPattern("*/*.txt")
+            .globInterruptible();
     assertThat(textFiles).hasSize(1);
     Path onlyFile = textFiles.iterator().next();
     assertThat(onlyFile).isEqualTo(fs.getPath(anotherFile.getPath()));
 
     Collection<Path> onlyFiles =
-        UnixGlob.forPath(fs.getPath(tmpDir.getPath()))
+        new UnixGlob.Builder(fs.getPath(tmpDir.getPath()), FilesystemOps.DIRECT)
             .addPattern("*")
             .setPathDiscriminator(
                 new TestUnixGlobPathDiscriminator(p -> true, (p, isDir) -> !isDir))
@@ -141,7 +144,7 @@ public class NativePathTest {
     assertPathSet(onlyFiles, aFile.getPath());
 
     Collection<Path> directoriesToo =
-        UnixGlob.forPath(fs.getPath(tmpDir.getPath()))
+        new UnixGlob.Builder(fs.getPath(tmpDir.getPath()), FilesystemOps.DIRECT)
             .addPattern("*")
             .setPathDiscriminator(new TestUnixGlobPathDiscriminator(p -> true, (p, isDir) -> true))
             .globInterruptible();
@@ -176,7 +179,7 @@ public class NativePathTest {
     Path path = fs.getPath(aFile.getPath());
     String latin1String = new String(allLatin1Chars);
     FileSystemUtils.writeContentAsLatin1(path, latin1String);
-    String fileContent = new String(FileSystemUtils.readContentAsLatin1(path));
+    String fileContent = FileSystemUtils.readContentAsLatin1(path);
     assertThat(latin1String).isEqualTo(fileContent);
   }
 
@@ -195,7 +198,7 @@ public class NativePathTest {
     String latin1String = new String(allLatin1Chars);
     FileSystemUtils.writeContentAsLatin1(path, latin1String);
     byte[] bytes = FileSystemUtils.readContent(path);
-    assertThat(latin1String).isEqualTo(new String(bytes, "ISO-8859-1"));
+    assertThat(latin1String).isEqualTo(new String(bytes, ISO_8859_1));
   }
 
   @Test

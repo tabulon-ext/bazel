@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 package com.google.devtools.build.lib.analysis;
 
 import static com.google.common.truth.Truth.assertThat;
@@ -21,16 +20,12 @@ import static com.google.devtools.build.lib.testutil.MoreAsserts.assertEventCoun
 import static org.junit.Assert.assertThrows;
 
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
-import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.google.devtools.build.lib.actions.Action;
 import com.google.devtools.build.lib.actions.Actions;
 import com.google.devtools.build.lib.actions.Artifact;
 import com.google.devtools.build.lib.actions.FailAction;
-import com.google.devtools.build.lib.analysis.config.transitions.NoTransition;
-import com.google.devtools.build.lib.analysis.config.transitions.NullTransition;
 import com.google.devtools.build.lib.analysis.configuredtargets.InputFileConfiguredTarget;
 import com.google.devtools.build.lib.analysis.configuredtargets.OutputFileConfiguredTarget;
 import com.google.devtools.build.lib.analysis.util.BuildViewTestBase;
@@ -39,7 +34,6 @@ import com.google.devtools.build.lib.buildeventstream.NullConfiguration;
 import com.google.devtools.build.lib.causes.AnalysisFailedCause;
 import com.google.devtools.build.lib.causes.Cause;
 import com.google.devtools.build.lib.cmdline.Label;
-import com.google.devtools.build.lib.cmdline.RepositoryName;
 import com.google.devtools.build.lib.events.OutputFilter.RegexOutputFilter;
 import com.google.devtools.build.lib.packages.BuildType;
 import com.google.devtools.build.lib.packages.Rule;
@@ -48,11 +42,11 @@ import com.google.devtools.build.lib.pkgcache.LoadingFailureEvent;
 import com.google.devtools.build.lib.skyframe.ActionLookupConflictFindingFunction;
 import com.google.devtools.build.lib.skyframe.ConfiguredTargetAndData;
 import com.google.devtools.build.lib.testutil.TestConstants.InternalTestExecutionMode;
-import com.google.devtools.build.lib.testutil.TestRuleClassProvider;
 import com.google.devtools.build.lib.util.Pair;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.skyframe.NotifyingHelper.Listener;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashSet;
@@ -88,36 +82,43 @@ public class BuildViewTest extends BuildViewTestBase {
 
   @Test
   public void testRuleConfiguredTarget() throws Exception {
-    scratch.file("pkg/BUILD",
-        "genrule(name='foo', ",
-        "        cmd = '',",
-        "        srcs=['a.src'],",
-        "        outs=['a.out'])");
+    scratch.file(
+        "pkg/BUILD",
+        """
+        genrule(name='foo',
+                cmd = '',
+                srcs=['a.src'],
+                outs=['a.out'])
+        """);
     update("//pkg:foo");
     Rule ruleTarget = (Rule) getTarget("//pkg:foo");
     assertThat(ruleTarget.getRuleClass()).isEqualTo("genrule");
 
     ConfiguredTargetAndData ruleCTAT = getConfiguredTargetAndTarget("//pkg:foo");
 
-    assertThat(ruleCTAT.getTarget()).isSameInstanceAs(ruleTarget);
+    assertThat(ruleCTAT.getTargetForTesting()).isSameInstanceAs(ruleTarget);
   }
 
   @Test
   public void testFilterByTargets() throws Exception {
-    scratch.file("tests/BUILD",
-        "sh_test(name = 'small_test_1',",
-        "        srcs = ['small_test_1.sh'],",
-        "        data = [':xUnit'],",
-        "        size = 'small',",
-        "        tags = ['tag1'])",
-        "",
-        "sh_test(name = 'small_test_2',",
-        "        srcs = ['small_test_2.sh'],",
-        "        size = 'small',",
-        "        tags = ['tag2'])",
-        "",
-        "",
-        "test_suite( name = 'smallTests', tags=['small'])");
+    scratch.file(
+        "tests/BUILD",
+        """
+        load('//test_defs:foo_test.bzl', 'foo_test')
+        foo_test(name = 'small_test_1',
+                srcs = ['small_test_1.sh'],
+                data = [':xUnit'],
+                size = 'small',
+                tags = ['tag1'])
+
+        foo_test(name = 'small_test_2',
+                srcs = ['small_test_2.sh'],
+                size = 'small',
+                tags = ['tag2'])
+
+
+        test_suite( name = 'smallTests', tags=['small'])
+        """);
     //scratch.file("tests/small_test_1.py");
 
     update("//tests:smallTests");
@@ -133,10 +134,9 @@ public class BuildViewTest extends BuildViewTestBase {
     Collection<ConfiguredTarget> targets =
         new LinkedHashSet<>(ImmutableList.of(test1CT, test2CT, suiteCT));
     targets =
-        Lists.newArrayList(
+        new ArrayList<>(
             BuildView.filterTestsByTargets(
-                targets,
-                Sets.newHashSet(test1.getTarget().getLabel(), suite.getTarget().getLabel())));
+                targets, Sets.newHashSet(test1.getTargetLabel(), suite.getTargetLabel())));
     assertThat(targets).containsExactlyElementsIn(Sets.newHashSet(test1CT, suiteCT));
   }
 
@@ -157,13 +157,9 @@ public class BuildViewTest extends BuildViewTestBase {
     ConfiguredTargetAndData ctad = getConfiguredTargetAndData("//pkg:a.out");
     OutputFileConfiguredTarget output = (OutputFileConfiguredTarget) ctad.getConfiguredTarget();
     Artifact outputArtifact = output.getArtifact();
-    assertThat(outputArtifact.getRoot())
-        .isEqualTo(
-            ctad.getConfiguration()
-                .getBinDirectory(output.getLabel().getPackageIdentifier().getRepository()));
+    assertThat(outputArtifact.getRoot()).isEqualTo(ctad.getConfiguration().getBinDirectory());
     assertThat(outputArtifact.getExecPath())
-        .isEqualTo(
-            ctad.getConfiguration().getBinFragment(RepositoryName.MAIN).getRelative("pkg/a.out"));
+        .isEqualTo(ctad.getConfiguration().getBinFragment().getRelative("pkg/a.out"));
     assertThat(outputArtifact.getRootRelativePath()).isEqualTo(PathFragment.create("pkg/a.out"));
 
     Action action = getGeneratingAction(outputArtifact);
@@ -174,18 +170,25 @@ public class BuildViewTest extends BuildViewTestBase {
   public void testGetArtifactOwnerInStarlark() throws Exception {
     scratch.file(
         "foo/rule.bzl",
-        "def _impl(ctx):",
-        "  f = ctx.actions.declare_file('rule_output')",
-        "  print('f owner is ' + str(f.owner))",
-        "  ctx.actions.write(",
-        "    output = f,",
-        "    content = 'foo',",
-        "  )",
-        "gen = rule(implementation = _impl)");
-    scratch.file("foo/BUILD", "load(':rule.bzl', 'gen')", "gen(name = 'a')");
+        """
+        def _impl(ctx):
+          f = ctx.actions.declare_file('rule_output')
+          print('f owner is ' + str(f.owner))
+          ctx.actions.write(
+            output = f,
+            content = 'foo',
+          )
+        gen = rule(implementation = _impl)
+        """);
+    scratch.file(
+        "foo/BUILD",
+        """
+        load(':rule.bzl', 'gen')
+        gen(name = 'a')
+        """);
 
     update("//foo:a");
-    assertContainsEvent("DEBUG /workspace/foo/rule.bzl:3:8: f owner is //foo:a");
+    assertContainsEvent("DEBUG /workspace/foo/rule.bzl:3:8: f owner is @@//foo:a");
   }
 
   @Test
@@ -198,11 +201,14 @@ public class BuildViewTest extends BuildViewTestBase {
         "        cmd = 'echo')",
         "@");  // syntax error
 
-    scratch.file("b/BUILD",
-        "genrule(name= 'cc',",
-        "        tools = ['//a:x'],",
-        "        outs = ['bar'],",
-        "        cmd = 'echo')");
+    scratch.file(
+        "b/BUILD",
+        """
+        genrule(name= 'cc',
+                tools = ['//a:x'],
+                outs = ['bar'],
+                cmd = 'echo')
+        """);
 
     reporter.removeHandler(failFastHandler);
     AnalysisResult result = update(defaultFlags().with(Flag.KEEP_GOING), "//b:cc");
@@ -213,23 +219,29 @@ public class BuildViewTest extends BuildViewTestBase {
 
   @Test
   public void testReportsVisibilityAnalysisRootCauses() throws Exception {
-    scratch.file("private/BUILD",
-        "genrule(",
-        "    name='private',",
-        "    outs=['private.out'],",
-        "    cmd='',",
-        "    visibility=['//visibility:private'])");
-    scratch.file("foo/BUILD",
-        "genrule(",
-        "    name='foo',",
-        "    tools=[':bar'],",
-        "    outs=['foo.out'],",
-        "    cmd='')",
-        "genrule(",
-        "    name='bar',",
-        "    tools=['//private'],",
-        "    outs=['bar.out'],",
-        "    cmd='')");
+    scratch.file(
+        "private/BUILD",
+        """
+        genrule(
+            name='private',
+            outs=['private.out'],
+            cmd='',
+            visibility=['//visibility:private'])
+        """);
+    scratch.file(
+        "foo/BUILD",
+        """
+        genrule(
+            name='foo',
+            tools=[':bar'],
+            outs=['foo.out'],
+            cmd='')
+        genrule(
+            name='bar',
+            tools=['//private'],
+            outs=['bar.out'],
+            cmd='')
+        """);
 
     reporter.removeHandler(failFastHandler);
     AnalysisFailureRecorder recorder = new AnalysisFailureRecorder();
@@ -253,14 +265,17 @@ public class BuildViewTest extends BuildViewTestBase {
     // //devtools/builddoctor/projects/invalid/java/library_invalid_dep/BUILD#2
     scratch.file(
         "java/BUILD",
-        "java_library(",
-        "    name='library_invalid_dep',",
-        "    srcs=['NoOp.java'],",
-        "    deps=['//non/existent/package:target'])",
-        "java_library(",
-        "    name='other',",
-        "    srcs=['NoOp.java'],",
-        "    deps=[])");
+        """
+        load("@rules_java//java:defs.bzl", "java_library")
+        java_library(
+            name='library_invalid_dep',
+            srcs=['NoOp.java'],
+            deps=['//non/existent/package:target'])
+        java_library(
+            name='other',
+            srcs=['NoOp.java'],
+            deps=[])
+        """);
     scratch.file("java/NoOp.java", "class NoOp { private NoOp() {} }");
 
     reporter.removeHandler(failFastHandler);
@@ -292,14 +307,17 @@ public class BuildViewTest extends BuildViewTestBase {
     // //devtools/builddoctor/projects/invalid/java/library_invalid_dep/BUILD#2
     scratch.file(
         "java/BUILD",
-        "java_library(",
-        "    name='library_invalid_dep',",
-        "    srcs=['NoOp.java'],",
-        "    deps=['//non/existent/package:target'])",
-        "java_library(",
-        "    name='other',",
-        "    srcs=['NoOp.java'],",
-        "    deps=[])");
+        """
+        load("@rules_java//java:defs.bzl", "java_library")
+        java_library(
+            name='library_invalid_dep',
+            srcs=['NoOp.java'],
+            deps=['//non/existent/package:target'])
+        java_library(
+            name='other',
+            srcs=['NoOp.java'],
+            deps=[])
+        """);
     scratch.file("java/NoOp.java", "class NoOp { private NoOp() {} }");
 
     reporter.removeHandler(failFastHandler);
@@ -327,16 +345,19 @@ public class BuildViewTest extends BuildViewTestBase {
     // Regression test for b/155669924, a missed edge case from the fix to b/153480748.
     scratch.file(
         "java/BUILD",
-        "package_group(name = 'group', includes=['//non/existent/package:othergroup'])",
-        "java_library(",
-        "    name='library_invalid_visibility',",
-        "    srcs=['NoOp.java'],",
-        "    deps=[':other'],",
-        "    visibility=[':group'])",
-        "java_library(",
-        "    name='other',",
-        "    srcs=['NoOp.java'],",
-        "    deps=[])");
+        """
+        load("@rules_java//java:defs.bzl", "java_library")
+        package_group(name = 'group', includes=['//non/existent/package:othergroup'])
+        java_library(
+            name='library_invalid_visibility',
+            srcs=['NoOp.java'],
+            deps=[':other'],
+            visibility=[':group'])
+        java_library(
+            name='other',
+            srcs=['NoOp.java'],
+            deps=[])
+        """);
     scratch.file("java/NoOp.java", "class NoOp { private NoOp() {} }");
 
     reporter.removeHandler(failFastHandler);
@@ -362,16 +383,18 @@ public class BuildViewTest extends BuildViewTestBase {
   public void testTestOnlyFailureReported() throws Exception {
     scratch.file(
         "foo/BUILD",
-        "genrule(",
-        "    name='foo',",
-        "    tools=[':bar'],",
-        "    outs=['foo.out'],",
-        "    cmd='')",
-        "genrule(",
-        "    name='bar',",
-        "    outs=['bar.out'],",
-        "    testonly=1,",
-        "    cmd='')");
+        """
+        genrule(
+            name='foo',
+            tools=[':bar'],
+            outs=['foo.out'],
+            cmd='')
+        genrule(
+            name='bar',
+            outs=['bar.out'],
+            testonly=1,
+            cmd='')
+        """);
 
     reporter.removeHandler(failFastHandler);
     AnalysisFailureRecorder recorder = new AnalysisFailureRecorder();
@@ -391,8 +414,14 @@ public class BuildViewTest extends BuildViewTestBase {
 
   @Test
   public void testAnalysisReportsDependencyCycle() throws Exception {
-    scratch.file("foo/BUILD", "sh_library(name='foo',deps=['//bar'])");
-    scratch.file("bar/BUILD", "sh_library(name='bar',deps=[':bar'])");
+    scratch.file(
+        "foo/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name='foo',deps=['//bar'])");
+    scratch.file(
+        "bar/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name='bar',deps=[':bar'])");
 
     reporter.removeHandler(failFastHandler);
     AnalysisFailureRecorder recorder = new AnalysisFailureRecorder();
@@ -409,10 +438,13 @@ public class BuildViewTest extends BuildViewTestBase {
     // This test checks that two simultaneous errors are both reported:
     // - missing outs attribute,
     // - package referenced in tools does not exist
-    scratch.file("pkg/BUILD",
-        "genrule(name='foo',",
-        "        tools=['//nopackage:missing'],",
-        "        cmd='')");
+    scratch.file(
+        "pkg/BUILD",
+        """
+        genrule(name='foo',
+                tools=['//nopackage:missing'],
+                cmd='')
+        """);
 
     reporter.removeHandler(failFastHandler);
     LoadingFailureRecorder loadingRecorder = new LoadingFailureRecorder();
@@ -431,7 +463,7 @@ public class BuildViewTest extends BuildViewTestBase {
             ? analysisFailureCauses.get(0)
             : analysisFailureCauses.get(1);
     assertThat(missingPackageCause.getLabel())
-        .isEqualTo(Label.parseAbsolute("//nopackage:missing", ImmutableMap.of()));
+        .isEqualTo(Label.parseCanonical("//nopackage:missing"));
     assertContainsEvent("missing value for mandatory attribute 'outs'");
     assertContainsEvent("no such package 'nopackage'");
     // Skyframe correctly reports the other root cause as the genrule itself (since it is
@@ -440,16 +472,19 @@ public class BuildViewTest extends BuildViewTestBase {
     assertThat(loadingRecorder.events)
         .contains(
             new LoadingFailureEvent(
-                Label.parseAbsolute("//pkg:foo", ImmutableMap.of()),
-                Label.parseAbsolute("//pkg:foo", ImmutableMap.of())));
+                Label.parseCanonical("//pkg:foo"), Label.parseCanonical("//pkg:foo")));
   }
 
   @Test
   public void testMultipleRootCauseReporting() throws Exception {
-    scratch.file("gp/BUILD",
-        "sh_library(name = 'gp', deps = ['//p:p'])");
-    scratch.file("p/BUILD",
-        "sh_library(name = 'p', deps = ['//c1:not', '//c2:not'])");
+    scratch.file(
+        "gp/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'gp', deps = ['//p:p'])");
+    scratch.file(
+        "p/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'p', deps = ['//c1:not', '//c2:not'])");
     scratch.file("c1/BUILD");
     scratch.file("c2/BUILD");
     reporter.removeHandler(failFastHandler);
@@ -461,13 +496,11 @@ public class BuildViewTest extends BuildViewTestBase {
     assertThat(recorder.events)
         .contains(
             new LoadingFailureEvent(
-                Label.parseAbsolute("//gp", ImmutableMap.of()),
-                Label.parseAbsolute("//c1:not", ImmutableMap.of())));
+                Label.parseCanonical("//gp"), Label.parseCanonical("//c1:not")));
     assertThat(recorder.events)
         .contains(
             new LoadingFailureEvent(
-                Label.parseAbsolute("//gp", ImmutableMap.of()),
-                Label.parseAbsolute("//c2:not", ImmutableMap.of())));
+                Label.parseCanonical("//gp"), Label.parseCanonical("//c2:not")));
   }
 
   /**
@@ -475,9 +508,12 @@ public class BuildViewTest extends BuildViewTestBase {
    */
   @Test
   public void testTopLevelPackageGroup() throws Exception {
-    scratch.file("tropical/BUILD",
-        "package_group(name='guava', includes=[':mango'])",
-        "package_group(name='mango')");
+    scratch.file(
+        "tropical/BUILD",
+        """
+        package_group(name='guava', includes=[':mango'])
+        package_group(name='mango')
+        """);
 
     // If the analysis phase results in an error, this will throw an exception
     update("//tropical:guava");
@@ -498,53 +534,18 @@ public class BuildViewTest extends BuildViewTestBase {
   public void testGetDirectPrerequisites() throws Exception {
     scratch.file(
         "package/BUILD",
-        "filegroup(name='top', srcs=[':inner', 'file'])",
-        "sh_binary(name='inner', srcs=['script.sh'])");
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        filegroup(name='top', srcs=[':inner', 'file'])
+        foo_library(name='inner', srcs=['script.sh'])
+        """);
     update("//package:top");
     ConfiguredTarget top = getConfiguredTarget("//package:top", getTargetConfiguration());
-    Iterable<ConfiguredTarget> targets = getView().getDirectPrerequisitesForTesting(
-        reporter, top, getBuildConfigurationCollection());
+    Iterable<ConfiguredTarget> targets = getView().getDirectPrerequisitesForTesting(reporter, top);
     Iterable<Label> labels = Iterables.transform(targets, TransitiveInfoCollection::getLabel);
     assertThat(labels)
         .containsExactly(
-            Label.parseAbsolute("//package:inner", ImmutableMap.of()),
-            Label.parseAbsolute("//package:file", ImmutableMap.of()));
-  }
-
-  @Test
-  public void testGetDirectPrerequisiteDependencies() throws Exception {
-    // Override the trimming transition to not distort the results.
-    ConfiguredRuleClassProvider.Builder builder =
-        new ConfiguredRuleClassProvider.Builder();
-    TestRuleClassProvider.addStandardRules(builder);
-    builder.overrideTrimmingTransitionFactoryForTesting((rule) -> NoTransition.INSTANCE);
-    useRuleClassProvider(builder.build());
-
-    update();
-
-    scratch.file(
-        "package/BUILD",
-        "filegroup(name='top', srcs=[':inner', 'file'])",
-        "sh_binary(name='inner', srcs=['script.sh'])");
-    ConfiguredTarget top = Iterables.getOnlyElement(update("//package:top").getTargetsToBuild());
-    Iterable<DependencyKey> targets =
-        getView()
-            .getDirectPrerequisiteDependenciesForTesting(
-                reporter, top, getBuildConfigurationCollection(), /* toolchainContexts= */ null)
-            .values();
-
-    DependencyKey innerDependency =
-        DependencyKey.builder()
-            .setLabel(Label.parseAbsolute("//package:inner", ImmutableMap.of()))
-            .setTransition(NoTransition.INSTANCE)
-            .build();
-    DependencyKey fileDependency =
-        DependencyKey.builder()
-            .setLabel(Label.parseAbsolute("//package:file", ImmutableMap.of()))
-            .setTransition(NullTransition.INSTANCE)
-            .build();
-
-    assertThat(targets).containsExactly(innerDependency, fileDependency);
+            Label.parseCanonical("//package:inner"), Label.parseCanonical("//package:file"));
   }
 
   // Regression test: "output_filter broken (but in a different way)"
@@ -570,23 +571,31 @@ public class BuildViewTest extends BuildViewTestBase {
   public void testOutputFilterWithDebug() throws Exception {
     scratch.file(
         "java/a/BUILD",
-        "java_library(name = 'a',",
-        "  srcs = ['A.java'],",
-        "  deps = ['//java/b'])");
+        """
+        load("@rules_java//java:defs.bzl", "java_library")
+        java_library(name = 'a',
+          srcs = ['A.java'],
+          deps = ['//java/b'])
+        """);
     scratch.file(
         "java/b/rules.bzl",
-        "def _impl(ctx):",
-        "  print('debug in b')",
-        "  ctx.actions.write(",
-        "    output = ctx.outputs.my_output,",
-        "    content = 'foo',",
-        "  )",
-        "gen = rule(implementation = _impl, outputs = {'my_output': 'B.java'})");
+        """
+        def _impl(ctx):
+          print('debug in b')
+          ctx.actions.write(
+            output = ctx.outputs.my_output,
+            content = 'foo',
+          )
+        gen = rule(implementation = _impl, outputs = {'my_output': 'B.java'})
+        """);
     scratch.file(
         "java/b/BUILD",
-        "load(':rules.bzl', 'gen')",
-        "gen(name='src')",
-        "java_library(name = 'b', srcs = [':src'])");
+        """
+        load("@rules_java//java:defs.bzl", "java_library")
+        load(':rules.bzl', 'gen')
+        gen(name='src')
+        java_library(name = 'b', srcs = [':src'])
+        """);
     reporter.setOutputFilter(RegexOutputFilter.forPattern(Pattern.compile("^//java/a")));
 
     update("//java/a:a");
@@ -595,7 +604,21 @@ public class BuildViewTest extends BuildViewTestBase {
 
   @Test
   public void testAnalysisErrorMessageWithKeepGoing() throws Exception {
-    scratch.file("a/BUILD", "sh_binary(name='a', srcs=['a1.sh', 'a2.sh'])");
+    scratch.file(
+        "a/foo_one.bzl",
+        """
+        def _impl(ctx):
+          if len(ctx.files.srcs) != 1:
+             fail("you must specify exactly one file in 'srcs'", attr = "srcs")
+        foo_one = rule(
+          implementation = _impl,
+          attrs = {
+            "srcs": attr.label_list(allow_files=True),
+          },
+        )
+        """);
+    scratch.file(
+        "a/BUILD", "load(':foo_one.bzl', 'foo_one')", "foo_one(name='a', srcs=['a1.sh', 'a2.sh'])");
     reporter.removeHandler(failFastHandler);
     AnalysisResult result = update(defaultFlags().with(Flag.KEEP_GOING), "//a");
     assertThat(result.hasError()).isTrue();
@@ -612,18 +635,21 @@ public class BuildViewTest extends BuildViewTestBase {
       // TODO(b/67412276): handle cycles properly.
       return;
     }
-    scratch.file("foo/BUILD",
-        "sh_library(name = 'top1', srcs = ['top1.sh'], deps = [':rec1'])",
-        "sh_library(name = 'top2', srcs = ['top2.sh'], deps = [':rec1'])",
-        "sh_library(name = 'rec1', srcs = ['rec1.sh'], deps = [':rec2'])",
-        "sh_library(name = 'rec2', srcs = ['rec2.sh'], deps = [':rec1'])"
-    );
+    scratch.file(
+        "foo/BUILD",
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        foo_library(name = 'top1', srcs = ['top1.sh'], deps = [':rec1'])
+        foo_library(name = 'top2', srcs = ['top2.sh'], deps = [':rec1'])
+        foo_library(name = 'rec1', srcs = ['rec1.sh'], deps = [':rec2'])
+        foo_library(name = 'rec2', srcs = ['rec2.sh'], deps = [':rec1'])
+        """);
     reporter.removeHandler(failFastHandler);
     AnalysisResult result =
         update(defaultFlags().with(Flag.KEEP_GOING), "//foo:top1", "//foo:top2");
     assertThat(result.hasError()).isTrue();
-    assertContainsEvent("in sh_library rule //foo:rec1: cycle in dependency graph:\n");
-    assertContainsEvent("in sh_library rule //foo:top");
+    assertContainsEvent("in foo_library rule //foo:rec1: cycle in dependency graph:\n");
+    assertContainsEvent("in foo_library rule //foo:top");
   }
 
   // Regression test: cycle node depends on error.
@@ -633,12 +659,16 @@ public class BuildViewTest extends BuildViewTestBase {
       // TODO(b/67651960): fix or justify disabling (also b/67412276: handle cycles properly).
       return;
     }
-    scratch.file("foo/BUILD",
-        "sh_library(name = 'top', deps = ['mid'])",
-        "sh_library(name = 'mid', deps = ['bad', 'cycle1'])",
-        "sh_library(name = 'bad', srcs = ['//badbuild:isweird'])",
-        "sh_library(name = 'cycle1', deps = ['cycle2', 'mid'])",
-        "sh_library(name = 'cycle2', deps = ['cycle1'])");
+    scratch.file(
+        "foo/BUILD",
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        foo_library(name = 'top', deps = ['mid'])
+        foo_library(name = 'mid', deps = ['bad', 'cycle1'])
+        foo_library(name = 'bad', srcs = ['//badbuild:isweird'])
+        foo_library(name = 'cycle1', deps = ['cycle2', 'mid'])
+        foo_library(name = 'cycle2', deps = ['cycle1'])
+        """);
     scratch.file("badbuild/BUILD", "");
     reporter.removeHandler(failFastHandler);
     injectGraphListenerForTesting(Listener.NULL_LISTENER, /*deterministic=*/ true);
@@ -646,7 +676,7 @@ public class BuildViewTest extends BuildViewTestBase {
     assertContainsEvent("no such target '//badbuild:isweird': target 'isweird' not declared in "
         + "package 'badbuild'");
     assertContainsEvent("and referenced by '//foo:bad'");
-    assertContainsEvent("in sh_library rule //foo");
+    assertContainsEvent("in foo_library rule //foo");
     assertContainsEvent("cycle in dependency graph");
     assertEventCountAtLeast(2, eventCollector);
   }
@@ -657,19 +687,23 @@ public class BuildViewTest extends BuildViewTestBase {
       // TODO(b/67412276): handle cycles properly.
       return;
     }
-    scratch.file("foo/BUILD",
-        "sh_library(name = 'top', deps = ['mid'])",
-        "sh_library(name = 'mid', deps = ['bad', 'cycle1'])",
-        "sh_library(name = 'bad', srcs = ['//badbuild:isweird'])",
-        "sh_library(name = 'cycle1', deps = ['cycle2', 'mid'])",
-        "sh_library(name = 'cycle2', deps = ['cycle1'])");
+    scratch.file(
+        "foo/BUILD",
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        foo_library(name = 'top', deps = ['mid'])
+        foo_library(name = 'mid', deps = ['bad', 'cycle1'])
+        foo_library(name = 'bad', srcs = ['//badbuild:isweird'])
+        foo_library(name = 'cycle1', deps = ['cycle2', 'mid'])
+        foo_library(name = 'cycle2', deps = ['cycle1'])
+        """);
     scratch.file("badbuild/BUILD", "");
     reporter.removeHandler(failFastHandler);
     update(defaultFlags().with(Flag.KEEP_GOING), "//foo:top");
     assertContainsEvent("no such target '//badbuild:isweird': target 'isweird' not declared in "
         + "package 'badbuild'");
     assertContainsEvent("and referenced by '//foo:bad'");
-    assertContainsEvent("in sh_library rule //foo");
+    assertContainsEvent("in foo_library rule //foo");
     assertContainsEvent("cycle in dependency graph");
     // This error is triggered both in configuration trimming (which visits the transitive target
     // closure) and in the normal configured target cycle detection path. So we get an additional
@@ -683,10 +717,13 @@ public class BuildViewTest extends BuildViewTestBase {
   public void testAnalysisEntryHasActionsEvenWithError() throws Exception {
     scratch.file(
         "foo/BUILD",
-        "genquery(name = 'foo',",
-        "         expression = 'deps(//foo:nosuchtarget)',",
-        "         scope = ['//foo:a'])",
-        "sh_library(name = 'a')");
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        genquery(name = 'foo',
+                 expression = 'deps(//foo:nosuchtarget)',
+                 scope = ['//foo:a'])
+        foo_library(name = 'a')
+        """);
     reporter.removeHandler(failFastHandler);
     assertThrows(ViewCreationFailedException.class, () -> update("//foo:foo"));
   }
@@ -695,33 +732,43 @@ public class BuildViewTest extends BuildViewTestBase {
   public void testHelpfulErrorForWrongPackageLabels() throws Exception {
     reporter.removeHandler(failFastHandler);
 
-    scratch.file("x/BUILD",
+    scratch.file(
+        "x/BUILD",
+        "load('@rules_cc//cc:cc_library.bzl', 'cc_library')",
         "cc_library(name='x', srcs=['x.cc'])");
-    scratch.file("y/BUILD",
+    scratch.file(
+        "y/BUILD",
+        "load('@rules_cc//cc:cc_library.bzl', 'cc_library')",
         "cc_library(name='y', srcs=['y.cc'], deps=['//x:z'])");
 
     AnalysisResult result = update(defaultFlags().with(Flag.KEEP_GOING), "//y:y");
     assertThat(result.hasError()).isTrue();
-    assertContainsEvent("no such target '//x:z': "
-        + "target 'z' not declared in package 'x' "
-        + "defined by /workspace/x/BUILD and referenced by '//y:y'");
+    assertContainsEvent(
+        "no such target '//x:z': target 'z' not declared in package 'x' defined by"
+            + " /workspace/x/BUILD");
   }
 
   @Test
   public void testNewActionsAreDifferentAndDontConflict() throws Exception {
-    scratch.file("pkg/BUILD",
-        "genrule(name='a', ",
-        "        cmd='',",
-        "        outs=['a.out'])");
+    scratch.file(
+        "pkg/BUILD",
+        """
+        genrule(name='a',
+                cmd='',
+                outs=['a.out'])
+        """);
     OutputFileConfiguredTarget outputCT = (OutputFileConfiguredTarget)
         Iterables.getOnlyElement(update("//pkg:a.out").getTargetsToBuild());
     Artifact outputArtifact = outputCT.getArtifact();
     Action action = getGeneratingAction(outputArtifact);
     assertThat(action).isNotNull();
-    scratch.overwriteFile("pkg/BUILD",
-        "genrule(name='a', ",
-        "        cmd='false',",
-        "        outs=['a.out'])");
+    scratch.overwriteFile(
+        "pkg/BUILD",
+        """
+        genrule(name='a',
+                cmd='false',
+                outs=['a.out'])
+        """);
     update("//pkg:a.out");
     assertWithMessage("Actions should not be compatible")
         .that(Actions.canBeShared(actionKeyContext, action, getGeneratingAction(outputArtifact)))
@@ -746,32 +793,56 @@ public class BuildViewTest extends BuildViewTestBase {
   public void testMultiBuildInvalidationRevalidation() throws Exception {
     scratch.file("java/a/A.java", "bla1");
     scratch.file("java/a/C.java", "bla2");
-    scratch.file("java/a/BUILD",
-        "java_test(name = 'A',",
-        "          srcs = glob(['A*.java']))",
-        "java_test(name = 'B',",
-        "          srcs = ['B.java'])");
+    scratch.file(
+        "java/a/BUILD",
+        """
+        load("@rules_java//java:defs.bzl", "java_test")
+        java_test(name = 'A',
+                  srcs = glob(['A*.java']))
+        java_test(name = 'B',
+                  srcs = ['B.java'])
+        """);
+    useConfiguration("--experimental_google_legacy_api");
     ConfiguredTarget ct = Iterables.getOnlyElement(update("//java/a:A").getTargetsToBuild());
     scratch.deleteFile("java/a/C.java");
     update("//java/a:B");
     update("//java/a:A");
-    assertThat(getGeneratingAction(getBinArtifact("A_deploy.jar", ct))).isNotNull();
+    assertThat(getGeneratingAction(getBinArtifact("A.jar", ct))).isNotNull();
   }
 
   /** Regression test for b/14248208. */
   @Test
   public void testDepOnGoodTargetInBadPkgAndTransitivelyBadTarget() throws Exception {
     reporter.removeHandler(failFastHandler);
-    scratch.file("parent/BUILD",
-        "sh_library(name = 'foo',",
-        "           srcs = ['//badpkg1:okay-target', '//okaypkg:transitively-bad-target'])");
+    scratch.file(
+        "parent/BUILD",
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        foo_library(name = 'foo',
+                   srcs = ['//badpkg1:okay-target', '//okaypkg:transitively-bad-target'])
+        """);
     Path badpkg1BuildFile =
-        scratch.file("badpkg1/BUILD", "exports_files(['okay-target'])", "fail()");
-    scratch.file("okaypkg/BUILD",
-        "sh_library(name = 'transitively-bad-target',",
-        "           srcs = ['//badpkg2:bad-target'])");
+        scratch.file(
+            "badpkg1/BUILD",
+            """
+            exports_files(['okay-target'])
+            fail()
+            """);
+    scratch.file(
+        "okaypkg/BUILD",
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        foo_library(name = 'transitively-bad-target',
+                   srcs = ['//badpkg2:bad-target'])
+        """);
     Path badpkg2BuildFile =
-        scratch.file("badpkg2/BUILD", "sh_library(name = 'bad-target')", "fail()");
+        scratch.file(
+            "badpkg2/BUILD",
+            """
+            load('//test_defs:foo_library.bzl', 'foo_library')
+            foo_library(name = 'bad-target')
+            fail()
+            """);
     update(defaultFlags().with(Flag.KEEP_GOING), "//parent:foo");
     // Each event string may contain stack traces and error messages with multiple file names.
     assertContainsEventWithFrequency(badpkg1BuildFile.asFragment().getPathString(), 1);
@@ -805,9 +876,12 @@ public class BuildViewTest extends BuildViewTestBase {
     reporter.removeHandler(failFastHandler);
     scratch.file(
         "cycles/BUILD",
-        "sh_library(name = 'a', deps = [':b'])",
-        "sh_library(name = 'b', deps = [':a'])",
-        "x = 1//0"); // dynamic error
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        foo_library(name = 'a', deps = [':b'])
+        foo_library(name = 'b', deps = [':a'])
+        x = 1//0
+        """); // dynamic error
     update(defaultFlags().with(Flag.KEEP_GOING), "//cycles:a");
     assertContainsEvent("division by zero");
     assertContainsEvent("cycle in dependency graph");
@@ -821,8 +895,19 @@ public class BuildViewTest extends BuildViewTestBase {
     }
     reporter.removeHandler(failFastHandler);
     scratch.file(
-        "parent/BUILD", "sh_library(name = 'a', deps = ['//child:b'])", "fail('parentisbad')");
-    scratch.file("child/BUILD", "sh_library(name = 'b')", "fail('childisbad')");
+        "parent/BUILD",
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        foo_library(name = 'a', deps = ['//child:b'])
+        fail('parentisbad')
+        """);
+    scratch.file(
+        "child/BUILD",
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        foo_library(name = 'b')
+        fail('childisbad')
+        """);
     update(defaultFlags().with(Flag.KEEP_GOING), "//parent:a");
     assertContainsEventWithFrequency("parentisbad", 1);
     assertContainsEventWithFrequency("childisbad", 1);
@@ -859,21 +944,25 @@ public class BuildViewTest extends BuildViewTestBase {
     // Then update the BUILD file and re-analyze.
     scratch.file(
         "foo/failer.bzl",
-        "def _impl(ctx):",
-        "  if ctx.attr.fail:",
-        "    fail('failing')",
-        "  ctx.actions.run_shell(outputs=[ctx.outputs.out], command='null')",
-        "failer = rule(",
-        "  _impl,",
-        "  attrs = {",
-        "    'fail': attr.bool(),",
-        "    'out': attr.output(),",
-        "  },",
-        ")");
+        """
+        def _impl(ctx):
+          if ctx.attr.fail:
+            fail('failing')
+          ctx.actions.run_shell(outputs=[ctx.outputs.out], command='null')
+        failer = rule(
+          _impl,
+          attrs = {
+            'fail': attr.bool(),
+            'out': attr.output(),
+          },
+        )
+        """);
     scratch.overwriteFile(
         "foo/BUILD",
-        "load(':failer.bzl', 'failer')",
-        "failer(name = 'foo', fail = False, out = 'foo.txt')");
+        """
+        load(':failer.bzl', 'failer')
+        failer(name = 'foo', fail = False, out = 'foo.txt')
+        """);
     ConfiguredTarget foo = Iterables.getOnlyElement(update("//foo:foo").getTargetsToBuild());
     Artifact fooOut = foo.getProvider(FileProvider.class).getFilesToBuild().getSingleton();
     assertThat(getActionGraph().getGeneratingAction(fooOut)).isNotNull();
@@ -882,8 +971,10 @@ public class BuildViewTest extends BuildViewTestBase {
     // Overwrite with an analysis-time error.
     scratch.overwriteFile(
         "foo/BUILD",
-        "load(':failer.bzl', 'failer')",
-        "failer(name = 'foo', fail = True, out = 'foo.txt')");
+        """
+        load(':failer.bzl', 'failer')
+        failer(name = 'foo', fail = True, out = 'foo.txt')
+        """);
 
     reporter.removeHandler(failFastHandler);
 
@@ -897,24 +988,33 @@ public class BuildViewTest extends BuildViewTestBase {
    */
   @Test
   public void testSkyframeAnalyzeRuleThenItsOutputFile() throws Exception {
-    scratch.file("pkg/BUILD",
-        "testing_dummy_rule(name='foo', ",
-        "                   srcs=['a.src'],",
-        "                   outs=['a.out'])");
+    scratch.file(
+        "pkg/BUILD",
+        """
+        testing_dummy_rule(name='foo',
+                           srcs=['a.src'],
+                           outs=['a.out'])
+        """);
 
-    scratch.file("pkg2/BUILD",
-        "testing_dummy_rule(name='foo', ",
-        "                   srcs=['a.src'],",
-        "                   outs=['a.out'])");
+    scratch.file(
+        "pkg2/BUILD",
+        """
+        testing_dummy_rule(name='foo',
+                           srcs=['a.src'],
+                           outs=['a.out'])
+        """);
     String aoutLabel = "//pkg:a.out";
 
     update("//pkg2:foo");
     update("//pkg:foo");
-    scratch.overwriteFile("pkg2/BUILD",
-        "testing_dummy_rule(name='foo', ",
-        "                   srcs=['a.src'],",
-        "                   outs=['a.out'])",
-        "# Comment");
+    scratch.overwriteFile(
+        "pkg2/BUILD",
+        """
+        testing_dummy_rule(name='foo',
+                           srcs=['a.src'],
+                           outs=['a.out'])
+        # Comment
+        """);
 
     update("//pkg:a.out");
 
@@ -933,18 +1033,32 @@ public class BuildViewTest extends BuildViewTestBase {
    */
   @Test
   public void testRootCauseReportingFileSymlinks() throws Exception {
-    scratch.file("gp/BUILD",
-        "sh_library(name = 'gp', deps = ['//p'])");
-    scratch.file("p/BUILD",
-        "sh_library(name = 'p', deps = ['//c'])");
-    scratch.file("c/BUILD",
-        "sh_library(name = 'c', deps = [':c1', ':c2'])",
-        "sh_library(name = 'c1', deps = ['//cycles1'])",
-        "sh_library(name = 'c2', deps = ['//cycles2'])");
-    Path cycles1BuildFilePath = scratch.file("cycles1/BUILD",
-        "sh_library(name = 'cycles1', srcs = glob(['*.sh']))");
-    Path cycles2BuildFilePath = scratch.file("cycles2/BUILD",
-        "sh_library(name = 'cycles2', srcs = glob(['*.sh']))");
+    scratch.file(
+        "gp/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'gp', deps = ['//p'])");
+    scratch.file(
+        "p/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'p', deps = ['//c'])");
+    scratch.file(
+        "c/BUILD",
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        foo_library(name = 'c', deps = [':c1', ':c2'])
+        foo_library(name = 'c1', deps = ['//cycles1'])
+        foo_library(name = 'c2', deps = ['//cycles2'])
+        """);
+    Path cycles1BuildFilePath =
+        scratch.file(
+            "cycles1/BUILD",
+            "load('//test_defs:foo_library.bzl', 'foo_library')",
+            "foo_library(name = 'cycles1', srcs = glob(['*.sh']))");
+    Path cycles2BuildFilePath =
+        scratch.file(
+            "cycles2/BUILD",
+            "load('//test_defs:foo_library.bzl', 'foo_library')",
+            "foo_library(name = 'cycles2', srcs = glob(['*.sh']))");
     cycles1BuildFilePath.getParentDirectory().getRelative("cycles1.sh").createSymbolicLink(
         PathFragment.create("cycles1.sh"));
     cycles2BuildFilePath.getParentDirectory().getRelative("cycles2.sh").createSymbolicLink(
@@ -959,9 +1073,7 @@ public class BuildViewTest extends BuildViewTestBase {
     List<Label> rootCauseLabels =
         event.getRootCauses().toList().stream().map(Cause::getLabel).collect(Collectors.toList());
     assertThat(rootCauseLabels)
-        .containsExactly(
-            Label.parseAbsolute("//cycles1", ImmutableMap.of()),
-            Label.parseAbsolute("//cycles2", ImmutableMap.of()));
+        .containsExactly(Label.parseCanonical("//cycles1"), Label.parseCanonical("//cycles2"));
   }
 
   /**
@@ -981,15 +1093,18 @@ public class BuildViewTest extends BuildViewTestBase {
     // them will come before //foo:nosuchtarget.
     scratch.file(
         "foo/BUILD",
-        "genquery(name = 'query',",
-        "         expression = 'deps(//foo:b) except //foo:nosuchtarget except //foo:z',",
-        "         scope = ['//foo:a'])",
-        "genquery(name = 'zquery',",
-        "         expression = 'deps(//foo:nosuchtarget)',",
-        "         scope = ['//foo:a'])",
-        "sh_library(name = 'a')",
-        "sh_library(name = 'b')",
-        "sh_library(name = 'z')");
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        genquery(name = 'query',
+                 expression = 'deps(//foo:b) except //foo:nosuchtarget except //foo:z',
+                 scope = ['//foo:a'])
+        genquery(name = 'zquery',
+                 expression = 'deps(//foo:nosuchtarget)',
+                 scope = ['//foo:a'])
+        foo_library(name = 'a')
+        foo_library(name = 'b')
+        foo_library(name = 'z')
+        """);
     reporter.removeHandler(failFastHandler);
     ViewCreationFailedException e =
         assertThrows(ViewCreationFailedException.class, () -> update("//foo:zquery"));
@@ -1012,13 +1127,17 @@ public class BuildViewTest extends BuildViewTestBase {
       // TODO(b/67651960): fix or justify disabling.
       return;
     }
-    useConfiguration("--cpu=k8");
+    useConfiguration("--compilation_mode=fastbuild");
     reporter.removeHandler(failFastHandler); // Expect errors from action conflicts.
     scratch.file(
         "conflict/BUILD",
-        "config_setting(name = 'a', values = {'cpu': 'unobtainiumx'})",
-        "cc_library(name='x', srcs=select({':a': ['a.cc'], '//conditions:default': ['foo.cc']}))",
-        "cc_binary(name='_objs/x/foo.o', srcs=['bar.cc'])");
+        """
+        load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+        load("@rules_cc//cc:cc_library.bzl", "cc_library")
+        config_setting(name = 'a', values = {'compilation_mode': 'dbg'})
+        cc_library(name='x', srcs=select({':a': ['a.cc'], '//conditions:default': ['foo.cc']}))
+        cc_binary(name='_objs/x/foo.o', srcs=['bar.cc'])
+        """);
     AnalysisResult result =
         update(defaultFlags().with(Flag.KEEP_GOING), "//conflict:_objs/x/foo.o", "//conflict:x");
     assertThat(result.hasError()).isTrue();
@@ -1032,9 +1151,14 @@ public class BuildViewTest extends BuildViewTestBase {
       // TODO(b/67412276): handle cycles properly.
       return;
     }
-    scratch.file("foo/BUILD",
-        "java_binary(name = 'java', srcs = ['DoesntMatter.java'])",
-        "cc_binary(name = 'cpp', data = [':java'])");
+    scratch.file(
+        "foo/BUILD",
+        """
+        load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+        load("@rules_java//java:defs.bzl", "java_binary")
+        java_binary(name = 'java', srcs = ['DoesntMatter.java'])
+        cc_binary(name = 'cpp', data = [':java'])
+        """);
     // Everything is fine - the dependency graph is acyclic.
     update("//foo:java", "//foo:cpp");
 
@@ -1052,10 +1176,11 @@ public class BuildViewTest extends BuildViewTestBase {
 
   @Test
   public void testDependsOnBrokenTarget() throws Exception {
-    scratch.file("foo/BUILD",
-        "sh_test(name = 'test', srcs = ['test.sh'], data = ['//bar:data'])");
-    scratch.file("bar/BUILD",
-        "BROKEN BROKEN BROKEN!!!");
+    scratch.file(
+        "foo/BUILD",
+        "load('//test_defs:foo_test.bzl', 'foo_test')",
+        "foo_test(name = 'test', srcs = ['test.sh'], data = ['//bar:data'])");
+    scratch.file("bar/BUILD", "BROKEN BROKEN BROKEN!!!");
     reporter.removeHandler(failFastHandler);
     ViewCreationFailedException expected =
         assertThrows(ViewCreationFailedException.class, () -> update("//foo:test"));
@@ -1074,9 +1199,13 @@ public class BuildViewTest extends BuildViewTestBase {
       // TODO(b/67412276): handle cycles properly.
       return;
     }
-    scratch.file("cycle/BUILD",
-        "cc_library(name = 'foo', srcs = ['foo.cc'], deps = [':bar'])",
-        "cc_library(name = 'bar', srcs = ['bar.cc'], deps = [':foo'])");
+    scratch.file(
+        "cycle/BUILD",
+        """
+        load("@rules_cc//cc:cc_library.bzl", "cc_library")
+        cc_library(name = 'foo', srcs = ['foo.cc'], deps = [':bar'])
+        cc_library(name = 'bar', srcs = ['bar.cc'], deps = [':foo'])
+        """);
     reporter.removeHandler(failFastHandler);
     ViewCreationFailedException expected =
         assertThrows(ViewCreationFailedException.class, () -> update("//cycle:foo"));
@@ -1096,13 +1225,17 @@ public class BuildViewTest extends BuildViewTestBase {
       // TODO(b/67412276): handle cycles properly.
       return;
     }
-    scratch.file("cycle/BUILD",
-        "cc_library(name = 'foo', srcs = ['foo.cc'], deps = [':bar'])",
-        "cc_library(name = 'bar', srcs = ['bar.cc'], deps = [':foo'])",
-        "cc_library(name = 'bat', srcs = ['bat.cc'], deps = [':bas'])",
-        "cc_library(name = 'bas', srcs = ['bas.cc'], deps = [':bau'])",
-        "cc_library(name = 'bau', srcs = ['bas.cc'], deps = [':bas'])",
-        "cc_library(name = 'baz', srcs = ['baz.cc'])");
+    scratch.file(
+        "cycle/BUILD",
+        """
+        load("@rules_cc//cc:cc_library.bzl", "cc_library")
+        cc_library(name = 'foo', srcs = ['foo.cc'], deps = [':bar'])
+        cc_library(name = 'bar', srcs = ['bar.cc'], deps = [':foo'])
+        cc_library(name = 'bat', srcs = ['bat.cc'], deps = [':bas'])
+        cc_library(name = 'bas', srcs = ['bas.cc'], deps = [':bau'])
+        cc_library(name = 'bau', srcs = ['bas.cc'], deps = [':bas'])
+        cc_library(name = 'baz', srcs = ['baz.cc'])
+        """);
     reporter.removeHandler(failFastHandler);
     LoadingFailureRecorder loadingFailureRecorder = new LoadingFailureRecorder();
     AnalysisFailureRecorder analysisFailureRecorder = new AnalysisFailureRecorder();
@@ -1113,9 +1246,9 @@ public class BuildViewTest extends BuildViewTestBase {
     assertContainsEvent("in cc_library rule //cycle:foo: cycle in dependency graph:");
     assertContainsEvent("in cc_library rule //cycle:bas: cycle in dependency graph:");
     assertContainsEvent(
-        "errors encountered while analyzing target '//cycle:foo': it will not be built");
+        "errors encountered while analyzing target '//cycle:foo', it will not be built");
     assertContainsEvent(
-        "errors encountered while analyzing target '//cycle:bat': it will not be built");
+        "errors encountered while analyzing target '//cycle:bat', it will not be built");
     // With interleaved loading and analysis, we can no longer distinguish loading-phase cycles
     // and analysis-phase cycles. This was previously reported as a loading-phase cycle, as it
     // happens with any configuration (cycle is hard-coded in the BUILD files). Also see the
@@ -1129,8 +1262,14 @@ public class BuildViewTest extends BuildViewTestBase {
 
   @Test
   public void testLoadingErrorReportedCorrectly() throws Exception {
-    scratch.file("a/BUILD", "cc_library(name='a')");
-    scratch.file("b/BUILD", "cc_library(name='b', deps = ['//missing:lib'])");
+    scratch.file(
+        "a/BUILD",
+        "load('@rules_cc//cc:cc_library.bzl', 'cc_library')",
+        "cc_library(name='a')");
+    scratch.file(
+        "b/BUILD",
+        "load('@rules_cc//cc:cc_library.bzl', 'cc_library')",
+        "cc_library(name='b', deps = ['//missing:lib'])");
 
     reporter.removeHandler(failFastHandler);
     AnalysisResult result = update(defaultFlags().with(Flag.KEEP_GOING), "//a", "//b");
@@ -1141,10 +1280,8 @@ public class BuildViewTest extends BuildViewTestBase {
 
   @Test
   public void testVisibilityReferencesNonexistentPackage() throws Exception {
-    scratch.file("z/a/BUILD",
-        "py_library(name='a', visibility=['//nonexistent:nothing'])");
-    scratch.file("z/b/BUILD",
-        "py_library(name='b', deps=['//z/a:a'])");
+    scratch.file("z/a/BUILD", "filegroup(name='a', visibility=['//nonexistent:nothing'])");
+    scratch.file("z/b/BUILD", "filegroup(name='b', srcs=['//z/a:a'])");
     reporter.removeHandler(failFastHandler);
     assertThrows(ViewCreationFailedException.class, () -> update("//z/b:b"));
     assertContainsEvent("no such package 'nonexistent'");
@@ -1153,11 +1290,13 @@ public class BuildViewTest extends BuildViewTestBase {
   // regression test ("java.lang.IllegalStateException: cannot happen")
   @Test
   public void testDefaultVisibilityInNonexistentPackage() throws Exception {
-    scratch.file("z/a/BUILD",
-        "package(default_visibility=['//b'])",
-        "py_library(name='alib')");
-    scratch.file("z/b/BUILD",
-        "py_library(name='b', deps=['//z/a:alib'])");
+    scratch.file(
+        "z/a/BUILD",
+        """
+        package(default_visibility=['//b'])
+        filegroup(name='alib')
+        """);
+    scratch.file("z/b/BUILD", "filegroup(name='b', srcs=['//z/a:alib'])");
     reporter.removeHandler(failFastHandler);
     assertThrows(ViewCreationFailedException.class, () -> update("//z/b:b"));
     assertContainsEvent("no such package 'b'");
@@ -1169,9 +1308,17 @@ public class BuildViewTest extends BuildViewTestBase {
       // TODO(b/67651960): fix or justify disabling.
       return;
     }
-    scratch.file("parent/BUILD",
-        "sh_library(name = 'a', deps = ['//child:b'])");
-    scratch.file("child/BUILD", "sh_library(name = 'b')", "fail('some error')");
+    scratch.file(
+        "parent/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'a', deps = ['//child:b'])");
+    scratch.file(
+        "child/BUILD",
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        foo_library(name = 'b')
+        fail('some error')
+        """);
     reporter.removeHandler(failFastHandler);
     assertThrows(ViewCreationFailedException.class, () -> update("//parent:a"));
     assertContainsEventWithFrequency("some error", 1);
@@ -1186,9 +1333,17 @@ public class BuildViewTest extends BuildViewTestBase {
       // TODO(b/67651960): fix or justify disabling.
       return;
     }
-    scratch.file("parent/BUILD",
-        "sh_library(name = 'a', deps = ['//child:b'])");
-    scratch.file("child/BUILD", "sh_library(name = 'b')", "fail('some error')");
+    scratch.file(
+        "parent/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'a', deps = ['//child:b'])");
+    scratch.file(
+        "child/BUILD",
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        foo_library(name = 'b')
+        fail('some error')
+        """);
     reporter.removeHandler(failFastHandler);
     update(defaultFlags().with(Flag.KEEP_GOING), "//parent:a");
     assertContainsEventWithFrequency("some error", 1);
@@ -1203,11 +1358,21 @@ public class BuildViewTest extends BuildViewTestBase {
       // TODO(b/67651960): fix or justify disabling.
       return;
     }
-    scratch.file("parent/BUILD",
-        "sh_library(name = 'a', deps = ['//child:b'])");
-    scratch.file("child/BUILD", "sh_library(name = 'b')", "fail('some error')");
-    scratch.file("okay/BUILD",
-        "sh_binary(name = 'okay', srcs = ['okay.sh'])");
+    scratch.file(
+        "parent/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'a', deps = ['//child:b'])");
+    scratch.file(
+        "child/BUILD",
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        foo_library(name = 'b')
+        fail('some error')
+        """);
+    scratch.file(
+        "okay/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'okay', srcs = ['okay.sh'])");
     useConfiguration("--experimental_action_listener=//parent:a");
     reporter.removeHandler(failFastHandler);
     assertThrows(ViewCreationFailedException.class, () -> update("//okay"));
@@ -1223,11 +1388,22 @@ public class BuildViewTest extends BuildViewTestBase {
       // TODO(b/67651960): fix or justify disabling.
       return;
     }
-    scratch.file("parent/BUILD",
-        "sh_library(name = 'a', deps = ['//child:b'])");
-    scratch.file("child/BUILD", "sh_library(name = 'b')", "fail('some error')");
-    scratch.file("okay/BUILD",
-        "sh_binary(name = 'okay', srcs = ['okay.sh'])");
+    scratch.file(
+        "parent/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'a', deps = ['//child:b'])");
+    scratch.file(
+        "child/BUILD",
+        """
+        load('//test_defs:foo_library.bzl', 'foo_library')
+        foo_library(name = 'b')
+        fail('some error')
+        """);
+    scratch.file(
+        "okay/BUILD",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "load('//test_defs:foo_library.bzl', 'foo_library')",
+        "foo_library(name = 'okay', srcs = ['okay.sh'])");
     useConfiguration("--experimental_action_listener=//parent:a");
     reporter.removeHandler(failFastHandler);
     update(defaultFlags().with(Flag.KEEP_GOING), "//okay");
@@ -1249,32 +1425,38 @@ public class BuildViewTest extends BuildViewTestBase {
 
     scratch.file(
         "x/BUILD",
-        "load(':extension.bzl', 'injecting_rule', 'action_rule')",
-        "injecting_rule(name='a', deps=[':b'])",
-        "action_rule(name='b')");
+        """
+        load(':extension.bzl', 'injecting_rule', 'action_rule')
+        injecting_rule(name='a', deps=[':b'])
+        action_rule(name='b')
+        """);
 
     scratch.file(
         "x/extension.bzl",
-        "def _aspect1_impl(target, ctx):",
-        "  ctx.actions.do_nothing(mnemonic='Mnemonic')",
-        "  return []",
-        "aspect1 = aspect(_aspect1_impl, attr_aspects=['deps'])",
-        "",
-        "def _injecting_rule_impl(ctx):",
-        "  return []",
-        "injecting_rule = rule(_injecting_rule_impl, ",
-        "    attrs = { 'deps' : attr.label_list(aspects = [aspect1]) })",
-        "",
-        "def _action_rule_impl(ctx):",
-        "  out = ctx.actions.declare_file(ctx.label.name)",
-        "  ctx.actions.run_shell(outputs = [out], command = 'dontcare', mnemonic='Mnemonic')",
-        "  return []",
-        "action_rule = rule(_action_rule_impl, attrs = { 'deps' : attr.label_list() })");
+        """
+        def _aspect1_impl(target, ctx):
+          ctx.actions.do_nothing(mnemonic='Mnemonic')
+          return []
+        aspect1 = aspect(_aspect1_impl, attr_aspects=['deps'])
+
+        def _injecting_rule_impl(ctx):
+          return []
+        injecting_rule = rule(_injecting_rule_impl,
+            attrs = { 'deps' : attr.label_list(aspects = [aspect1]) })
+
+        def _action_rule_impl(ctx):
+          out = ctx.actions.declare_file(ctx.label.name)
+          ctx.actions.run_shell(outputs = [out], command = 'dontcare', mnemonic='Mnemonic')
+          return []
+        action_rule = rule(_action_rule_impl, attrs = { 'deps' : attr.label_list() })
+        """);
 
     scratch.file(
         "pkg/BUILD",
-        "extra_action(name='xa', cmd='echo dont-care')",
-        "action_listener(name='listener', mnemonics=['Mnemonic'], extra_actions=[':xa'])");
+        """
+        extra_action(name='xa', cmd='echo dont-care')
+        action_listener(name='listener', mnemonics=['Mnemonic'], extra_actions=[':xa'])
+        """);
 
     AnalysisResult analysisResult = update("//x:a");
 
@@ -1290,8 +1472,7 @@ public class BuildViewTest extends BuildViewTestBase {
   @Test
   public void testErrorMessageForMissingPackageGroup() throws Exception {
     scratch.file(
-        "apple/BUILD",
-        "py_library(name='apple', visibility=['//non:existent'])");
+        "apple/BUILD", "filegroup(name='apple', srcs=['x.txt'], visibility=['//non:existent'])");
     reporter.removeHandler(failFastHandler);
     assertThrows(ViewCreationFailedException.class, () -> update("//apple"));
     assertDoesNotContainEvent("implicitly depends upon");
@@ -1307,15 +1488,18 @@ public class BuildViewTest extends BuildViewTestBase {
                 .allowedRuleClasses("java_library", "java_binary")
                 .allowedRuleClassesWithWarning("genrule")));
 
-    scratch.file("foo/BUILD",
-        "genrule(",
-        "    name = 'genlib',",
-        "    srcs = [],",
-        "    outs = ['genlib.out'],",
-        "    cmd = 'echo hi > $@')",
-        "custom_rule(",
-        "    name = 'foo',",
-        "    deps = [':genlib'])");
+    scratch.file(
+        "foo/BUILD",
+        """
+        genrule(
+            name = 'genlib',
+            srcs = [],
+            outs = ['genlib.out'],
+            cmd = 'echo hi > $@')
+        custom_rule(
+            name = 'foo',
+            deps = [':genlib'])
+        """);
 
     update("//foo");
     assertContainsEvent(
@@ -1335,19 +1519,26 @@ public class BuildViewTest extends BuildViewTestBase {
                     attr("$implicit1", BuildType.LABEL_LIST)
                         .defaultValue(
                             ImmutableList.of(
-                                Label.parseAbsoluteUnchecked("//bad2:label"),
-                                Label.parseAbsoluteUnchecked("//foo:dep"))),
+                                Label.parseCanonicalUnchecked("//bad2:label"),
+                                Label.parseCanonicalUnchecked("//foo:dep"))),
                     attr("$implicit2", BuildType.LABEL)
-                        .defaultValue(Label.parseAbsoluteUnchecked("//bad:label")));
+                        .defaultValue(Label.parseCanonicalUnchecked("//bad:label")));
               } catch (ConversionException e) {
                 throw new IllegalStateException(e);
               }
             });
-    scratch.file("foo/BUILD", "custom_rule(name = 'foo')", "sh_library(name = 'dep')");
+    scratch.file(
+        "foo/BUILD",
+        """
+        custom_rule(name = 'foo')
+        filegroup(name = 'dep')
+        """);
     scratch.file(
         "bad/BUILD",
-        "sh_library(name = 'other_label', nonexistent_attribute = 'blah')",
-        "sh_library(name = 'label')");
+        """
+        filegroup(name = 'other_label', nonexistent_attribute = 'blah')
+        filegroup(name = 'label')
+        """);
     // bad2/BUILD is completely missing.
     reporter.removeHandler(failFastHandler);
     update(defaultFlags().with(Flag.KEEP_GOING), "//foo:foo");
@@ -1370,15 +1561,18 @@ public class BuildViewTest extends BuildViewTestBase {
                 .allowedFileTypes()
                 .allowedRuleClassesWithWarning("genrule")));
 
-    scratch.file("foo/BUILD",
-        "genrule(",
-        "    name = 'genlib',",
-        "    srcs = [],",
-        "    outs = ['genlib.out'],",
-        "    cmd = 'echo hi > $@')",
-        "custom_rule(",
-        "    name = 'foo',",
-        "    deps = [':genlib'])");
+    scratch.file(
+        "foo/BUILD",
+        """
+        genrule(
+            name = 'genlib',
+            srcs = [],
+            outs = ['genlib.out'],
+            cmd = 'echo hi > $@')
+        custom_rule(
+            name = 'foo',
+            deps = [':genlib'])
+        """);
 
     update("//foo");
     assertContainsEvent(
@@ -1390,12 +1584,14 @@ public class BuildViewTest extends BuildViewTestBase {
   public void testExistingRule() throws Exception {
     scratch.file(
         "pkg/BUILD",
-        "genrule(name='foo', ",
-        "        cmd = '',",
-        "        srcs=['a.src'],",
-        "        outs=['a.out'])",
-        "print(existing_rule('foo')['kind'])",
-        "print(existing_rule('bar'))");
+        """
+        genrule(name='foo',
+                cmd = '',
+                srcs=['a.src'],
+                outs=['a.out'])
+        print(existing_rule('foo')['kind'])
+        print(existing_rule('bar'))
+        """);
     reporter.setOutputFilter(RegexOutputFilter.forPattern(Pattern.compile("^//pkg")));
     update("//pkg:foo");
     assertContainsEvent("DEBUG /workspace/pkg/BUILD:5:6: genrule");
@@ -1406,22 +1602,190 @@ public class BuildViewTest extends BuildViewTestBase {
   public void testExistingRules() throws Exception {
     scratch.file(
         "pkg/BUILD",
-        "genrule(name='foo', ",
-        "        cmd = '',",
-        "        srcs=['a.src'],",
-        "        outs=['a.out'])",
-        "print(existing_rules().keys())");
+        """
+        genrule(name='foo',
+                cmd = '',
+                srcs=['a.src'],
+                outs=['a.out'])
+        print(existing_rules().keys())
+        """);
     reporter.setOutputFilter(RegexOutputFilter.forPattern(Pattern.compile("^//pkg")));
     update("//pkg:foo");
     assertContainsEvent("DEBUG /workspace/pkg/BUILD:5:6: [\"foo\"]");
   }
 
-  /** Runs the same test with the Skyframe-based analysis prep. */
-  @RunWith(JUnit4.class)
-  public static class WithSkyframePrepareAnalysis extends BuildViewTest {
-    @Override
-    protected FlagBuilder defaultFlags() {
-      return super.defaultFlags().with(Flag.SKYFRAME_PREPARE_ANALYSIS);
-    }
+  @CanIgnoreReturnValue
+  private AnalysisResult updateWithOutputGroups(
+      String target, List<String> outputGroups, boolean failOnUnknownOutputGroups)
+      throws Exception {
+    return updateWithAspectsAndOutputGroups(
+        ImmutableList.of(), outputGroups, failOnUnknownOutputGroups, target);
+  }
+
+  @CanIgnoreReturnValue
+  private AnalysisResult updateWithAspectsAndOutputGroups(
+      List<String> aspects,
+      List<String> outputGroups,
+      boolean failOnUnknownOutputGroups,
+      String... targets)
+      throws Exception {
+    TopLevelArtifactContext context =
+        new TopLevelArtifactContext(
+            false,
+            OutputGroupInfo.determineOutputGroups(
+                outputGroups,
+                /* extraDefaultOutputGroups= */ ImmutableList.of(),
+                OutputGroupInfo.ValidationMode.OFF,
+                /* shouldRunTests= */ false),
+            failOnUnknownOutputGroups,
+            /* forRunCommand= */ false);
+    return update(context, ImmutableList.copyOf(aspects), targets);
+  }
+
+  @Test
+  public void testUnknownOutputGroupWarning() throws Exception {
+    scratch.file("pkg/BUILD", "genrule(name = 'foo', cmd = '', srcs = [], outs = ['a.out'])");
+    updateWithOutputGroups("//pkg:foo", ImmutableList.of("+unknown_group"), false);
+    assertContainsEvent(
+        "Output group 'unknown_group' was requested, but was not present on any top-level target or"
+            + " aspect");
+  }
+
+  @Test
+  public void testUnknownOutputGroupError() throws Exception {
+    scratch.file("pkg/BUILD", "genrule(name = 'foo', cmd = '', srcs = [], outs = ['a.out'])");
+    reporter.removeHandler(failFastHandler);
+    ViewCreationFailedException e =
+        assertThrows(
+            ViewCreationFailedException.class,
+            () -> updateWithOutputGroups("//pkg:foo", ImmutableList.of("+unknown_group"), true));
+    assertThat(e)
+        .hasMessageThat()
+        .contains(
+            "Output group 'unknown_group' was requested, but was not present on any top-level"
+                + " target or aspect");
+    assertContainsEvent(
+        "Output group 'unknown_group' was requested, but was not present on any top-level target"
+            + " or aspect");
+  }
+
+  @Test
+  public void testKnownOutputGroupNoError() throws Exception {
+    scratch.file(
+        "pkg/rules.bzl",
+        """
+        def _impl(ctx):
+            out = ctx.actions.declare_file(ctx.label.name + ".out")
+            ctx.actions.write(out, "hello")
+            return [OutputGroupInfo(my_group = depset([out]))]
+        my_rule = rule(implementation = _impl)
+        """);
+    scratch.file(
+        "pkg/BUILD",
+        """
+        load(":rules.bzl", "my_rule")
+        my_rule(name = "foo")
+        """);
+    updateWithOutputGroups("//pkg:foo", ImmutableList.of("+my_group"), true);
+    assertNoEvents();
+  }
+
+  @Test
+  public void testKnownOutputGroupFromAspectNoError() throws Exception {
+    scratch.file(
+        "pkg/rules.bzl",
+        """
+        def _aspect_impl(target, ctx):
+            out = ctx.actions.declare_file(ctx.label.name + ".aspect.out")
+            ctx.actions.write(out, "hello")
+            return [OutputGroupInfo(my_aspect_group = depset([out]))]
+        my_aspect = aspect(implementation = _aspect_impl)
+        """);
+    scratch.file("pkg/BUILD", "genrule(name = 'foo', cmd = '', srcs = [], outs = ['a.out'])");
+    updateWithAspectsAndOutputGroups(
+        ImmutableList.of("//pkg:rules.bzl%my_aspect"),
+        ImmutableList.of("+my_aspect_group"),
+        true,
+        "//pkg:foo");
+    assertNoEvents();
+  }
+
+  @Test
+  public void testRemovedOutputGroupNoError() throws Exception {
+    scratch.file("pkg/BUILD", "genrule(name = 'foo', cmd = '', srcs = [], outs = ['a.out'])");
+    updateWithOutputGroups("//pkg:foo", ImmutableList.of("-unknown_group"), true);
+    assertNoEvents();
+  }
+
+  @Test
+  public void testMultipleUnknownOutputGroupsWarning() throws Exception {
+    scratch.file("pkg/BUILD", "genrule(name = 'foo', cmd = '', srcs = [], outs = ['a.out'])");
+    updateWithOutputGroups(
+        "//pkg:foo", ImmutableList.of("+unknown_group1", "+unknown_group2"), false);
+    assertContainsEvent(
+        "Output group 'unknown_group1' was requested, but was not present on any top-level target"
+            + " or aspect");
+    assertContainsEvent(
+        "Output group 'unknown_group2' was requested, but was not present on any top-level target"
+            + " or aspect");
+  }
+
+  @Test
+  public void testMultipleUnknownOutputGroupsError() throws Exception {
+    scratch.file("pkg/BUILD", "genrule(name = 'foo', cmd = '', srcs = [], outs = ['a.out'])");
+    reporter.removeHandler(failFastHandler);
+    ViewCreationFailedException e =
+        assertThrows(
+            ViewCreationFailedException.class,
+            () ->
+                updateWithOutputGroups(
+                    "//pkg:foo", ImmutableList.of("+unknown_group1", "+unknown_group2"), true));
+    assertThat(e)
+        .hasMessageThat()
+        .contains(
+            "Output groups 'unknown_group1', 'unknown_group2' were requested, but were not present"
+                + " on any top-level target or aspect");
+    assertContainsEvent(
+        "Output group 'unknown_group1' was requested, but was not present on any top-level target"
+            + " or aspect");
+    assertContainsEvent(
+        "Output group 'unknown_group2' was requested, but was not present on any top-level target"
+            + " or aspect");
+  }
+
+  @Test
+  public void testCustomUnderscoreOutputGroup_checked() throws Exception {
+    scratch.file("pkg/BUILD", "genrule(name = 'foo', cmd = '', srcs = [], outs = ['a.out'])");
+    reporter.removeHandler(failFastHandler);
+    ViewCreationFailedException e =
+        assertThrows(
+            ViewCreationFailedException.class,
+            () -> updateWithOutputGroups("//pkg:foo", ImmutableList.of("+_custom_unknown"), true));
+    assertThat(e)
+        .hasMessageThat()
+        .contains(
+            "Output group '_custom_unknown' was requested, but was not present on any top-level"
+                + " target or aspect");
+  }
+
+  @Test
+  public void testValidationOutputGroups_noError() throws Exception {
+    scratch.file("pkg/BUILD", "genrule(name = 'foo', cmd = '', srcs = [], outs = ['a.out'])");
+    updateWithOutputGroups("//pkg:foo", ImmutableList.of("+" + OutputGroupInfo.VALIDATION), true);
+    updateWithOutputGroups(
+        "//pkg:foo", ImmutableList.of("+" + OutputGroupInfo.VALIDATION_TOP_LEVEL), true);
+    updateWithOutputGroups(
+        "//pkg:foo", ImmutableList.of("+" + OutputGroupInfo.VALIDATION_TRANSITIVE), true);
+    assertNoEvents();
+  }
+
+  @Test
+  public void testInternalOutputGroups_noError() throws Exception {
+    scratch.file("pkg/BUILD", "genrule(name = 'foo', cmd = '', srcs = [], outs = ['a.out'])");
+    updateWithOutputGroups(
+        "//pkg:foo", ImmutableList.of("+custom_internal" + OutputGroupInfo.INTERNAL_SUFFIX), true);
+    updateWithOutputGroups(
+        "//pkg:foo", ImmutableList.of("+custom_internal" + OutputGroupInfo.INTERNAL_SUFFIX), false);
+    assertNoEvents();
   }
 }

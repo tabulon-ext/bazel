@@ -23,11 +23,10 @@ import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.actions.Artifact;
 import com.google.devtools.build.lib.actions.BuildFailedException;
 import com.google.devtools.build.lib.analysis.FileProvider;
-import com.google.devtools.build.lib.buildtool.util.BuildIntegrationTestCase;
+import com.google.devtools.build.lib.buildtool.util.BazelIntegrationTestCase;
+import com.google.devtools.build.lib.buildtool.util.BazelServer;
 import com.google.devtools.build.lib.events.EventKind;
-import com.google.devtools.build.lib.events.util.EventCollectionApparatus;
 import com.google.devtools.build.lib.runtime.BlazeModule;
-import com.google.devtools.build.lib.runtime.BlazeRuntime;
 import com.google.devtools.build.lib.testutil.MoreAsserts;
 import com.google.devtools.build.lib.util.AbruptExitException;
 import com.google.devtools.build.lib.vfs.ModifiedFileSet;
@@ -46,21 +45,25 @@ import org.junit.runner.RunWith;
  * OutputService#startBuild}.
  */
 @RunWith(TestParameterInjector.class)
-public final class OutputsInvalidationIntegrationTest extends BuildIntegrationTestCase {
+public final class OutputsInvalidationIntegrationTest extends BazelIntegrationTestCase {
 
   private final OutputService outputService = mock(OutputService.class);
 
   @Before
   public void prepareOutputServiceMock()
-      throws BuildFailedException, AbruptExitException, InterruptedException, IOException {
+      throws BuildFailedException, AbruptExitException, InterruptedException {
     when(outputService.actionFileSystemType()).thenReturn(ActionFileSystemType.DISABLED);
-    when(outputService.startBuild(any(), any(), anyBoolean()))
+    when(outputService.getFileSystemName(any())).thenReturn("fileSystemName");
+    when(outputService.startBuild(any(), any(), any(), anyBoolean()))
         .thenReturn(ModifiedFileSet.EVERYTHING_MODIFIED);
+    when(outputService.getXattrProvider(any())).thenAnswer(i -> i.getArgument(0));
+    when(outputService.getRewoundActionSynchronizer())
+        .thenReturn(OutputService.RewoundActionSynchronizer.NOOP);
   }
 
   @Override
-  protected BlazeRuntime.Builder getRuntimeBuilder() throws Exception {
-    return super.getRuntimeBuilder()
+  protected BazelServer.Builder getServerBuilder() {
+    return super.getServerBuilder()
         .addBlazeModule(
             new BlazeModule() {
               @Override
@@ -71,8 +74,8 @@ public final class OutputsInvalidationIntegrationTest extends BuildIntegrationTe
   }
 
   @Override
-  protected EventCollectionApparatus createEvents() {
-    return new EventCollectionApparatus(ImmutableSet.of(EventKind.FINISH));
+  protected ImmutableSet<EventKind> additionalEventsToCollect() {
+    return ImmutableSet.of(EventKind.FINISH);
   }
 
   @Test
@@ -85,7 +88,7 @@ public final class OutputsInvalidationIntegrationTest extends BuildIntegrationTe
       delete(getOnlyOutput("//foo"));
     }
 
-    when(outputService.startBuild(any(), any(), anyBoolean()))
+    when(outputService.startBuild(any(), any(), any(), anyBoolean()))
         .thenReturn(ModifiedFileSet.NOTHING_MODIFIED);
     events.collector().clear();
     buildTarget("//foo");
@@ -123,7 +126,7 @@ public final class OutputsInvalidationIntegrationTest extends BuildIntegrationTe
     buildTarget("//foo");
     MoreAsserts.assertContainsEvent(events.collector(), "Executing genrule //foo:foo");
 
-    when(outputService.startBuild(any(), any(), anyBoolean()))
+    when(outputService.startBuild(any(), any(), any(), anyBoolean()))
         .thenReturn(modification.modifiedFileSet(getOnlyOutput("//foo")));
     events.collector().clear();
     buildTarget("//foo");
@@ -139,7 +142,7 @@ public final class OutputsInvalidationIntegrationTest extends BuildIntegrationTe
     buildTarget("//foo");
     MoreAsserts.assertContainsEvent(events.collector(), "Executing genrule //foo:foo");
 
-    when(outputService.startBuild(any(), any(), anyBoolean()))
+    when(outputService.startBuild(any(), any(), any(), anyBoolean()))
         .thenReturn(modification.modifiedFileSet(getOnlyOutput("//foo")));
     events.collector().clear();
     buildTarget("//foo");
@@ -161,7 +164,7 @@ public final class OutputsInvalidationIntegrationTest extends BuildIntegrationTe
     MoreAsserts.assertContainsEvent(events.collector(), "Executing genrule //foo:foo");
     delete(getOnlyOutput("//foo"));
 
-    when(outputService.startBuild(any(), any(), anyBoolean()))
+    when(outputService.startBuild(any(), any(), any(), anyBoolean()))
         .thenReturn(
             everythingDeleted
                 ? ModifiedFileSet.EVERYTHING_DELETED
@@ -176,15 +179,27 @@ public final class OutputsInvalidationIntegrationTest extends BuildIntegrationTe
   public void outputFileModified_invalidatesOnlyAffectedAction() throws Exception {
     write(
         "foo/BUILD",
-        "genrule(name='foo', outs=['foo.out'], cmd='touch $@')",
-        "genrule(name='bar', outs=['bar.out'], cmd='touch $@')");
+        """
+        genrule(
+            name = "foo",
+            outs = ["foo.out"],
+            cmd = "touch $@",
+        )
+
+        genrule(
+            name = "bar",
+            outs = ["bar.out"],
+            cmd = "touch $@",
+        )
+        """);
     buildTarget("//foo:all");
     MoreAsserts.assertContainsEvent(events.collector(), "Executing genrule //foo:foo");
     MoreAsserts.assertContainsEvent(events.collector(), "Executing genrule //foo:bar");
     Artifact fooOut = getOnlyOutput("//foo");
     delete(fooOut);
 
-    when(outputService.startBuild(any(), any(), anyBoolean())).thenReturn(modifiedFileSet(fooOut));
+    when(outputService.startBuild(any(), any(), any(), anyBoolean()))
+        .thenReturn(modifiedFileSet(fooOut));
     events.collector().clear();
     buildTarget("//foo:all");
 
@@ -203,7 +218,7 @@ public final class OutputsInvalidationIntegrationTest extends BuildIntegrationTe
         .getSingleton();
   }
 
-  private ModifiedFileSet modifiedFileSet(Artifact... artifacts) {
+  private static ModifiedFileSet modifiedFileSet(Artifact... artifacts) {
     ModifiedFileSet.Builder modifiedFileSet = ModifiedFileSet.builder();
     for (Artifact artifact : artifacts) {
       modifiedFileSet.modify(artifact.getExecPath());

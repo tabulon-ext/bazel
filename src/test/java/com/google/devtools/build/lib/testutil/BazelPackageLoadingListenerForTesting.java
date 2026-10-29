@@ -26,13 +26,13 @@ import com.google.devtools.build.lib.packages.NoSuchPackageException;
 import com.google.devtools.build.lib.packages.Package;
 import com.google.devtools.build.lib.packages.PackageLoadingListener;
 import com.google.devtools.build.lib.packages.Target;
+import com.google.devtools.build.lib.pkgcache.PackageOptions.LazyMacroExpansionPackages;
 import com.google.devtools.build.lib.skyframe.PrecomputedValue.Injected;
 import com.google.devtools.build.lib.skyframe.packages.BazelPackageLoader;
 import com.google.devtools.build.lib.skyframe.packages.PackageLoader;
 import com.google.devtools.build.lib.vfs.Root;
 import com.google.devtools.build.skyframe.SkyFunction;
 import com.google.devtools.build.skyframe.SkyFunctionName;
-import java.util.OptionalLong;
 import net.starlark.java.eval.StarlarkSemantics;
 
 /**
@@ -60,13 +60,16 @@ public class BazelPackageLoadingListenerForTesting implements PackageLoadingList
   public void onLoadingCompleteAndSuccessful(
       Package pkg,
       StarlarkSemantics starlarkSemantics,
-      long loadTimeNanos,
-      OptionalLong packageOverhead) {
-    sanityCheckBazelPackageLoader(pkg, ruleClassProvider, starlarkSemantics);
+      LazyMacroExpansionPackages lazyMacroExpansionPackages,
+      Metrics metrics) {
+    sanityCheckBazelPackageLoader(
+        pkg, ruleClassProvider, starlarkSemantics, lazyMacroExpansionPackages);
   }
 
   private PackageLoader makeFreshPackageLoader(
-      ConfiguredRuleClassProvider ruleClassProvider, StarlarkSemantics starlarkSemantics) {
+      ConfiguredRuleClassProvider ruleClassProvider,
+      StarlarkSemantics starlarkSemantics,
+      LazyMacroExpansionPackages lazyMacroExpansionPackages) {
     return BazelPackageLoader.builder(
             Root.fromPath(directories.getWorkspace()),
             directories.getInstallBase(),
@@ -75,17 +78,19 @@ public class BazelPackageLoadingListenerForTesting implements PackageLoadingList
         .setRuleClassProvider(ruleClassProvider)
         .addExtraPrecomputedValues(extraPrecomputedValues)
         .addExtraSkyFunctions(extraSkyFunctions)
+        .setLazyMacroExpansionPackages(lazyMacroExpansionPackages)
         .build();
   }
 
   private void sanityCheckBazelPackageLoader(
       Package pkg,
       ConfiguredRuleClassProvider ruleClassProvider,
-      StarlarkSemantics starlarkSemantics) {
+      StarlarkSemantics starlarkSemantics,
+      LazyMacroExpansionPackages lazyMacroExpansionPackages) {
     PackageIdentifier pkgId = pkg.getPackageIdentifier();
     Package newlyLoadedPkg;
     try (PackageLoader packageLoader =
-        makeFreshPackageLoader(ruleClassProvider, starlarkSemantics)) {
+        makeFreshPackageLoader(ruleClassProvider, starlarkSemantics, lazyMacroExpansionPackages)) {
       newlyLoadedPkg = packageLoader.loadPackage(pkg.getPackageIdentifier());
     } catch (InterruptedException e) {
       return;
@@ -93,10 +98,9 @@ public class BazelPackageLoadingListenerForTesting implements PackageLoadingList
       throw new IllegalStateException(e);
     }
     ImmutableSet<Label> targetsInPkg =
-        ImmutableSet.copyOf(Iterables.transform(pkg.getTargets().values(), Target::getLabel));
+        ImmutableSet.copyOf(Iterables.transform(pkg.getTargets(), Target::getLabel));
     ImmutableSet<Label> targetsInNewlyLoadedPkg =
-        ImmutableSet.copyOf(
-            Iterables.transform(newlyLoadedPkg.getTargets().values(), Target::getLabel));
+        ImmutableSet.copyOf(Iterables.transform(newlyLoadedPkg.getTargets(), Target::getLabel));
     if (!targetsInPkg.equals(targetsInNewlyLoadedPkg)) {
       Sets.SetView<Label> unsatisfied = Sets.difference(targetsInPkg, targetsInNewlyLoadedPkg);
       Sets.SetView<Label> unexpected = Sets.difference(targetsInNewlyLoadedPkg, targetsInPkg);

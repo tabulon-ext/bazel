@@ -16,6 +16,7 @@ package com.google.devtools.build.lib.shell;
 
 import com.google.devtools.build.lib.vfs.Path;
 import java.io.BufferedInputStream;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.time.Duration;
@@ -40,6 +41,10 @@ public final class ExecutionStatistics {
       } else {
         return Optional.empty();
       }
+    } catch (FileNotFoundException e) {
+      // Collecting resource usage is best-effort and the file may be missing if the wrapper around
+      // the command terminated abnormally.
+      return Optional.empty();
     }
   }
 
@@ -67,27 +72,33 @@ public final class ExecutionStatistics {
           resourceUsageProto.getStimeSec(), resourceUsageProto.getStimeUsec() * 1000);
     }
 
-    /** Returns the maximum resident set size (in bytes) during command execution, if available. */
+    /**
+     * Returns the maximum resident set size during command execution, if available. The units are
+     * kibibytes on Linux and bytes on Darwin.
+     */
     public long getMaximumResidentSetSize() {
       return resourceUsageProto.getMaxrss();
     }
 
     /**
-     * Returns the integral shared memory size (in bytes) during command execution, if available.
+     * Returns the integral shared memory size during command execution, if available. The units are
+     * kibibytes on Linux and bytes on Darwin.
      */
     public long getIntegralSharedMemorySize() {
       return resourceUsageProto.getIxrss();
     }
 
     /**
-     * Returns the integral unshared data size (in bytes) during command execution, if available.
+     * Returns the integral unshared data size during command execution, if available. The units are
+     * kibibytes on Linux and bytes on Darwin.
      */
     public long getIntegralUnsharedDataSize() {
       return resourceUsageProto.getIdrss();
     }
 
     /**
-     * Returns the integral unshared stack size (in bytes) during command execution, if available.
+     * Returns the integral unshared stack size during command execution, if available. The units
+     * are kibibytes on Linux and bytes on Darwin.
      */
     public long getIntegralUnsharedStackSize() {
       return resourceUsageProto.getIsrss();

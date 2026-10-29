@@ -20,6 +20,7 @@ import io.reactivex.rxjava3.core.Completable;
 import io.reactivex.rxjava3.core.Flowable;
 import io.reactivex.rxjava3.core.Single;
 import java.io.IOException;
+import java.util.concurrent.CancellationException;
 import javax.annotation.Nullable;
 
 /** Utility methods for the Rx. * */
@@ -28,30 +29,43 @@ public class RxUtils {
 
   /** Result of an I/O operation to remote cache. */
   public static class TransferResult {
-    private static final TransferResult OK = new TransferResult(null);
+    private static final TransferResult OK = new TransferResult(null, false);
+
+    private static final TransferResult INTERRUPTED = new TransferResult(null, true);
 
     public static TransferResult ok() {
       return OK;
     }
 
+    public static TransferResult interrupted() {
+      return INTERRUPTED;
+    }
+
     public static TransferResult error(IOException error) {
-      return new TransferResult(error);
+      return new TransferResult(error, false);
     }
 
     @Nullable private final IOException error;
 
-    TransferResult(@Nullable IOException error) {
+    private final boolean interrupted;
+
+    TransferResult(@Nullable IOException error, boolean interrupted) {
       this.error = error;
+      this.interrupted = interrupted;
     }
 
     /** Returns {@code true} if the operation succeed. */
     public boolean isOk() {
-      return error == null;
+      return error == null && !interrupted;
     }
 
     /** Returns {@code true} if the operation failed. */
     public boolean isError() {
       return error != null;
+    }
+
+    public boolean isInterrupted() {
+      return interrupted;
     }
 
     /** Returns the IO error if the operation failed. */
@@ -70,19 +84,31 @@ public class RxUtils {
         .toSingleDefault(TransferResult.ok())
         .onErrorResumeNext(
             error -> {
-              if (error instanceof IOException) {
-                return Single.just(TransferResult.error((IOException) error));
+              if (error instanceof IOException ioException) {
+                return Single.just(TransferResult.error(ioException));
+              } else if (error instanceof InterruptedException
+                  || error instanceof CancellationException) {
+                // A transfer is only ever canceled as part of tearing down the operation it
+                // belongs to, so this is reported as an interruption rather than propagated
+                // downstream.
+                return Single.just(TransferResult.interrupted());
+              } else {
+                return Single.error(error);
               }
-
-              return Single.error(error);
             });
   }
 
   private static class BulkTransferExceptionCollector {
     private BulkTransferException bulkTransferException;
+    private boolean interrupted = false;
 
     void onResult(TransferResult result) {
       if (result.isOk()) {
+        return;
+      }
+
+      if (result.isInterrupted()) {
+        interrupted = true;
         return;
       }
 
@@ -95,11 +121,15 @@ public class RxUtils {
     }
 
     Completable toCompletable() {
-      if (bulkTransferException == null) {
-        return Completable.complete();
+      if (interrupted) {
+        return Completable.error(new InterruptedException());
       }
 
-      return Completable.error(bulkTransferException);
+      if (bulkTransferException != null) {
+        return Completable.error(bulkTransferException);
+      }
+
+      return Completable.complete();
     }
   }
 

@@ -17,7 +17,7 @@ import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;
 import com.google.devtools.build.lib.supplier.InterruptibleSupplier;
 import com.google.devtools.build.lib.supplier.MemoizingInterruptibleSupplier;
-import com.google.devtools.build.lib.util.GroupedList;
+import com.google.devtools.build.skyframe.NodeEntry.DirtyType;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.util.Map;
 import java.util.Set;
@@ -32,6 +32,7 @@ import javax.annotation.Nullable;
  */
 @ThreadSafe
 public interface QueryableGraph {
+
   /**
    * Returns the node with the given {@code key}, or {@code null} if the node does not exist.
    *
@@ -43,26 +44,93 @@ public interface QueryableGraph {
   NodeEntry get(@Nullable SkyKey requestor, Reason reason, SkyKey key) throws InterruptedException;
 
   /**
-   * Fetches all the given nodes. Returns a map {@code m} such that, for all {@code k} in {@code
-   * keys}, {@code m.get(k).equals(e)} iff {@code get(k) == e} and {@code e != null}, and {@code
-   * !m.containsKey(k)} iff {@code get(k) == null}.
+   * Fetches all the given nodes. Returns a {@link NodeBatch} {@code b} such that, for all {@code k}
+   * in {@code keys}, {@code b.get(k) == get(k)}.
+   *
+   * <p>Prefer calling this method over {@link #getBatchMap} if it is not necessary to represent the
+   * result as a {@link Map}, as it may be significantly more efficient.
    *
    * @param requestor if non-{@code null}, the node on behalf of which the given {@code keys} are
    *     being requested.
    * @param reason the reason the nodes are being requested.
    */
-  Map<SkyKey, ? extends NodeEntry> getBatch(
+  default NodeBatch getBatch(
       @Nullable SkyKey requestor, Reason reason, Iterable<? extends SkyKey> keys)
-          throws InterruptedException;
+      throws InterruptedException {
+    return getBatchMap(requestor, reason, keys)::get;
+  }
+
+  /** A hint about the most efficient way to look up a key in the graph. */
+  enum LookupHint {
+    INDIVIDUAL,
+    BATCH
+  }
+
+  /**
+   * Hints to the caller about the most efficient way to look up a key in this graph.
+   *
+   * <p>A return of {@link LookupHint#INDIVIDUAL} indicates that the given key can efficiently be
+   * looked up by calling {@link #get}. In such a case, it is not worth the effort to aggregate the
+   * key into a collection with other keys for a {@link #getBatch} call.
+   *
+   * <p>A return of {@link LookupHint#BATCH} indicates that the given key should ideally be
+   * requested with other keys as part of a call to {@link #getBatch}. This may be the case if, for
+   * example, the corresponding node is stored remotely, and requesting keys in a single batch
+   * reduces trips to remote storage.
+   */
+  LookupHint getLookupHint(SkyKey key);
 
   /**
    * A version of {@link #getBatch} that returns an {@link InterruptibleSupplier} to possibly
    * retrieve the results later.
    */
   @CanIgnoreReturnValue
-  default InterruptibleSupplier<Map<SkyKey, ? extends NodeEntry>> getBatchAsync(
+  default InterruptibleSupplier<NodeBatch> getBatchAsync(
       @Nullable SkyKey requestor, Reason reason, Iterable<? extends SkyKey> keys) {
     return MemoizingInterruptibleSupplier.of(() -> getBatch(requestor, reason, keys));
+  }
+
+  /**
+   * Fetches all the given nodes. Returns a map {@code m} such that, for all {@code k} in {@code
+   * keys}, {@code m.get(k) == get(k)} and {@code !m.containsKey(k)} iff {@code get(k) == null}.
+   *
+   * <p>Prefer calling {@link #getBatch} over this method if it is not necessary to represent the
+   * result as a {@link Map}, as it may be significantly more efficient.
+   *
+   * @param requestor if non-{@code null}, the node on behalf of which the given {@code keys} are
+   *     being requested.
+   * @param reason the reason the nodes are being requested.
+   */
+  Map<SkyKey, ? extends NodeEntry> getBatchMap(
+      @Nullable SkyKey requestor, Reason reason, Iterable<? extends SkyKey> keys)
+      throws InterruptedException;
+
+  /**
+   * Identical to {@link #getBatchMap}, except that it includes a parameter for a maximum
+   * deserialization limit per-node (in bytes). If the serialized form of any fetched node read from
+   * storage exceeds this limit, then this method throws {@link NodeEntryTooBigException}.
+   *
+   * <p>Note that not every subclass of {@link QueryableGraph} supports this method, especially as
+   * not all graphs use node serialization. This is identical to {@link #getBatchMap} if this graph
+   * does not support limits.
+   */
+  default Map<SkyKey, ? extends NodeEntry> getBatchMapWithSizeLimit(
+      @Nullable SkyKey requestor,
+      Reason reason,
+      Iterable<? extends SkyKey> keys,
+      long nodeSizeLimitInBytes)
+      throws InterruptedException, NodeEntryTooBigException {
+    return getBatchMap(requestor, reason, keys);
+  }
+
+  /**
+   * A version of {@link #getBatchMap} that returns an {@link InterruptibleSupplier} to possibly
+   * retrieve the results later.
+   */
+  @CanIgnoreReturnValue
+  default InterruptibleSupplier<Map<SkyKey, ? extends NodeEntry>> getBatchMapAsync(
+      @Nullable SkyKey requestor, Reason reason, Iterable<? extends SkyKey> keys) {
+    return MemoizingInterruptibleSupplier.of(() -> getBatchMap(requestor, reason, keys));
   }
 
   /**
@@ -73,23 +141,26 @@ public interface QueryableGraph {
    * @param previouslyRequestedDeps deps that have already been requested during this build and
    *     should not be prefetched because they will be subsequently fetched anyway
    * @return {@code previouslyRequestedDeps} as a set if the implementation called {@link
-   *     GroupedList#toSet} (so that the caller may reuse it), otherwise {@code null}
+   *     GroupedDeps#toSet} (so that the caller may reuse it), otherwise {@code null}
    */
+  @CanIgnoreReturnValue
   @Nullable
   default ImmutableSet<SkyKey> prefetchDeps(
-      SkyKey requestor, Set<SkyKey> oldDeps, GroupedList<SkyKey> previouslyRequestedDeps)
+      SkyKey requestor, Set<SkyKey> oldDeps, GroupedDeps previouslyRequestedDeps)
       throws InterruptedException {
     return null;
-  }
-
-  /** Checks whether this graph stores reverse dependencies. */
-  default boolean storesReverseDeps() {
-    return true;
   }
 
   default ImmutableSet<SkyKey> getAllKeysForTesting() {
     throw new UnsupportedOperationException();
   }
+
+  /**
+   * Cancel all in-flight graph lookups. This may be a no-op for many graph implementations, but is
+   * particularly useful to clean up pending work when graph lookups consist of I/O operations or
+   * RPCs.
+   */
+  default void cancelLookups() {}
 
   /**
    * The reason that a node is being looked up in the Skyframe graph.
@@ -99,8 +170,8 @@ public interface QueryableGraph {
   enum Reason {
     /**
      * The node is being fetched in order to see if it needs to be evaluated or because it was just
-     * evaluated, but *not* because it was just requested during evaluation of a SkyFunction
-     * (see {@link #DEP_REQUESTED}).
+     * evaluated, but *not* because it was just requested during evaluation of a SkyFunction (see
+     * {@link #DEP_REQUESTED}).
      */
     PRE_OR_POST_EVALUATION,
 
@@ -136,9 +207,7 @@ public interface QueryableGraph {
     /** The node is being looked up so it can be enqueued for evaluation or change pruning. */
     ENQUEUING_CHILD,
 
-    /**
-     * The node is being looked up so that it can be signaled that a dependency is now complete.
-     */
+    /** The node is being looked up so that it can be signaled that a dependency is now complete. */
     SIGNAL_DEP,
 
     /**
@@ -153,10 +222,13 @@ public interface QueryableGraph {
     /** The node is being looked up merely to see if it is done or not. */
     DONE_CHECKING,
 
+    /** The node is being looked up so that it can be {@linkplain DirtyType#REWIND rewound}. */
+    REWINDING,
+
     /**
-     * The node is being looked up to service {@link WalkableGraph#getValue},
-     * {@link WalkableGraph#getException}, {@link WalkableGraph#getMissingAndExceptions}, or
-     * {@link WalkableGraph#getSuccessfulValues}.
+     * The node is being looked up to service {@link WalkableGraph#getValue}, {@link
+     * WalkableGraph#getException}, {@link WalkableGraph#getMissingAndExceptions}, or {@link
+     * WalkableGraph#getSuccessfulValues}.
      */
     WALKABLE_GRAPH_VALUE,
 
@@ -171,6 +243,9 @@ public interface QueryableGraph {
 
     /** The node is being looked up to service another "graph lookup" function. */
     WALKABLE_GRAPH_OTHER,
+
+    /** The node is being looked up to vendor external repos from its dependencies. */
+    VENDOR_EXTERNAL_REPOS,
 
     /** Some other reason than one of the above that needs the node's value and deps. */
     OTHER_NEEDING_VALUE_AND_DEPS,
@@ -190,6 +265,23 @@ public interface QueryableGraph {
           || this == WALKABLE_GRAPH_RDEPS
           || this == WALKABLE_GRAPH_VALUE_AND_RDEPS
           || this == WALKABLE_GRAPH_OTHER;
+    }
+  }
+
+  /**
+   * An exception thrown if the serialized form of a node read from storage exceeds the limit as set
+   * by the limit parameter to {@link #getBatchMapWithSizeLimit}.
+   */
+  class NodeEntryTooBigException extends Exception {
+    private final SkyKey key;
+
+    public NodeEntryTooBigException(SkyKey key) {
+      this.key = key;
+    }
+
+    /** Returns the {@link SkyKey} of the node which violated the size limit. */
+    public SkyKey getSkyKey() {
+      return key;
     }
   }
 }

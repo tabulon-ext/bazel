@@ -1,0 +1,44 @@
+package(default_visibility = ["//visibility:public"])
+
+alias(
+    name = "host_platform",
+    actual = "@platforms//host",
+)
+
+# Platform used for invalid or empty (e.g. builtin) Bazel actions.
+platform(
+    name = "internal_platform",
+    visibility = ["//visibility:private"],
+)
+
+# All bzl files in the built in repo '@bazel_tools'.
+filegroup(
+    name = "bzl_srcs",
+    srcs = [
+        "//tools:build_defs.bzl",
+        "//tools/android:bzl_srcs",
+        "//tools/build_defs:bzl_srcs",
+        "//tools/cpp:bzl_srcs",
+        "//tools/jdk:bzl_srcs",
+        "//tools/osx:bzl_srcs",
+        "//tools/python:bzl_srcs",
+        "//tools/res:bzl_srcs",
+        "//tools/sh:bzl_srcs",
+        "//tools/test:bzl_srcs",
+    ],
+)
+
+# Deprecated: `bazel vendor --lockfile_deps` vendors everything that
+# `bazel mod tidy` requires, including the module extensions it evaluates.
+# This target only covers the buildozer binary.
+# See https://bazel.build/external/vendor#vendor-tools-for-subcommands.
+filegroup(
+    name = "tools_for_bazel_subcommands",
+    srcs = [
+        # Keep in sync with the label resolved in
+        # src/main/java/com/google/devtools/build/lib/bazel/bzlmod/
+        # BazelModTidyFunction.java (search for "buildozer.exe").
+        "@buildozer_binary//:buildozer.exe",
+    ],
+    deprecation = "Use `bazel vendor --lockfile_deps` instead.",
+)

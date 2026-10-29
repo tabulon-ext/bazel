@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright 2020 The Bazel Authors. All rights reserved.
 #
@@ -24,7 +24,10 @@ function start_worker() {
   pid_file="${TEST_TMPDIR}/remote.pid_file"
   mkdir -p "${work_path}"
   mkdir -p "${cas_path}"
-  worker_port=$(pick_random_unused_tcp_port) || fail "no port found"
+  # Preserve port across restarts so tests simulating cache eviction don't invalidate action execution salt.
+  if [[ -z "${worker_port:-}" ]]; then
+    worker_port=$(pick_random_unused_tcp_port) || fail "no port found"
+  fi
   native_lib="${BAZEL_RUNFILES}/src/main/native/"
   "${REMOTE_WORKER}" \
       --singlejar \
@@ -95,4 +98,17 @@ function count_remote_cas_files() {
   else
     echo 0
   fi
+}
+
+function remote_cas_file_exist() {
+  local file=$1
+  [ -f "$cas_path/cas/${file:0:2}/$file" ]
+}
+
+function append_remote_cas_files() {
+  find "$cas_path/cas" -type f >> $1
+}
+
+function delete_remote_cas_files() {
+  rm -rf "$cas_path/cas"
 }

@@ -16,16 +16,17 @@ package com.google.devtools.build.lib.pkgcache;
 import static com.google.common.truth.Truth.assertThat;
 
 import com.google.common.base.Predicates;
-import com.google.common.collect.ImmutableMap;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.cmdline.LabelSyntaxException;
 import com.google.devtools.build.lib.cmdline.ResolvedTargets;
 import com.google.devtools.build.lib.cmdline.TargetParsingException;
+import com.google.devtools.build.lib.cmdline.TargetPattern;
 import com.google.devtools.build.lib.events.DelegatingEventHandler;
 import com.google.devtools.build.lib.events.ExtendedEventHandler;
-import com.google.devtools.build.lib.packages.ConstantRuleVisibility;
+import com.google.devtools.build.lib.packages.RuleVisibility;
 import com.google.devtools.build.lib.packages.Target;
 import com.google.devtools.build.lib.packages.util.PackageLoadingTestCase;
+import com.google.devtools.build.lib.skyframe.SkyframeTargetPatternEvaluator;
 import com.google.devtools.build.lib.util.Pair;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import java.util.ArrayList;
@@ -55,11 +56,7 @@ public abstract class AbstractTargetPatternEvaluatorTest extends PackageLoadingT
       boolean keepGoing)
       throws TargetParsingException, InterruptedException {
     return parseTargetPatternList(
-        PathFragment.EMPTY_FRAGMENT,
-        parser,
-        eventHandler,
-        targetPatterns,
-        keepGoing);
+        PathFragment.EMPTY_FRAGMENT, parser, eventHandler, targetPatterns, keepGoing);
   }
 
   protected static ResolvedTargets<Target> parseTargetPatternList(
@@ -75,7 +72,10 @@ public abstract class AbstractTargetPatternEvaluatorTest extends PackageLoadingT
             .collect(Collectors.toList());
     Map<String, Collection<Target>> resolvedTargetsMap =
         parser.preloadTargetPatterns(
-            eventHandler, relativeWorkingDirectory, positivePatterns, keepGoing);
+            eventHandler,
+            TargetPattern.mainRepoParser(relativeWorkingDirectory),
+            positivePatterns,
+            keepGoing);
     ResolvedTargets.Builder<Target> result = ResolvedTargets.builder();
     for (String pattern : targetPatterns) {
       if (pattern.startsWith("-")) {
@@ -91,8 +91,8 @@ public abstract class AbstractTargetPatternEvaluatorTest extends PackageLoadingT
   }
 
   /**
-   * Method converts collection of targets to the new, mutable,
-   * lexicographically-ordered set of corresponding labels.
+   * Method converts collection of targets to the new, mutable, lexicographically-ordered set of
+   * corresponding labels.
    */
   protected static Set<Label> targetsToLabels(Iterable<Target> targets) {
     Set<Label> labels = new TreeSet<>();
@@ -104,15 +104,15 @@ public abstract class AbstractTargetPatternEvaluatorTest extends PackageLoadingT
 
   @Before
   public final void initializeParser() throws Exception {
-    setUpSkyframe(ConstantRuleVisibility.PRIVATE);
-    parser = skyframeExecutor.newTargetPatternPreloader();
+    setUpSkyframe(RuleVisibility.PRIVATE);
+    parser = new SkyframeTargetPatternEvaluator(skyframeExecutor);
     parsingListener = new RecordingParsingListener(reporter);
   }
 
   protected static Set<Label> labels(String... labelStrings) throws LabelSyntaxException {
     Set<Label> labels = new HashSet<>();
     for (String labelString : labelStrings) {
-      labels.add(Label.parseAbsolute(labelString, ImmutableMap.of()));
+      labels.add(Label.parseCanonical(labelString));
     }
     return labels;
   }
@@ -135,8 +135,7 @@ public abstract class AbstractTargetPatternEvaluatorTest extends PackageLoadingT
     @Override
     public void post(Postable post) {
       super.post(post);
-      if (post instanceof ParsingFailedEvent) {
-        ParsingFailedEvent e = (ParsingFailedEvent) post;
+      if (post instanceof ParsingFailedEvent e) {
         events.add(Pair.of(e.getPattern(), e.getMessage()));
       }
     }

@@ -13,14 +13,18 @@
 # limitations under the License.
 
 import os
-import unittest
+from absl.testing import absltest
 from src.test.py.bazel import test_base
 
 class DEFParserTest(test_base.TestBase):
 
   def createAndBuildProjectFiles(self):
-    self.ScratchFile('WORKSPACE')
-    self.ScratchFile('BUILD', ['cc_library(name="hello", srcs=["x.cc"])'])
+    self.ScratchFile('MODULE.bazel')
+    self.AddBazelDep('rules_cc')
+    self.ScratchFile('BUILD', [
+        'load("@rules_cc//cc:cc_library.bzl", "cc_library")',
+        'cc_library(name="hello", srcs=["x.cc"])'
+    ])
     self.ScratchFile('x.cc', [
         '#include <stdio.h>',
         'int hello_data;',
@@ -105,4 +109,4 @@ class DEFParserTest(test_base.TestBase):
       self.assertIn('hello_world', def_content)
 
 if __name__ == '__main__':
-  unittest.main()
+  absltest.main()

@@ -14,6 +14,8 @@
 
 #include "src/tools/singlejar/desugar_checking.h"
 
+#include <string>
+
 #include "src/tools/singlejar/input_jar.h"
 #include "src/tools/singlejar/zip_headers.h"
 #include "src/tools/singlejar/zlib_interface.h"
@@ -24,7 +26,7 @@
 class Java8DesugarDepsCheckerTest : public ::testing::Test {
  protected:
   static void TestHasDefaultMethods() {
-    Java8DesugarDepsChecker checker([](const std::string &) { return false; },
+    Java8DesugarDepsChecker checker([](const std::string&) { return false; },
                                     /*verbose=*/false);
     checker.has_default_methods_["a"] = true;
     checker.extended_interfaces_["c"] = {"b", "a"};
@@ -43,7 +45,7 @@ class Java8DesugarDepsCheckerTest : public ::testing::Test {
   static void TestOutputEntry() {
     bool checkedA = false;
     Java8DesugarDepsChecker checker(
-        [&checkedA](const std::string &binary_name) {
+        [&checkedA](const std::string& binary_name) {
           checkedA = true;
           return binary_name == "a$$CC.class";
         },
@@ -65,7 +67,7 @@ class Java8DesugarDepsCheckerTest : public ::testing::Test {
   }
 
   static void TestNeededDepMissing() {
-    Java8DesugarDepsChecker checker([](const std::string &) { return false; },
+    Java8DesugarDepsChecker checker([](const std::string&) { return false; },
                                     /*verbose=*/false,
                                     /*fail_on_error=*/false);
     checker.needed_deps_["a$$CC.class"] = "b";
@@ -74,7 +76,7 @@ class Java8DesugarDepsCheckerTest : public ::testing::Test {
   }
 
   static void TestMissedDefaultMethods() {
-    Java8DesugarDepsChecker checker([](const std::string &) { return true; },
+    Java8DesugarDepsChecker checker([](const std::string&) { return true; },
                                     /*verbose=*/false,
                                     /*fail_on_error=*/false);
     checker.has_default_methods_["b"] = true;
@@ -89,9 +91,7 @@ TEST_F(Java8DesugarDepsCheckerTest, HasDefaultMethods) {
   TestHasDefaultMethods();
 }
 
-TEST_F(Java8DesugarDepsCheckerTest, OutputEntry) {
-  TestOutputEntry();
-}
+TEST_F(Java8DesugarDepsCheckerTest, OutputEntry) { TestOutputEntry(); }
 
 TEST_F(Java8DesugarDepsCheckerTest, NeededDepMissing) {
   TestNeededDepMissing();

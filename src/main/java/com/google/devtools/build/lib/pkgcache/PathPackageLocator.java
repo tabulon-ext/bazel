@@ -16,15 +16,16 @@ package com.google.devtools.build.lib.pkgcache;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Verify;
 import com.google.common.collect.ImmutableList;
+import com.google.devtools.build.lib.analysis.BlazeDirectories;
 import com.google.devtools.build.lib.cmdline.LabelConstants;
 import com.google.devtools.build.lib.cmdline.PackageIdentifier;
 import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.events.EventHandler;
 import com.google.devtools.build.lib.packages.BuildFileName;
-import com.google.devtools.build.lib.packages.BuildFileNotFoundException;
-import com.google.devtools.build.lib.packages.NoSuchPackageException;
+import com.google.devtools.build.lib.server.FailureDetails;
 import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
-import com.google.devtools.build.lib.server.FailureDetails.PackageLoading;
+import com.google.devtools.build.lib.server.FailureDetails.PackageOptions.Code;
+import com.google.devtools.build.lib.util.AbruptExitException;
 import com.google.devtools.build.lib.util.DetailedExitCode;
 import com.google.devtools.build.lib.vfs.Dirent;
 import com.google.devtools.build.lib.vfs.FileStatus;
@@ -33,10 +34,12 @@ import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.Root;
 import com.google.devtools.build.lib.vfs.Symlinks;
 import com.google.devtools.build.lib.vfs.SyscallCache;
+import com.google.devtools.common.options.OptionsProvider;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import javax.annotation.Nullable;
 
 /**
  * A mapping from the name of a package to the location of its BUILD file. The implementation
@@ -48,60 +51,37 @@ public final class PathPackageLocator {
   private static final String WORKSPACE_WILDCARD = "%workspace%";
 
   private final ImmutableList<Root> pathEntries;
+
   // Transient because this is an injected value in Skyframe, and as such, its serialized
   // representation is used as a key. We want a change to output base not to invalidate things.
-  private final transient Path outputBase;
+  @Nullable private final transient Path outputBase;
 
   private final ImmutableList<BuildFileName> buildFilesByPriority;
 
   @VisibleForTesting
   public PathPackageLocator(
-      Path outputBase, List<Root> pathEntries, List<BuildFileName> buildFilesByPriority) {
+      @Nullable Path outputBase, List<Root> pathEntries, List<BuildFileName> buildFilesByPriority) {
     this.outputBase = outputBase;
     this.pathEntries = ImmutableList.copyOf(pathEntries);
     this.buildFilesByPriority = ImmutableList.copyOf(buildFilesByPriority);
   }
 
   /**
-   * Returns the path to the build file for this package.
+   * Returns the path to the build file for this package, or null if not found.
    *
-   * <p>The package's root directory may be computed by calling getParentFile()
-   * on the result of this function.
+   * <p>The package's root directory may be computed by calling getParentFile() on the result of
+   * this function.
    *
-   * <p>Instances of this interface do not attempt to do any caching, nor
-   * implement checks for package-boundary crossing logic; the PackageCache
-   * does that.
-   *
-   * <p>If the same package exists beneath multiple package path entries, the
-   * first path that matches always wins.
-   */
-  public Path getPackageBuildFile(PackageIdentifier packageName) throws NoSuchPackageException {
-    Path buildFile = getPackageBuildFileNullable(packageName, SyscallCache.NO_CACHE);
-    if (buildFile == null) {
-      String message = "BUILD file not found on package path";
-      throw new BuildFileNotFoundException(
-          packageName,
-          message,
-          DetailedExitCode.of(
-              FailureDetail.newBuilder()
-                  .setMessage(message)
-                  .setPackageLoading(
-                      PackageLoading.newBuilder()
-                          .setCode(PackageLoading.Code.BUILD_FILE_MISSING)
-                          .build())
-                  .build()));
-    }
-    return buildFile;
-  }
-
-  /**
-   * Like #getPackageBuildFile(), but returns null instead of throwing.
+   * <p>If the same package exists beneath multiple package path entries, the first path that
+   * matches always wins.
    *
    * @param packageIdentifier the name of the package.
-   * @param cache a filesystem-level cache of stat() calls.
+   * @param syscallCache a filesystem-level cache of stat() calls.
    * @return the {@link Path} to the correct build file, or {@code null} if none was found
    */
-  public Path getPackageBuildFileNullable(PackageIdentifier packageIdentifier, SyscallCache cache) {
+  @Nullable
+  public Path getPackageBuildFileNullable(
+      PackageIdentifier packageIdentifier, SyscallCache syscallCache) {
     if (packageIdentifier.getRepository().isMain()) {
       for (BuildFileName buildFileName : buildFilesByPriority) {
         Path buildFilePath =
@@ -109,15 +89,17 @@ public final class PathPackageLocator {
                 packageIdentifier
                     .getPackageFragment()
                     .getRelative(buildFileName.getFilenameFragment()),
-                cache);
+                syscallCache);
         if (buildFilePath != null) {
           return buildFilePath;
         }
       }
     } else {
-      Verify.verify(outputBase != null, String.format(
+      Verify.verify(
+          outputBase != null,
           "External package '%s' needs to be loaded but this PathPackageLocator instance does not "
-              + "support external packages", packageIdentifier));
+              + "support external packages",
+          packageIdentifier);
       // This works only to some degree, because it relies on the presence of the repository under
       // $OUTPUT_BASE/external, which is created by the appropriate RepositoryDirectoryValue. This
       // is true for the invocation in GlobCache, but not for the locator.getBuildFileForPackage()
@@ -126,11 +108,11 @@ public final class PathPackageLocator {
         Path buildFile =
             outputBase
                 .getRelative(LabelConstants.EXTERNAL_REPOSITORY_LOCATION)
-                .getRelative(packageIdentifier.getRepository().strippedName())
+                .getRelative(packageIdentifier.getRepository().getName())
                 .getRelative(packageIdentifier.getSourceRoot())
                 .getRelative(buildFileName.getFilenameFragment());
         try {
-          FileStatus stat = cache.statIfFound(buildFile, Symlinks.FOLLOW);
+          FileStatus stat = syscallCache.statIfFound(buildFile, Symlinks.FOLLOW);
           if (stat != null && stat.isFile()) {
             return buildFile;
           }
@@ -156,11 +138,12 @@ public final class PathPackageLocator {
   public static String maybeReplaceWorkspaceInString(String pathElement, PathFragment workspace) {
     return pathElement.replace(WORKSPACE_WILDCARD, workspace.getPathString());
   }
+
   /**
    * A factory of PathPackageLocators from a list of path elements. Elements may contain
    * "%workspace%", indicating the workspace.
    *
-   * <p>If any of the paths given do not exist, an exception will be thrown.
+   * <p>If none of the paths given exist, an exception will be thrown.
    *
    * @param outputBase the output base. Can be null if remote repositories are not in use.
    * @param pathElements Each element must be an absolute path, relative path, or some string
@@ -182,7 +165,8 @@ public final class PathPackageLocator {
       EventHandler eventHandler,
       PathFragment workspace,
       Path clientWorkingDirectory,
-      List<BuildFileName> buildFilesByPriority) {
+      List<BuildFileName> buildFilesByPriority)
+      throws AbruptExitException {
     return createInternal(
         outputBase,
         pathElements,
@@ -203,7 +187,9 @@ public final class PathPackageLocator {
    *     provided.
    */
   public static PathPackageLocator createWithoutExistenceCheck(
-      Path outputBase, List<Root> pathElements, List<BuildFileName> buildFilesByPriority) {
+      @Nullable Path outputBase,
+      List<Root> pathElements,
+      List<BuildFileName> buildFilesByPriority) {
     return new PathPackageLocator(outputBase, pathElements, buildFilesByPriority);
   }
 
@@ -213,7 +199,8 @@ public final class PathPackageLocator {
       EventHandler eventHandler,
       PathFragment workspace,
       Path clientWorkingDirectory,
-      List<BuildFileName> buildFilesByPriority) {
+      List<BuildFileName> buildFilesByPriority)
+      throws AbruptExitException {
     List<Root> resolvedPaths = new ArrayList<>();
 
     for (String pathElement : pathElements) {
@@ -232,19 +219,76 @@ public final class PathPackageLocator {
             Event.warn(
                 "The package path element '"
                     + pathElementFragment
-                    + "' will be taken relative to your working directory. You may have intended to"
-                    + " have the path taken relative to your workspace directory. If so, please use"
-                    + "the '"
+                    + "' will be taken relative to your working directory. You may have intended "
+                    + "to have the path taken relative to your workspace directory. If so, please "
+                    + "use the '"
                     + WORKSPACE_WILDCARD
                     + "' wildcard."));
       }
 
-      if (rootPath.exists()) {
+      boolean rootPathExists;
+      try {
+        rootPathExists = rootPath.exists();
+      } catch (IOException e) {
+        throw new AbruptExitException(
+            DetailedExitCode.of(
+                FailureDetail.newBuilder()
+                    .setMessage(
+                        String.format(
+                            "Failed to check whether directory '%s' specified in --package_path"
+                                + " exists: %s",
+                            pathElement, e.getMessage()))
+                    .setPackageOptions(
+                        FailureDetails.PackageOptions.newBuilder()
+                            .setCode(Code.PACKAGE_PATH_IO_EXCEPTION))
+                    .build()));
+      }
+
+      if (rootPathExists) {
         resolvedPaths.add(Root.fromPath(rootPath));
       }
     }
 
+    if (resolvedPaths.isEmpty()) {
+      throw new AbruptExitException(
+          DetailedExitCode.of(
+              FailureDetail.newBuilder()
+                  .setMessage(
+                      String.format(
+                          "None of the directories specified in --package_path '%s' exist",
+                          String.join(":", pathElements)))
+                  .setPackageOptions(
+                      FailureDetails.PackageOptions.newBuilder().setCode(Code.PACKAGE_PATH_INVALID))
+                  .build()));
+    }
+
     return new PathPackageLocator(outputBase, resolvedPaths, buildFilesByPriority);
+  }
+
+  /**
+   * Extracts the package path from the {@code --package_path} flag, which is expected to have a
+   * single entry.
+   *
+   * <p>May be used to get the real package path when a {@linkplain
+   * BlazeDirectories#getVirtualSourceRoot virtual source root} is installed.
+   */
+  public static String getSingletonPackagePathFromFlag(
+      OptionsProvider options, BlazeDirectories directories) throws AbruptExitException {
+    List<String> packagePaths = options.getOptions(PackageOptions.class).getPackagePath();
+    if (packagePaths.size() != 1) {
+      throw new AbruptExitException(
+          DetailedExitCode.of(
+              FailureDetail.newBuilder()
+                  .setMessage(
+                      String.format(
+                          "Package path option must have exactly 1 value: %s", packagePaths))
+                  .setPackageOptions(
+                      FailureDetails.PackageOptions.newBuilder()
+                          .setCode(Code.NONSINGLETON_PACKAGE_PATH))
+                  .build()));
+    }
+    return maybeReplaceWorkspaceInString(
+        packagePaths.getFirst(), directories.getWorkspace().asFragment());
   }
 
   /**
@@ -253,22 +297,28 @@ public final class PathPackageLocator {
    * <p>If there are WORKSPACE files beneath multiple package path entries, the first one always
    * wins.
    */
-  public Path getWorkspaceFile() {
+  public Path getWorkspaceFile(SyscallCache syscallCache) {
     // TODO(bazel-team): correctness in the presence of changes to the location of the WORKSPACE
-    // file.
-    Path workspaceFile =
-        getFilePath(LabelConstants.WORKSPACE_DOT_BAZEL_FILE_NAME, SyscallCache.NO_CACHE);
+    //  file.
+    Path workspaceFile = getFilePath(LabelConstants.WORKSPACE_DOT_BAZEL_FILE_NAME, syscallCache);
     if (workspaceFile != null) {
       return workspaceFile;
     }
-    return getFilePath(LabelConstants.WORKSPACE_FILE_NAME, SyscallCache.NO_CACHE);
+    return getFilePath(LabelConstants.WORKSPACE_FILE_NAME, syscallCache);
   }
 
+  @Nullable
   private Path getFilePath(PathFragment suffix, SyscallCache cache) {
     for (Root pathEntry : pathEntries) {
       Path buildFile = pathEntry.getRelative(suffix);
       try {
-        Dirent.Type type = cache.getType(buildFile, Symlinks.FOLLOW);
+        SyscallCache.DirentTypeWithSkip typeWithSkip = cache.getType(buildFile, Symlinks.FOLLOW);
+        Dirent.Type type = null;
+        if (typeWithSkip == SyscallCache.DirentTypeWithSkip.FILESYSTEM_OP_SKIPPED) {
+          type = SyscallCache.statusToDirentType(cache.statIfFound(buildFile, Symlinks.FOLLOW));
+        } else if (typeWithSkip != null) {
+          type = typeWithSkip.getType();
+        }
         if (type == Dirent.Type.FILE || type == Dirent.Type.UNKNOWN) {
           return buildFile;
         }
@@ -289,14 +339,14 @@ public final class PathPackageLocator {
     if (this == other) {
       return true;
     }
-    if (!(other instanceof PathPackageLocator)) {
+    if (!(other instanceof PathPackageLocator pathPackageLocator)) {
       return false;
     }
-    PathPackageLocator pathPackageLocator = (PathPackageLocator) other;
     return Objects.equals(pathEntries, pathPackageLocator.pathEntries)
         && Objects.equals(outputBase, pathPackageLocator.outputBase);
   }
 
+  @Nullable
   public Path getOutputBase() {
     return outputBase;
   }

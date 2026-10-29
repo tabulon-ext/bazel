@@ -29,17 +29,17 @@ public class ConstraintCollectionTest extends BuildViewTestCase {
   @Test
   public void testSetArithmetic() throws Exception {
     ConstraintSettingInfo setting1 =
-        ConstraintSettingInfo.create(Label.parseAbsoluteUnchecked("//foo:s1"));
+        ConstraintSettingInfo.create(Label.parseCanonicalUnchecked("//foo:s1"));
     ConstraintValueInfo value1 =
-        ConstraintValueInfo.create(setting1, Label.parseAbsoluteUnchecked("//foo:value1"));
+        ConstraintValueInfo.create(setting1, Label.parseCanonicalUnchecked("//foo:value1"));
     ConstraintSettingInfo setting2 =
-        ConstraintSettingInfo.create(Label.parseAbsoluteUnchecked("//foo:s2"));
+        ConstraintSettingInfo.create(Label.parseCanonicalUnchecked("//foo:s2"));
     ConstraintValueInfo value2 =
-        ConstraintValueInfo.create(setting2, Label.parseAbsoluteUnchecked("//foo:value2"));
+        ConstraintValueInfo.create(setting2, Label.parseCanonicalUnchecked("//foo:value2"));
     ConstraintSettingInfo setting3 =
-        ConstraintSettingInfo.create(Label.parseAbsoluteUnchecked("//foo:s3"));
+        ConstraintSettingInfo.create(Label.parseCanonicalUnchecked("//foo:s3"));
     ConstraintValueInfo value3 =
-        ConstraintValueInfo.create(setting3, Label.parseAbsoluteUnchecked("//foo:value3"));
+        ConstraintValueInfo.create(setting3, Label.parseCanonicalUnchecked("//foo:value3"));
 
     ConstraintCollection collection =
         ConstraintCollection.builder().addConstraints(value1, value2).build();
@@ -57,11 +57,13 @@ public class ConstraintCollectionTest extends BuildViewTestCase {
   public void testSetArithmetic_withDefaultValues() throws Exception {
     ConstraintSettingInfo setting =
         ConstraintSettingInfo.create(
-            Label.parseAbsoluteUnchecked("//foo:s"), Label.parseAbsoluteUnchecked("//foo:value1"));
+            Label.parseCanonicalUnchecked("//foo:s"),
+            Label.parseCanonicalUnchecked("//foo:value1"),
+            /* refinedConstraintValue= */ null);
     ConstraintValueInfo value1 =
-        ConstraintValueInfo.create(setting, Label.parseAbsoluteUnchecked("//foo:value1"));
+        ConstraintValueInfo.create(setting, Label.parseCanonicalUnchecked("//foo:value1"));
     ConstraintValueInfo value2 =
-        ConstraintValueInfo.create(setting, Label.parseAbsoluteUnchecked("//foo:value2"));
+        ConstraintValueInfo.create(setting, Label.parseCanonicalUnchecked("//foo:value2"));
 
     ConstraintCollection collection1 =
         ConstraintCollection.builder().addConstraints(value1).build();
@@ -78,24 +80,83 @@ public class ConstraintCollectionTest extends BuildViewTestCase {
   }
 
   @Test
+  public void testRepeatedConstraintValue() throws Exception {
+    // Referencing the same constraint value twice, e.g. once directly and once through an alias,
+    // must not fail.
+    ConstraintSettingInfo setting1 =
+        ConstraintSettingInfo.create(Label.parseCanonicalUnchecked("//foo:s1"));
+    ConstraintValueInfo value1 =
+        ConstraintValueInfo.create(setting1, Label.parseCanonicalUnchecked("//foo:value1"));
+    ConstraintSettingInfo setting2 =
+        ConstraintSettingInfo.create(Label.parseCanonicalUnchecked("//foo:s2"));
+    ConstraintValueInfo value2 =
+        ConstraintValueInfo.create(setting2, Label.parseCanonicalUnchecked("//foo:value2"));
+
+    ConstraintCollection collection =
+        ConstraintCollection.builder().addConstraints(value1, value2, value1).build();
+    assertThat(collection.constraintSettings()).containsExactly(setting1, setting2);
+    assertThat(collection.get(setting1)).isEqualTo(value1);
+    assertThat(collection.get(setting2)).isEqualTo(value2);
+    assertThat(collection.containsAll(ImmutableList.of(value1, value2))).isTrue();
+  }
+
+  @Test
   public void testDiff() throws Exception {
     ConstraintSettingInfo setting1 =
-        ConstraintSettingInfo.create(Label.parseAbsoluteUnchecked("//foo:s1"));
+        ConstraintSettingInfo.create(Label.parseCanonicalUnchecked("//foo:s1"));
     ConstraintValueInfo value1 =
-        ConstraintValueInfo.create(setting1, Label.parseAbsoluteUnchecked("//foo:value1"));
+        ConstraintValueInfo.create(setting1, Label.parseCanonicalUnchecked("//foo:value1"));
     ConstraintSettingInfo setting2 =
-        ConstraintSettingInfo.create(Label.parseAbsoluteUnchecked("//foo:s2"));
+        ConstraintSettingInfo.create(Label.parseCanonicalUnchecked("//foo:s2"));
     ConstraintValueInfo value2a =
-        ConstraintValueInfo.create(setting2, Label.parseAbsoluteUnchecked("//foo:value2a"));
+        ConstraintValueInfo.create(setting2, Label.parseCanonicalUnchecked("//foo:value2a"));
     ConstraintValueInfo value2b =
-        ConstraintValueInfo.create(setting2, Label.parseAbsoluteUnchecked("//foo:value2b"));
+        ConstraintValueInfo.create(setting2, Label.parseCanonicalUnchecked("//foo:value2b"));
 
     ConstraintCollection collection1 =
         ConstraintCollection.builder().addConstraints(value1, value2a).build();
     ConstraintCollection collection2 =
         ConstraintCollection.builder().addConstraints(value1, value2b).build();
     assertThat(collection1.diff(collection2)).containsExactly(setting2);
-    assertThat(collection1.diff(collection2))
-        .containsAtLeastElementsIn(collection2.diff(collection1));
+    assertThat(collection2.diff(collection1)).containsExactly(setting2);
+  }
+
+  @Test
+  public void testDiff_withParent() throws Exception {
+    ConstraintSettingInfo setting1 =
+        ConstraintSettingInfo.create(Label.parseCanonicalUnchecked("//foo:s1"));
+    ConstraintValueInfo value1 =
+        ConstraintValueInfo.create(setting1, Label.parseCanonicalUnchecked("//foo:value1"));
+    ConstraintSettingInfo setting2 =
+        ConstraintSettingInfo.create(Label.parseCanonicalUnchecked("//foo:s2"));
+    ConstraintValueInfo value2a =
+        ConstraintValueInfo.create(setting2, Label.parseCanonicalUnchecked("//foo:value2a"));
+    ConstraintValueInfo value2b =
+        ConstraintValueInfo.create(setting2, Label.parseCanonicalUnchecked("//foo:value2b"));
+
+    // Both collections set the same value for setting1 directly, but differ in the value of
+    // setting2, which is only set via the parent.
+    ConstraintCollection parent1 = ConstraintCollection.builder().addConstraints(value2a).build();
+    ConstraintCollection collection1 =
+        ConstraintCollection.builder().parent(parent1).addConstraints(value1).build();
+    ConstraintCollection parent2 = ConstraintCollection.builder().addConstraints(value2b).build();
+    ConstraintCollection collection2 =
+        ConstraintCollection.builder().parent(parent2).addConstraints(value1).build();
+
+    assertThat(collection1.diff(collection2)).containsExactly(setting2);
+    assertThat(collection2.diff(collection1)).containsExactly(setting2);
+
+    // A collection that inherits the same value from its parent does not differ.
+    ConstraintCollection collection3 =
+        ConstraintCollection.builder().parent(parent1).addConstraints(value1).build();
+    assertThat(collection1.diff(collection3)).isEmpty();
+    assertThat(collection3.diff(collection1)).isEmpty();
+
+    // A collection that does not set the inherited setting at all differs from one that does, in
+    // both directions.
+    ConstraintCollection collection4 =
+        ConstraintCollection.builder().addConstraints(value1).build();
+    assertThat(collection1.diff(collection4)).containsExactly(setting2);
+    assertThat(collection4.diff(collection1)).containsExactly(setting2);
   }
 }

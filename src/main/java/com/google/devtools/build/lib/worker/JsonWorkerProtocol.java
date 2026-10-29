@@ -18,6 +18,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
 import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
 import com.google.gson.stream.MalformedJsonException;
 import com.google.protobuf.util.JsonFormat;
 import com.google.protobuf.util.JsonFormat.Printer;
@@ -29,6 +30,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
+import javax.annotation.Nullable;
 
 /** An implementation of a Bazel worker using JSON to communicate with the worker process. */
 final class JsonWorkerProtocol implements WorkerProtocolImpl {
@@ -51,11 +53,12 @@ final class JsonWorkerProtocol implements WorkerProtocolImpl {
     // WorkRequests are serialized according to ndjson spec.
     // https://github.com/ndjson/ndjson-spec
     jsonPrinter.appendTo(request, jsonWriter);
-    jsonWriter.append(System.lineSeparator());
+    jsonWriter.append("\n");
     jsonWriter.flush();
   }
 
   @Override
+  @Nullable
   public WorkResponse getResponse() throws IOException {
     boolean interrupted = Thread.interrupted();
     try {
@@ -67,11 +70,19 @@ final class JsonWorkerProtocol implements WorkerProtocolImpl {
     }
   }
 
+  @Nullable
   private WorkResponse parseResponse() throws IOException {
     Integer exitCode = null;
     String output = null;
     Integer requestId = null;
     try {
+      try {
+        if (reader.peek() == JsonToken.END_DOCUMENT) {
+          return null;
+        }
+      } catch (EOFException e) {
+        return null;
+      }
       reader.beginObject();
       while (reader.hasNext()) {
         String name = reader.nextName();
@@ -95,7 +106,7 @@ final class JsonWorkerProtocol implements WorkerProtocolImpl {
             requestId = reader.nextInt();
             break;
           default:
-            // As per https://docs.bazel.build/versions/main/creating-workers.html#work-responses,
+            // As per https://bazel.build/docs/creating-workers#work-responses,
             // unknown fields are ignored.
             reader.skipValue();
         }

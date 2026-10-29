@@ -14,6 +14,8 @@
 package com.google.devtools.build.lib.vfs.inmemoryfs;
 
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.common.truth.Truth.assertWithMessage;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.Assert.assertThrows;
 
 import com.google.common.collect.Lists;
@@ -21,12 +23,12 @@ import com.google.devtools.build.lib.clock.BlazeClock;
 import com.google.devtools.build.lib.testutil.TestThread;
 import com.google.devtools.build.lib.testutil.TestThread.TestRunnable;
 import com.google.devtools.build.lib.vfs.DigestHashFunction;
+import com.google.devtools.build.lib.vfs.FileSymlinkLoopException;
 import com.google.devtools.build.lib.vfs.FileSystem;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.SymlinkAwareFileSystemTest;
-import com.google.testing.junit.testparameterinjector.TestParameter;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -61,6 +63,20 @@ public final class InMemoryFileSystemTest extends SymlinkAwareFileSystemTest {
   private static void writeToFile(Path path, String data) throws IOException {
     try (OutputStream out = path.getOutputStream()) {
       out.write(data.getBytes(Charset.defaultCharset()));
+    }
+  }
+
+  @Test
+  public void testPermissions() throws Exception {
+    Path file = testFS.getPath("/file");
+    FileSystemUtils.createEmptyFile(file);
+    for (int bits = 0; bits <= 0777; bits++) {
+      String msg = "for permissions 0%s".formatted(Integer.toString(bits, 8));
+      file.chmod(bits);
+      assertWithMessage(msg).that(file.stat().getPermissions()).isEqualTo(bits);
+      assertWithMessage(msg).that(file.isReadable()).isEqualTo((bits & 0400) != 0);
+      assertWithMessage(msg).that(file.isWritable()).isEqualTo((bits & 0200) != 0);
+      assertWithMessage(msg).that(file.isExecutable()).isEqualTo((bits & 0100) != 0);
     }
   }
 
@@ -386,8 +402,20 @@ public final class InMemoryFileSystemTest extends SymlinkAwareFileSystemTest {
     Path b = testFS.getPath(bName);
     a.createSymbolicLink(PathFragment.create(bName));
     b.createSymbolicLink(PathFragment.create(aName));
-    IOException e = assertThrows(IOException.class, a::stat);
+    FileSymlinkLoopException e = assertThrows(FileSymlinkLoopException.class, a::stat);
     assertThat(e).hasMessageThat().isEqualTo(aName + " (Too many levels of symbolic links)");
+  }
+
+  @Test
+  public void testSymlinkBelowDeepPath() throws Exception {
+    // Only symlinks count toward the limit, not the components of the path leading to them.
+    Path deep = testFS.getPath("/" + "d/".repeat(300) + "dir");
+    deep.createDirectoryAndParents();
+    deep.getChild("target").createDirectory();
+    FileSystemUtils.createEmptyFile(deep.getChild("target").getChild("file"));
+    deep.getChild("link").createSymbolicLink(PathFragment.create("target"));
+
+    assertThat(deep.getChild("link").getChild("file").stat().isFile()).isTrue();
   }
 
   @Test
@@ -397,7 +425,7 @@ public final class InMemoryFileSystemTest extends SymlinkAwareFileSystemTest {
 
     Path a = testFS.getPath(aName);
     a.createSymbolicLink(PathFragment.create(aName));
-    IOException e = assertThrows(IOException.class, a::stat);
+    FileSymlinkLoopException e = assertThrows(FileSymlinkLoopException.class, a::stat);
     assertThat(e).hasMessageThat().isEqualTo(aName + " (Too many levels of symbolic links)");
   }
 
@@ -412,18 +440,12 @@ public final class InMemoryFileSystemTest extends SymlinkAwareFileSystemTest {
     assertThat(symlink.getxattr("some.xattr")).isNull();
   }
 
-  // createSeekableByteChannel is not supported by InMemoryFileSystem.
   @Test
-  @Override
-  public void testCreateReadWriteByteChannelWrite(@TestParameter boolean overwrite) {}
+  public void testLargeFile() throws Exception {
+    Path file = testFS.getPath("/file");
 
-  // createSeekableByteChannel is not supported by InMemoryFileSystem.
-  @Test
-  @Override
-  public void testCreateReadWriteByteChannelWriteAfterSeek() {}
-
-  // createSeekableByteChannel is not supported by InMemoryFileSystem.
-  @Test
-  @Override
-  public void testCreateReadWriteByteChannelRead(@TestParameter({"0"}) int seekPosition) {}
+    String largeStr = "abcdefghijklmnopqrstuvwxyz".repeat(1000000);
+    FileSystemUtils.writeContent(file, UTF_8, largeStr);
+    assertThat(FileSystemUtils.readContent(file, UTF_8)).isEqualTo(largeStr);
+  }
 }

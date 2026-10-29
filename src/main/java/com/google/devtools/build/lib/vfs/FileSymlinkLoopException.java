@@ -16,13 +16,10 @@ package com.google.devtools.build.lib.vfs;
 
 import com.google.devtools.build.lib.io.FileSymlinkException;
 
-final class FileSymlinkLoopException extends FileSymlinkException {
-  FileSymlinkLoopException(String message) {
+/** A {@link FileSymlinkException} that indicates a symlink loop. */
+public final class FileSymlinkLoopException extends FileSymlinkException {
+  public FileSymlinkLoopException(String message) {
     super(message);
-  }
-
-  FileSymlinkLoopException(PathFragment pathFragment) {
-    this(pathFragment.getPathString() + " (Too many levels of symbolic links)");
   }
 
   @Override

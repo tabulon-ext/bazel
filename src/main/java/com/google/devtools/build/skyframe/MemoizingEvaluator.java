@@ -13,13 +13,14 @@
 // limitations under the License.
 package com.google.devtools.build.skyframe;
 
+import static com.google.common.base.Preconditions.checkNotNull;
+
 import com.google.common.annotations.VisibleForTesting;
-import com.google.devtools.build.lib.collect.nestedset.NestedSetVisitor;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadHostile;
 import com.google.devtools.build.lib.events.ExtendedEventHandler;
-import com.google.devtools.build.lib.events.ExtendedEventHandler.Postable;
 import java.io.PrintStream;
 import java.util.Map;
+import java.util.function.BiPredicate;
 import java.util.function.Predicate;
 import javax.annotation.Nullable;
 
@@ -48,6 +49,11 @@ public interface MemoizingEvaluator {
       Iterable<? extends SkyKey> roots, EvaluationContext evaluationContext)
       throws InterruptedException;
 
+  /** Same as {@link #delete(BiPredicate)}, but takes a predicate that only uses the key. */
+  default void delete(Predicate<SkyKey> pred) {
+    delete((k, v) -> pred.test(k));
+  }
+
   /**
    * Ensures that after the next completed {@link #evaluate} call the current values of any value
    * matching this predicate (and all values that transitively depend on them) will be removed from
@@ -59,11 +65,11 @@ public interface MemoizingEvaluator {
    *
    * <p>To delete all dirty values, you can specify a predicate that's always false.
    */
-  void delete(Predicate<SkyKey> pred);
+  void delete(BiPredicate<SkyKey, SkyValue> pred);
 
   /**
-   * Marks dirty values for deletion if they have been dirty for at least as many graph versions
-   * as the specified limit.
+   * Marks dirty values for deletion if they have been dirty for at least as many graph versions as
+   * the specified limit.
    *
    * <p>This ensures that after the next completed {@link #evaluate} call, all such values, along
    * with all values that transitively depend on them, will be removed from the value cache. Values
@@ -73,8 +79,12 @@ public interface MemoizingEvaluator {
    * be recomputed and the new values stored in the cache again.
    *
    * <p>To delete all dirty values, you can specify 0 for the limit.
+   *
+   * <p>If {@code keepChangePrunableNodes} is true, dirty values that change pruning would mark
+   * clean when they are next requested are exempt from deletion, regardless of how long they have
+   * been dirty.
    */
-  void deleteDirty(long versionAgeLimit);
+  void deleteDirty(long versionAgeLimit, boolean keepChangePrunableNodes);
 
   /**
    * Returns the values in the graph.
@@ -87,11 +97,12 @@ public interface MemoizingEvaluator {
   Map<SkyKey, SkyValue> getValues();
 
   /**
-   * Returns the node entries in the graph. Should only be called between evaluations. The returned
-   * iterable is mutable, but do not mutate it unless you know what you are doing! Naively deleting
-   * an entry will break graph invariants and cause a crash.
+   * Returns an {@link InMemoryGraph} containing all of the nodes backing this evaluator.
+   *
+   * <p>Throws {@link UnsupportedOperationException} if this evaluator does not store its entire
+   * graph in memory.
    */
-  Iterable<? extends Map.Entry<SkyKey, ? extends NodeEntry>> getGraphEntries();
+  InMemoryGraph getInMemoryGraph();
 
   /**
    * Informs the evaluator that a sequence of evaluations at the same version has finished.
@@ -112,6 +123,16 @@ public interface MemoizingEvaluator {
   default void postLoggingStats(ExtendedEventHandler eventHandler) {}
 
   /**
+   * Returns the version of the first evaluation in the latest sequence of evaluations (see {@link
+   * #noteEvaluationsAtSameVersionMayBeFinished}), or {@code null} if nothing has been evaluated yet
+   * or versions aren't tracked.
+   */
+  @Nullable
+  default Version getFirstVersionOfLatestEvaluationSequence() {
+    return null;
+  }
+
+  /**
    * Returns the done (without error) values in the graph.
    *
    * <p>The returned map may be a live view of the graph.
@@ -130,6 +151,9 @@ public interface MemoizingEvaluator {
   @Nullable
   NodeEntry getExistingEntryAtCurrentlyEvaluatingVersion(SkyKey key) throws InterruptedException;
 
+  /** Returns whether the key was rewound and has not yet completed successfully. */
+  boolean isRewinding(SkyKey key);
+
   /**
    * Returns an error if and only if an earlier call to {@link #evaluate} created it; null
    * otherwise.
@@ -143,16 +167,19 @@ public interface MemoizingEvaluator {
   ErrorInfo getExistingErrorForTesting(SkyKey key) throws InterruptedException;
 
   /**
-   * Tests that want finer control over the graph being used may provide a {@code transformer} here.
-   * This {@code transformer} will be applied to the graph for each invalidation/evaluation.
+   * Injects a {@link GraphTransformerForTesting} to allow tests to have finer-grained control over
+   * the graph.
+   *
+   * <p>May be called multiple times, in which case the effective graph is the result of
+   * sequentially applying all transformers in the order in which they were passed to this method.
+   *
+   * <p>Must only be called in tests.
    */
   void injectGraphTransformerForTesting(GraphTransformerForTesting transformer);
 
   /** Transforms a graph, possibly injecting other functionality. */
   interface GraphTransformerForTesting {
     InMemoryGraph transform(InMemoryGraph graph);
-
-    QueryableGraph transform(QueryableGraph graph);
 
     ProcessableGraph transform(ProcessableGraph graph);
 
@@ -164,15 +191,37 @@ public interface MemoizingEvaluator {
           }
 
           @Override
-          public QueryableGraph transform(QueryableGraph graph) {
-            return graph;
-          }
-
-          @Override
           public ProcessableGraph transform(ProcessableGraph graph) {
             return graph;
           }
         };
+
+    /**
+     * Returns a composite transformer that applies both of the given transformers in the given
+     * order.
+     */
+    static GraphTransformerForTesting compose(
+        GraphTransformerForTesting before, GraphTransformerForTesting after) {
+      checkNotNull(before);
+      checkNotNull(after);
+      if (before == NO_OP) {
+        return after;
+      }
+      if (after == NO_OP) {
+        return before;
+      }
+      return new GraphTransformerForTesting() {
+        @Override
+        public InMemoryGraph transform(InMemoryGraph graph) {
+          return after.transform(before.transform(graph));
+        }
+
+        @Override
+        public ProcessableGraph transform(ProcessableGraph graph) {
+          return after.transform(before.transform(graph));
+        }
+      };
+    }
   }
 
   /**
@@ -184,28 +233,74 @@ public interface MemoizingEvaluator {
   void dumpSummary(PrintStream out);
 
   /**
-   * Writes a detailed summary of the graph to the given output stream, omitting keys that do not
-   * match the given filter.
+   * Writes a list of counts of each node type in the graph to the given output stream.
    *
    * <p>Not necessarily thread-safe. Use only for debugging purposes.
    */
   @ThreadHostile
-  void dumpDetailed(PrintStream out, Predicate<SkyKey> filter);
+  void dumpCount(PrintStream out);
 
   /**
-   * Keeps track of already-emitted events. Users of the graph should instantiate an
-   * {@code EmittedEventState} first and pass it to the graph during creation. This allows them to
-   * determine whether or not to replay events.
+   * Writes the keys in the graph to the given output stream. For each keys matching the given
+   * filter, prints the key name.
+   *
+   * <p>Not necessarily thread-safe. Use only for debugging purposes.
    */
-  class EmittedEventState {
-    final NestedSetVisitor.VisitedState<TaggedEvents> eventState =
-        new NestedSetVisitor.VisitedState<>();
-    final NestedSetVisitor.VisitedState<Postable> postableState =
-        new NestedSetVisitor.VisitedState<>();
+  @ThreadHostile
+  void dumpKeys(PrintStream out, Predicate<String> filter) throws InterruptedException;
 
-    public void clear() {
-      eventState.clear();
-      postableState.clear();
-    }
-  }
+  /**
+   * Writes a detailed summary of the graph to the given output stream. For each key matching the
+   * given filter, prints the key name and value.
+   *
+   * <p>Not necessarily thread-safe. Use only for debugging purposes.
+   */
+  @ThreadHostile
+  void dumpValues(PrintStream out, Predicate<String> filter) throws InterruptedException;
+
+  /**
+   * Writes a detailed summary of the graph to the given output stream. For each key matching the
+   * given filter, prints the key name and deps. The deps are printed in groups according to the
+   * dependency order registered in Skyframe.
+   *
+   * <p>Not necessarily thread-safe. Use only for debugging purposes.
+   */
+  @ThreadHostile
+  void dumpDeps(PrintStream out, Predicate<String> filter) throws InterruptedException;
+
+  /**
+   * Emits the graph representation in the DOT description format of SkyFunction dependencies of the
+   * keys matching the given filter to the given output stream.
+   *
+   * <p>Useful for understanding the high level dependency edges established by Skyframe lookups.
+   * calls.
+   *
+   * <p>The nodes are {@link SkyFunctionName}s. They do not include individual SkyKey information
+   * since the most basic builds already create way too many nodes to generate a useful graph image.
+   *
+   * <p>Edges are de-duplicated (e.g. all FILE -> FILE_STATE edges show up as a single edge), and
+   * the output may show cycles (e.g. ACTION_EXECUTION -> ARTIFACT -> ACTION_EXECUTION -> ...)
+   *
+   * <p>Not necessarily thread-safe. Use only for debugging purposes.
+   */
+  @ThreadHostile
+  void dumpFunctionGraph(PrintStream out, Predicate<String> filter) throws InterruptedException;
+
+  /**
+   * Writes a detailed summary of the graph to the given output stream. For each key matching the
+   * given filter, prints the key name and its reverse deps.
+   *
+   * <p>Not necessarily thread-safe. Use only for debugging purposes.
+   */
+  @ThreadHostile
+  void dumpRdeps(PrintStream out, Predicate<String> filter) throws InterruptedException;
+
+  /**
+   * Cleans up {@linkplain com.google.devtools.build.lib.concurrent.PooledInterner.Pool interning
+   * pools} by moving objects to weak interners and uninstalling the current pools.
+   *
+   * <p>May destroy this evaluator's {@linkplain #getInMemoryGraph graph}. Only call when the graph
+   * is about to be thrown away.
+   */
+  void cleanupInterningPools();
 }

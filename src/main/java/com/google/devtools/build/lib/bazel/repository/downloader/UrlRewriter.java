@@ -14,36 +14,33 @@
 package com.google.devtools.build.lib.bazel.repository.downloader;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
-import static java.nio.charset.StandardCharsets.ISO_8859_1;
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 import com.google.auth.Credentials;
 import com.google.auto.value.AutoValue;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Ascii;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.io.Closer;
+import com.google.common.net.UrlEscapers;
 import com.google.devtools.build.lib.authandtls.Netrc;
 import com.google.devtools.build.lib.authandtls.NetrcCredentials;
 import com.google.devtools.build.lib.authandtls.NetrcParser;
-import com.google.devtools.build.lib.events.Event;
-import com.google.devtools.build.lib.events.Reporter;
 import com.google.devtools.build.lib.util.OS;
-import com.google.devtools.build.lib.vfs.FileSystem;
 import com.google.devtools.build.lib.vfs.Path;
+import com.google.devtools.build.lib.vfs.PathFragment;
 import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.Reader;
 import java.io.StringReader;
-import java.io.UncheckedIOException;
-import java.net.MalformedURLException;
 import java.net.URI;
-import java.net.URISyntaxException;
-import java.net.URL;
-import java.nio.file.Files;
-import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
 import java.util.HashMap;
@@ -51,10 +48,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.function.Consumer;
-import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import net.starlark.java.syntax.Location;
 
@@ -69,70 +65,117 @@ public class UrlRewriter {
 
   private static final ImmutableSet<String> REWRITABLE_SCHEMES = ImmutableSet.of("http", "https");
 
+  private static final String DIGITS = "\\d+";
+
+  // Matches tokens in replacement strings: ${urlencode($N)}, urlencode($N), ${N}, $N, or \c
+  private static final Pattern REPLACEMENT_TOKEN_PATTERN =
+      Pattern.compile(
+          Pattern.quote("${urlencode($")
+              + DIGITS
+              + Pattern.quote(")}")
+              + "|"
+              + Pattern.quote("urlencode($")
+              + DIGITS
+              + Pattern.quote(")")
+              + "|"
+              + Pattern.quote("${")
+              + DIGITS
+              + Pattern.quote("}")
+              + "|"
+              + Pattern.quote("$")
+              + DIGITS
+              + "|\\\\.");
+
+  static boolean isValidUrlEncodeSyntax(String replacement) {
+    String stripped = REPLACEMENT_TOKEN_PATTERN.matcher(replacement).replaceAll("");
+    return !stripped.contains("urlencode(");
+  }
+
   private final UrlRewriterConfig config;
-  private final Function<URL, List<RewrittenURL>> rewriter;
-  @Nullable private final Credentials netrcCreds;
 
   @VisibleForTesting
-  UrlRewriter(
-      Consumer<String> log,
-      String filePathForErrorReporting,
-      Reader reader,
-      @Nullable Credentials netrcCreds)
+  UrlRewriter(List<String> filePathsForErrorReporting, List<Reader> readers)
       throws UrlRewriterParseException {
-    Preconditions.checkNotNull(reader, "UrlRewriterConfig source must be set");
-    this.config = new UrlRewriterConfig(filePathForErrorReporting, reader);
-    this.netrcCreds = netrcCreds;
+    Preconditions.checkNotNull(readers, "UrlRewriterConfig source must be set");
+    Preconditions.checkNotNull(
+        filePathsForErrorReporting, "UrlRewriterConfig filePath must be set");
+    Preconditions.checkArgument(
+        filePathsForErrorReporting.size() == readers.size(),
+        "filePath and readers size must be equal");
 
-    this.rewriter = this::rewrite;
+    this.config = new UrlRewriterConfig(filePathsForErrorReporting, readers);
   }
 
   /**
    * Obtain a new {@code UrlRewriter} configured with the specified config file.
    *
-   * @param configPath Path to the config file to use. May be null.
-   * @param reporter Used for logging when URLs are rewritten.
-   * @param clientEnv a map of the current Bazel command's environment
-   * @param fileSystem the Blaze file system
+   * @param configPaths Paths to the config file to use. May be null.
    */
   public static UrlRewriter getDownloaderUrlRewriter(
-      String configPath,
-      Reporter reporter,
-      ImmutableMap<String, String> clientEnv,
-      FileSystem fileSystem)
-      throws UrlRewriterParseException {
-    Consumer<String> log = str -> reporter.handle(Event.info(str));
-
+      Path workspaceRoot, @Nullable List<PathFragment> configPaths)
+      throws IOException, UrlRewriterParseException {
     // "empty" UrlRewriter shouldn't alter auth headers
-    if (Strings.isNullOrEmpty(configPath)) {
-      return new UrlRewriter(log, "", new StringReader(""), null);
+    if (configPaths == null
+        || configPaths.isEmpty()
+        || configPaths.stream().anyMatch(PathFragment::isEmpty)) {
+      return new UrlRewriter(ImmutableList.of(""), ImmutableList.of(new StringReader("")));
     }
 
-    Credentials creds = null;
-    try {
-      creds = newCredentialsFromNetrc(clientEnv, fileSystem);
-    } catch (UrlRewriterParseException e) {
-      // If the credentials extraction failed, we're letting bazel try without credentials.
+    // There have been reports (eg. https://github.com/bazelbuild/bazel/issues/22104) that
+    // there are occasional errors when `configFile` can't be found, and when this happens
+    // investigation suggests that the current working directory isn't the workspace root.
+    List<Path> actualConfigPaths = configPaths.stream().map(workspaceRoot::getRelative).toList();
+
+    List<Path> notFoundConfigPaths = new ArrayList<>();
+    for (Path actualConfigPath : actualConfigPaths) {
+      if (!actualConfigPath.exists()) {
+        notFoundConfigPaths.add(actualConfigPath);
+      }
     }
-    try (BufferedReader reader = Files.newBufferedReader(Paths.get(configPath))) {
-      return new UrlRewriter(log, configPath, reader, creds);
+    if (!notFoundConfigPaths.isEmpty()) {
+      throw new UrlRewriterParseException(
+          String.format(
+              "Unable to find downloader config file %s",
+              notFoundConfigPaths.stream()
+                  .map(Path::getPathString)
+                  .collect(Collectors.joining(","))));
+    }
+
+    // Java's try-with-resources doesn't handle dynamic amounts of AutoCloseable resources, so use
+    // Closer to register and close.
+    Closer closer = Closer.create();
+    try { // For IOExceptions coming from Closer.
+      try {
+        List<Reader> readers = new ArrayList<>();
+        for (Path actualConfigPath : actualConfigPaths) {
+          BufferedReader br =
+              new BufferedReader(new InputStreamReader(actualConfigPath.getInputStream(), UTF_8));
+          closer.register(br);
+          readers.add(br);
+        }
+        return new UrlRewriter(
+            configPaths.stream().map(PathFragment::getPathString).toList(), readers);
+      } catch (Throwable e) {
+        throw closer.rethrow(e, UrlRewriterParseException.class);
+      } finally {
+        closer.close();
+      }
     } catch (IOException e) {
-      throw new UncheckedIOException(e);
+      throw new UrlRewriterParseException(e.getMessage());
     }
   }
 
   /**
-   * Rewrites {@code urls} using the configuration provided to {@link
-   * #getDownloaderUrlRewriter(String, Reporter, ImmutableMap, FileSystem)}. The returned list of
-   * URLs may be empty if the configuration used blocks all the input URLs.
+   * Rewrites {@code urls} using the configuration provided to {@link #getDownloaderUrlRewriter}.
+   * The returned list of URLs may be empty if the configuration used blocks all the input URLs.
    *
    * @param urls The input list of {@link URL}s. May be empty.
    * @return The amended lists of URLs.
    */
-  public ImmutableList<RewrittenURL> amend(List<URL> urls) {
+  public ImmutableList<RewrittenURL> amend(List<URI> urls) {
     Objects.requireNonNull(urls, "URLS to check must be set but may be empty");
 
-    return urls.stream().map(rewriter).flatMap(Collection::stream).collect(toImmutableList());
+    return urls.stream().map(this::rewrite).flatMap(Collection::stream).collect(toImmutableList());
   }
 
   /**
@@ -144,9 +187,11 @@ public class UrlRewriter {
    * @param authHeaders A map of the URLs and their corresponding auth tokens.
    * @return A map of the updated authentication headers.
    */
-  public Map<URI, Map<String, String>> updateAuthHeaders(
-      List<RewrittenURL> urls, Map<URI, Map<String, String>> authHeaders) {
-    Map<URI, Map<String, String>> updatedAuthHeaders = new HashMap<>(authHeaders);
+  public Map<URI, Map<String, List<String>>> updateAuthHeaders(
+      List<RewrittenURL> urls,
+      Map<URI, Map<String, List<String>>> authHeaders,
+      Credentials netrcCreds) {
+    Map<URI, Map<String, List<String>>> updatedAuthHeaders = new HashMap<>(authHeaders);
 
     for (RewrittenURL url : urls) {
       // if URL was not re-written by UrlRewriter in first place, we should not attach auth headers
@@ -157,17 +202,12 @@ public class UrlRewriter {
 
       String userInfo = url.url().getUserInfo();
       if (userInfo != null) {
+        String token = "Basic " + Base64.getEncoder().encodeToString(userInfo.getBytes(UTF_8));
+        updatedAuthHeaders.put(
+            url.url(), ImmutableMap.of("Authorization", ImmutableList.of(token)));
+      } else if (netrcCreds != null) {
         try {
-          String token =
-              "Basic " + Base64.getEncoder().encodeToString(userInfo.getBytes(ISO_8859_1));
-          updatedAuthHeaders.put(url.url().toURI(), ImmutableMap.of("Authorization", token));
-        } catch (URISyntaxException e) {
-          // If the credentials extraction failed, we're letting bazel try without credentials.
-        }
-      } else if (this.netrcCreds != null) {
-        try {
-          Map<String, List<String>> urlAuthHeaders =
-              this.netrcCreds.getRequestMetadata(url.url().toURI());
+          Map<String, List<String>> urlAuthHeaders = netrcCreds.getRequestMetadata(url.url());
           if (urlAuthHeaders == null || urlAuthHeaders.isEmpty()) {
             continue;
           }
@@ -176,10 +216,11 @@ public class UrlRewriter {
               urlAuthHeaders.entrySet().stream().findFirst().get();
           if (firstAuthHeader.getValue() != null && !firstAuthHeader.getValue().isEmpty()) {
             updatedAuthHeaders.put(
-                url.url().toURI(),
-                ImmutableMap.of(firstAuthHeader.getKey(), firstAuthHeader.getValue().get(0)));
+                url.url(),
+                ImmutableMap.of(
+                    firstAuthHeader.getKey(), ImmutableList.of(firstAuthHeader.getValue().get(0))));
           }
-        } catch (URISyntaxException | IOException e) {
+        } catch (IOException e) {
           // If the credentials extraction failed, we're letting bazel try without credentials.
         }
       }
@@ -188,12 +229,12 @@ public class UrlRewriter {
     return ImmutableMap.copyOf(updatedAuthHeaders);
   }
 
-  private ImmutableList<RewrittenURL> rewrite(URL url) {
+  private ImmutableList<RewrittenURL> rewrite(URI url) {
     Preconditions.checkNotNull(url);
 
     // Cowardly refuse to rewrite non-HTTP(S) urls
     if (REWRITABLE_SCHEMES.stream()
-        .noneMatch(scheme -> Ascii.equalsIgnoreCase(scheme, url.getProtocol()))) {
+        .noneMatch(scheme -> Ascii.equalsIgnoreCase(scheme, url.getScheme()))) {
       return ImmutableList.of(RewrittenURL.create(url, false));
     }
 
@@ -217,7 +258,7 @@ public class UrlRewriter {
     return toReturn.build();
   }
 
-  private boolean isAllowMatched(URL url) {
+  private boolean isAllowMatched(URI url) {
     for (String host : config.getAllowList()) {
       if (isMatchingHostName(url, host)) {
         return true;
@@ -226,7 +267,7 @@ public class UrlRewriter {
     return false;
   }
 
-  private boolean isBlockMatched(URL url) {
+  private boolean isBlockMatched(URI url) {
     for (String host : config.getBlockList()) {
       // Allow a wild-card block
       if ("*".equals(host)) {
@@ -240,12 +281,32 @@ public class UrlRewriter {
     return false;
   }
 
-  private static boolean isMatchingHostName(URL url, String host) {
-    return host.equals(url.getHost()) || url.getHost().endsWith("." + host);
+  private static boolean isMatchingHostName(URI url, String host) {
+    String urlHost = url.getHost();
+    if (urlHost == null) {
+      return false;
+    }
+    String lowerUrlHost = Ascii.toLowerCase(urlHost);
+    return host.equals(lowerUrlHost) || lowerUrlHost.endsWith("." + host);
   }
 
-  private ImmutableList<RewrittenURL> applyRewriteRules(URL url) {
-    String withoutScheme = url.toString().substring(url.getProtocol().length() + 3);
+  private ImmutableList<RewrittenURL> applyRewriteRules(URI url) {
+    String withoutScheme = url.toString().substring(url.getScheme().length() + 3);
+    String host = url.getHost();
+    if (host != null) {
+      String lowerHost = Ascii.toLowerCase(host);
+      if (!host.equals(lowerHost)) {
+        // Splice the lowercased host into withoutScheme (after any "userInfo@") while leaving the
+        // raw port, path, query, and fragment untouched.
+        String userInfo = url.getRawUserInfo();
+        int hostStart = userInfo == null ? 0 : userInfo.length() + 1;
+        int hostEnd = hostStart + host.length();
+        if (withoutScheme.regionMatches(hostStart, host, 0, host.length())) {
+          withoutScheme =
+              withoutScheme.substring(0, hostStart) + lowerHost + withoutScheme.substring(hostEnd);
+        }
+      }
+    }
 
     ImmutableSet.Builder<String> rewrittenUrls = ImmutableSet.builder();
 
@@ -256,7 +317,7 @@ public class UrlRewriter {
         matchMade = true;
 
         for (String replacement : entry.getValue()) {
-          rewrittenUrls.add(matcher.replaceFirst(replacement));
+          rewrittenUrls.add(evaluateReplacement(matcher, replacement));
         }
       }
     }
@@ -266,23 +327,48 @@ public class UrlRewriter {
     }
 
     return rewrittenUrls.build().stream()
-        .map(urlString -> prefixWithProtocol(urlString, url.getProtocol()))
+        .map(urlString -> prefixWithProtocol(urlString, url.getScheme()))
         .map(plainUrl -> RewrittenURL.create(plainUrl, true))
         .collect(toImmutableList());
   }
 
-  /** Prefixes url with protocol if not already prefixed by {@link #REWRITABLE_SCHEMES} */
-  private static URL prefixWithProtocol(String url, String protocol) {
-    try {
-      for (String schemaPrefix : REWRITABLE_SCHEMES) {
-        if (url.startsWith(schemaPrefix + "://")) {
-          return new URL(url);
-        }
+  private static String evaluateReplacement(Matcher matcher, String replacement) {
+    Matcher m = REPLACEMENT_TOKEN_PATTERN.matcher(replacement);
+    StringBuilder sb = new StringBuilder();
+    while (m.find()) {
+      String token = m.group();
+      if (token.contains("urlencode")) {
+        int groupIndex = Integer.parseInt(token.replaceAll("\\D+", ""));
+        String val = Strings.nullToEmpty(matcher.group(groupIndex));
+        m.appendReplacement(sb, Matcher.quoteReplacement(escapeUrlPath(val)));
+      } else if (token.startsWith("$")) {
+        int groupIndex = Integer.parseInt(token.replaceAll("\\D+", ""));
+        String val = Strings.nullToEmpty(matcher.group(groupIndex));
+        m.appendReplacement(sb, Matcher.quoteReplacement(val));
+      } else if (token.startsWith("\\")) {
+        String escapedChar = token.substring(1);
+        m.appendReplacement(sb, Matcher.quoteReplacement(escapedChar));
       }
-      return new URL(protocol + "://" + url);
-    } catch (MalformedURLException e) {
-      throw new IllegalStateException(e);
     }
+    m.appendTail(sb);
+    return sb.toString();
+  }
+
+  private static String escapeUrlPath(String path) {
+    return Splitter.on('/')
+        .splitToStream(path)
+        .map(UrlEscapers.urlPathSegmentEscaper()::escape)
+        .collect(Collectors.joining("/"));
+  }
+
+  /** Prefixes url with protocol if not already prefixed by {@link #REWRITABLE_SCHEMES} */
+  private static URI prefixWithProtocol(String url, String protocol) {
+    for (String schemaPrefix : REWRITABLE_SCHEMES) {
+      if (url.startsWith(schemaPrefix + "://")) {
+        return HttpUtils.toAsciiUri(URI.create(url));
+      }
+    }
+    return HttpUtils.toAsciiUri(URI.create(protocol + "://" + url));
   }
 
   /**
@@ -298,9 +384,9 @@ public class UrlRewriter {
    * @throws UrlRewriterParseException in case the credentials can't be constructed.
    */
   // TODO : consider re-using RemoteModule.newCredentialsFromNetrc
-  @VisibleForTesting
-  static Credentials newCredentialsFromNetrc(Map<String, String> clientEnv, FileSystem fileSystem)
-      throws UrlRewriterParseException {
+  @Nullable
+  public static Credentials newCredentialsFromNetrc(
+      Map<String, String> clientEnv, Path workingDirectory) throws UrlRewriterParseException {
     final Optional<String> homeDir;
     if (OS.getCurrent() == OS.WINDOWS) {
       homeDir = Optional.ofNullable(clientEnv.get("USERPROFILE"));
@@ -314,18 +400,25 @@ public class UrlRewriter {
       return null;
     }
     Location location = Location.fromFileLineColumn(netrcFileString, 0, 0);
-
-    Path netrcFile = fileSystem.getPath(netrcFileString);
-    if (netrcFile.exists()) {
-      try {
+    // In case Bazel is not started from a valid workspace.
+    if (workingDirectory == null) {
+      return null;
+    }
+    // Using the getRelative() method ensures:
+    //  - If netrcFileString is an absolute path, use as it is.
+    //  - If netrcFileString is a relative path, it's resolved to an absolute path with the current
+    //    working directory.
+    Path netrcFile = workingDirectory.getRelative(netrcFileString);
+    try {
+      if (netrcFile.exists()) {
         Netrc netrc = NetrcParser.parseAndClose(netrcFile.getInputStream());
         return new NetrcCredentials(netrc);
-      } catch (IOException e) {
-        throw new UrlRewriterParseException(
-            "Failed to parse " + netrcFile.getPathString() + ": " + e.getMessage(), location);
+      } else {
+        return null;
       }
-    } else {
-      return null;
+    } catch (IOException e) {
+      throw new UrlRewriterParseException(
+          "Failed to parse " + netrcFile.getPathString() + ": " + e.getMessage(), location);
     }
   }
 
@@ -337,11 +430,11 @@ public class UrlRewriter {
   /** Holds the URL along with meta-info, such as whether URL was re-written or not. */
   @AutoValue
   public abstract static class RewrittenURL {
-    static RewrittenURL create(URL url, boolean rewritten) {
+    static RewrittenURL create(URI url, boolean rewritten) {
       return new AutoValue_UrlRewriter_RewrittenURL(url, rewritten);
     }
 
-    abstract URL url();
+    abstract URI url();
 
     abstract boolean rewritten();
   }

@@ -17,10 +17,13 @@ package com.google.devtools.build.lib.starlarkbuildapi.cpp;
 import com.google.common.collect.ImmutableList;
 import com.google.devtools.build.lib.collect.nestedset.Depset;
 import com.google.devtools.build.lib.starlarkbuildapi.FileApi;
+import net.starlark.java.annot.StarlarkBuiltin;
 import net.starlark.java.annot.StarlarkMethod;
+import net.starlark.java.eval.StarlarkValue;
 
 /** Object with information about C++ rules. Every C++-related target should provide this. */
-public interface CcStarlarkApiProviderApi<FileT extends FileApi> {
+@StarlarkBuiltin(name = "cc_starlark_api_provider", documented = false)
+public interface CcStarlarkApiProviderApi<FileT extends FileApi> extends StarlarkValue {
 
   @StarlarkMethod(
       name = "transitive_headers",
@@ -37,7 +40,7 @@ public interface CcStarlarkApiProviderApi<FileT extends FileApi> {
       doc =
           "Returns the <a href=\"depset.html\">depset</a> of libraries for either "
               + "<code>FULLY STATIC</code> mode (<code>linkopts=[\"-static\"]</code>) or "
-              + "<code>MOSTLY STATIC</code> mode (<code>linkstatic=1</code>) "
+              + "<code>MOSTLY STATIC</code> mode (<code>linkstatic=True</code>) "
               + "(possibly empty but never <code>None</code>)")
   public Depset /*<FileT>*/ getLibrariesForStarlark();
 
@@ -47,7 +50,7 @@ public interface CcStarlarkApiProviderApi<FileT extends FileApi> {
       doc =
           "Returns the list of flags given to the C++ linker command for either "
               + "<code>FULLY STATIC</code> mode (<code>linkopts=[\"-static\"]</code>) or "
-              + "<code>MOSTLY STATIC</code> mode (<code>linkstatic=1</code>) "
+              + "<code>MOSTLY STATIC</code> mode (<code>linkstatic=True</code>) "
               + "(possibly empty but never <code>None</code>)")
   public ImmutableList<String> getLinkopts();
 

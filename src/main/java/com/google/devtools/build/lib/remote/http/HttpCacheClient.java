@@ -13,9 +13,14 @@
 // limitations under the License.
 package com.google.devtools.build.lib.remote.http;
 
+import build.bazel.remote.execution.v2.ActionCacheUpdateCapabilities;
 import build.bazel.remote.execution.v2.ActionResult;
+import build.bazel.remote.execution.v2.CacheCapabilities;
 import build.bazel.remote.execution.v2.Digest;
+import build.bazel.remote.execution.v2.ServerCapabilities;
+import build.bazel.remote.execution.v2.SymlinkAbsolutePathStrategy;
 import com.google.auth.Credentials;
+import com.google.common.base.Ascii;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.flogger.GoogleLogger;
@@ -25,16 +30,20 @@ import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.common.util.concurrent.SettableFuture;
 import com.google.devtools.build.lib.authandtls.AuthAndTLSOptions;
+import com.google.devtools.build.lib.remote.RemoteRetrier;
+import com.google.devtools.build.lib.remote.Retrier.ResultClassifier;
+import com.google.devtools.build.lib.remote.Retrier.ResultClassifier.Result;
+import com.google.devtools.build.lib.remote.common.ActionKey;
 import com.google.devtools.build.lib.remote.common.CacheNotFoundException;
 import com.google.devtools.build.lib.remote.common.RemoteActionExecutionContext;
 import com.google.devtools.build.lib.remote.common.RemoteCacheClient;
 import com.google.devtools.build.lib.remote.util.DigestOutputStream;
 import com.google.devtools.build.lib.remote.util.DigestUtil;
 import com.google.devtools.build.lib.remote.util.Utils;
-import com.google.devtools.build.lib.vfs.Path;
 import com.google.protobuf.ByteString;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.EventLoopGroup;
@@ -45,7 +54,6 @@ import io.netty.channel.kqueue.KQueue;
 import io.netty.channel.kqueue.KQueueDomainSocketChannel;
 import io.netty.channel.kqueue.KQueueEventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.channel.pool.ChannelPool;
 import io.netty.channel.pool.ChannelPoolHandler;
 import io.netty.channel.pool.FixedChannelPool;
 import io.netty.channel.pool.SimpleChannelPool;
@@ -59,7 +67,6 @@ import io.netty.handler.codec.http.HttpRequestEncoder;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpResponseDecoder;
 import io.netty.handler.codec.http.HttpResponseStatus;
-import io.netty.handler.ssl.OpenSsl;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslHandler;
@@ -78,16 +85,22 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.URI;
+import java.nio.channels.ClosedChannelException;
 import java.util.List;
 import java.util.Map.Entry;
 import java.util.NoSuchElementException;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLParameters;
 
 /**
  * Implementation of {@link RemoteCacheClient} that can talk to a HTTP/1.1 backend.
@@ -113,22 +126,52 @@ import javax.net.ssl.SSLEngine;
  *
  * <p>The implementation currently does not support transfer encoding chunked.
  */
-public final class HttpCacheClient implements RemoteCacheClient {
+public final class HttpCacheClient extends RemoteCacheClient {
   private static final GoogleLogger logger = GoogleLogger.forEnclosingClass();
 
   public static final String AC_PREFIX = "ac/";
   public static final String CAS_PREFIX = "cas/";
+  public static final ResultClassifier HTTP_RESULT_CLASSIFIER =
+      e ->
+          switch (e) {
+            case ClosedChannelException ignored -> Result.TRANSIENT_FAILURE;
+            case DownloadTimeoutException ignored -> Result.TRANSIENT_FAILURE;
+            case UploadTimeoutException ignored -> Result.TRANSIENT_FAILURE;
+            case HttpException httpException -> {
+              int status = httpException.response().status().code();
+              if (status == HttpResponseStatus.NOT_FOUND.code()) {
+                yield Result.SUCCESS;
+              }
+              yield status == HttpResponseStatus.REQUEST_TIMEOUT.code()
+                      || status == HttpResponseStatus.TOO_MANY_REQUESTS.code()
+                      || status == HttpResponseStatus.INTERNAL_SERVER_ERROR.code()
+                      || status == HttpResponseStatus.BAD_GATEWAY.code()
+                      || status == HttpResponseStatus.SERVICE_UNAVAILABLE.code()
+                      || status == HttpResponseStatus.GATEWAY_TIMEOUT.code()
+                  ? Result.TRANSIENT_FAILURE
+                  : Result.PERMANENT_FAILURE;
+            }
+            case IOException ioException -> {
+              String msg = Ascii.toLowerCase(ioException.getMessage());
+              yield msg.contains("connection reset") || msg.contains("operation timed out")
+                  ? Result.TRANSIENT_FAILURE
+                  : Result.PERMANENT_FAILURE;
+            }
+            case null, default -> Result.PERMANENT_FAILURE;
+          };
+
   private static final Pattern INVALID_TOKEN_ERROR =
       Pattern.compile("\\s*error\\s*=\\s*\"?invalid_token\"?");
 
   private final EventLoopGroup eventLoop;
-  private final ChannelPool channelPool;
+  private final SimpleChannelPool channelPool;
   private final URI uri;
   private final int timeoutSeconds;
   private final ImmutableList<Entry<String, String>> extraHttpHeaders;
   private final boolean useTls;
   private final boolean verifyDownloads;
   private final DigestUtil digestUtil;
+  private final RemoteRetrier retrier;
 
   private final Object closeLock = new Object();
 
@@ -150,6 +193,7 @@ public final class HttpCacheClient implements RemoteCacheClient {
       boolean verifyDownloads,
       ImmutableList<Entry<String, String>> extraHttpHeaders,
       DigestUtil digestUtil,
+      RemoteRetrier retrier,
       @Nullable final Credentials creds,
       AuthAndTLSOptions authAndTlsOptions)
       throws Exception {
@@ -162,6 +206,7 @@ public final class HttpCacheClient implements RemoteCacheClient {
         verifyDownloads,
         extraHttpHeaders,
         digestUtil,
+        retrier,
         creds,
         authAndTlsOptions,
         null);
@@ -175,6 +220,7 @@ public final class HttpCacheClient implements RemoteCacheClient {
       boolean verifyDownloads,
       ImmutableList<Entry<String, String>> extraHttpHeaders,
       DigestUtil digestUtil,
+      RemoteRetrier retrier,
       @Nullable final Credentials creds,
       AuthAndTLSOptions authAndTlsOptions)
       throws Exception {
@@ -189,6 +235,7 @@ public final class HttpCacheClient implements RemoteCacheClient {
           verifyDownloads,
           extraHttpHeaders,
           digestUtil,
+          retrier,
           creds,
           authAndTlsOptions,
           domainSocketAddress);
@@ -202,6 +249,7 @@ public final class HttpCacheClient implements RemoteCacheClient {
           verifyDownloads,
           extraHttpHeaders,
           digestUtil,
+          retrier,
           creds,
           authAndTlsOptions,
           domainSocketAddress);
@@ -219,6 +267,7 @@ public final class HttpCacheClient implements RemoteCacheClient {
       boolean verifyDownloads,
       ImmutableList<Entry<String, String>> extraHttpHeaders,
       DigestUtil digestUtil,
+      RemoteRetrier retrier,
       @Nullable final Credentials creds,
       AuthAndTLSOptions authAndTlsOptions,
       @Nullable SocketAddress socketAddress)
@@ -265,11 +314,7 @@ public final class HttpCacheClient implements RemoteCacheClient {
             ChannelPipeline p = ch.pipeline();
             if (sslCtx != null) {
               SSLEngine engine = sslCtx.newEngine(ch.alloc(), hostname, port);
-              engine.setUseClientMode(true);
-              if (authAndTlsOptions.tlsClientCertificate != null
-                  && authAndTlsOptions.tlsClientKey != null) {
-                engine.setNeedClientAuth(true);
-              }
+              configureSslEngine(engine, authAndTlsOptions);
               p.addFirst("ssl-handler", new SslHandler(engine));
             }
           }
@@ -284,6 +329,7 @@ public final class HttpCacheClient implements RemoteCacheClient {
     this.extraHttpHeaders = extraHttpHeaders;
     this.verifyDownloads = verifyDownloads;
     this.digestUtil = digestUtil;
+    this.retrier = retrier;
   }
 
   @SuppressWarnings("FutureReturnValueIgnored")
@@ -294,7 +340,7 @@ public final class HttpCacheClient implements RemoteCacheClient {
         .addListener(
             (Future<Channel> channelAcquired) -> {
               if (!channelAcquired.isSuccess()) {
-                channelReady.setFailure(channelAcquired.cause());
+                channelReady.tryFailure(channelAcquired.cause());
                 return;
               }
 
@@ -303,7 +349,7 @@ public final class HttpCacheClient implements RemoteCacheClient {
                 ChannelPipeline pipeline = channel.pipeline();
 
                 if (!isChannelPipelineEmpty(pipeline)) {
-                  channelReady.setFailure(
+                  channelReady.tryFailure(
                       new IllegalStateException("Channel pipeline is not empty."));
                   return;
                 }
@@ -330,12 +376,12 @@ public final class HttpCacheClient implements RemoteCacheClient {
                   // delivered to the last non-pending handler, which will most likely end up
                   // throwing UnsupportedMessageTypeException. Therefore, we only complete the
                   // promise in the event loop.
-                  channel.eventLoop().execute(() -> channelReady.setSuccess(channel));
+                  channel.eventLoop().execute(() -> handOverDownloadChannel(channelReady, channel));
                 } else {
-                  channelReady.setSuccess(channel);
+                  handOverDownloadChannel(channelReady, channel);
                 }
               } catch (Throwable t) {
-                channelReady.setFailure(t);
+                channelReady.tryFailure(t);
               }
             });
     return channelReady;
@@ -369,7 +415,7 @@ public final class HttpCacheClient implements RemoteCacheClient {
         .addListener(
             (Future<Channel> channelAcquired) -> {
               if (!channelAcquired.isSuccess()) {
-                channelReady.setFailure(channelAcquired.cause());
+                channelReady.tryFailure(channelAcquired.cause());
                 return;
               }
 
@@ -378,7 +424,7 @@ public final class HttpCacheClient implements RemoteCacheClient {
                 ChannelPipeline pipeline = channel.pipeline();
 
                 if (!isChannelPipelineEmpty(pipeline)) {
-                  channelReady.setFailure(
+                  channelReady.tryFailure(
                       new IllegalStateException("Channel pipeline is not empty."));
                   return;
                 }
@@ -397,16 +443,25 @@ public final class HttpCacheClient implements RemoteCacheClient {
                   // delivered to the last non-pending handler, which will most likely end up
                   // throwing UnsupportedMessageTypeException. Therefore, we only complete the
                   // promise in the event loop.
-                  channel.eventLoop().execute(() -> channelReady.setSuccess(channel));
+                  channel.eventLoop().execute(() -> handOverDownloadChannel(channelReady, channel));
                 } else {
-                  channelReady.setSuccess(channel);
+                  handOverDownloadChannel(channelReady, channel);
                 }
               } catch (Throwable t) {
-                channelReady.setFailure(t);
+                channelReady.tryFailure(t);
               }
             });
 
     return channelReady;
+  }
+
+  /**
+   * Completes the promise with the channel, or releases the channel if the promise was cancelled.
+   */
+  private void handOverDownloadChannel(Promise<Channel> channelReady, Channel channel) {
+    if (!channelReady.trySuccess(channel)) {
+      releaseDownloadChannel(channel);
+    }
   }
 
   @SuppressWarnings("FutureReturnValueIgnored")
@@ -429,11 +484,14 @@ public final class HttpCacheClient implements RemoteCacheClient {
     channelPool.release(ch);
   }
 
-  private boolean isChannelPipelineEmpty(ChannelPipeline pipeline) {
-    return (pipeline.first() == null)
-        || (useTls
-            && "ssl-handler".equals(pipeline.firstContext().name())
-            && pipeline.first() == pipeline.last());
+  boolean isChannelPipelineEmpty(ChannelPipeline pipeline) {
+    ChannelHandlerContext firstContext = pipeline.firstContext();
+    if (firstContext == null) {
+      return true;
+    }
+    return useTls
+        && firstContext.name().equals("ssl-handler")
+        && Objects.equals(pipeline.first(), pipeline.last());
   }
 
   @Override
@@ -441,8 +499,11 @@ public final class HttpCacheClient implements RemoteCacheClient {
       RemoteActionExecutionContext context, Digest digest, OutputStream out) {
     final DigestOutputStream digestOut =
         verifyDownloads ? digestUtil.newDigestOutputStream(out) : null;
+    final AtomicLong casBytesDownloaded = new AtomicLong();
     return Futures.transformAsync(
-        get(digest, digestOut != null ? digestOut : out, /* casDownload= */ true),
+        retrier.executeAsync(
+            () ->
+                get(digest, digestOut != null ? digestOut : out, Optional.of(casBytesDownloaded))),
         (v) -> {
           try {
             if (digestOut != null) {
@@ -458,7 +519,8 @@ public final class HttpCacheClient implements RemoteCacheClient {
   }
 
   @SuppressWarnings("FutureReturnValueIgnored")
-  private ListenableFuture<Void> get(Digest digest, final OutputStream out, boolean casDownload) {
+  private ListenableFuture<Void> get(
+      Digest digest, final OutputStream out, Optional<AtomicLong> casBytesDownloaded) {
     final AtomicBoolean dataWritten = new AtomicBoolean();
     OutputStream wrappedOut =
         new OutputStream() {
@@ -469,12 +531,18 @@ public final class HttpCacheClient implements RemoteCacheClient {
           @Override
           public void write(byte[] b, int offset, int length) throws IOException {
             dataWritten.set(true);
+            if (casBytesDownloaded.isPresent()) {
+              casBytesDownloaded.get().addAndGet(length);
+            }
             out.write(b, offset, length);
           }
 
           @Override
           public void write(int b) throws IOException {
             dataWritten.set(true);
+            if (casBytesDownloaded.isPresent()) {
+              casBytesDownloaded.get().incrementAndGet();
+            }
             out.write(b);
           }
 
@@ -483,56 +551,73 @@ public final class HttpCacheClient implements RemoteCacheClient {
             out.flush();
           }
         };
-    DownloadCommand downloadCmd = new DownloadCommand(uri, casDownload, digest, wrappedOut);
+    long offset = 0;
+    if (casBytesDownloaded.isPresent()) {
+      offset = casBytesDownloaded.get().get();
+    }
+    DownloadCommand downloadCmd =
+        new DownloadCommand(uri, casBytesDownloaded.isPresent(), digest, wrappedOut, offset);
     SettableFuture<Void> outerF = SettableFuture.create();
-    acquireDownloadChannel()
-        .addListener(
-            (Future<Channel> channelPromise) -> {
-              if (!channelPromise.isSuccess()) {
-                outerF.setException(channelPromise.cause());
-                return;
-              }
-
-              Channel ch = channelPromise.getNow();
-              ch.writeAndFlush(downloadCmd)
-                  .addListener(
-                      (f) -> {
-                        try {
-                          if (f.isSuccess()) {
-                            outerF.set(null);
-                          } else {
-                            Throwable cause = f.cause();
-                            // cause can be of type HttpException, because Netty uses
-                            // Unsafe.throwException to
-                            // re-throw a checked exception that hasn't been declared in the method
-                            // signature.
-                            if (cause instanceof HttpException) {
-                              HttpResponse response = ((HttpException) cause).response();
-                              if (!dataWritten.get() && authTokenExpired(response)) {
-                                // The error is due to an auth token having expired. Let's try
-                                // again.
-                                try {
-                                  refreshCredentials();
-                                  getAfterCredentialRefresh(downloadCmd, outerF);
-                                  return;
-                                } catch (IOException e) {
-                                  cause.addSuppressed(e);
-                                } catch (RuntimeException e) {
-                                  logger.atWarning().withCause(e).log("Unexpected exception");
-                                  cause.addSuppressed(e);
-                                }
-                              } else if (cacheMiss(response.status())) {
-                                outerF.setException(new CacheNotFoundException(digest));
-                                return;
-                              }
+    Future<Channel> channelPromise = acquireDownloadChannel();
+    // A caller that gives up while waiting for a connection must not occupy it with a request
+    // whose response is discarded.
+    outerF.addListener(
+        () -> {
+          if (outerF.isCancelled()) {
+            channelPromise.cancel(/* mayInterruptIfRunning= */ false);
+          }
+        },
+        MoreExecutors.directExecutor());
+    channelPromise.addListener(
+        (Future<Channel> acquired) -> {
+          if (!acquired.isSuccess()) {
+            outerF.setException(acquired.cause());
+            return;
+          }
+          Channel ch = acquired.getNow();
+          if (outerF.isCancelled()) {
+            releaseDownloadChannel(ch);
+            return;
+          }
+          ch.writeAndFlush(downloadCmd)
+              .addListener(
+                  (f) -> {
+                    try {
+                      if (f.isSuccess()) {
+                        outerF.set(null);
+                      } else {
+                        Throwable cause = f.cause();
+                        // cause can be of type HttpException, because Netty uses
+                        // Unsafe.throwException to
+                        // re-throw a checked exception that hasn't been declared in the method
+                        // signature.
+                        if (cause instanceof HttpException httpException) {
+                          HttpResponse response = httpException.response();
+                          if (!dataWritten.get() && authTokenExpired(response)) {
+                            // The error is due to an auth token having expired. Let's try
+                            // again.
+                            try {
+                              refreshCredentials();
+                              getAfterCredentialRefresh(downloadCmd, outerF);
+                              return;
+                            } catch (IOException e) {
+                              cause.addSuppressed(e);
+                            } catch (RuntimeException e) {
+                              logger.atWarning().withCause(e).log("Unexpected exception");
+                              cause.addSuppressed(e);
                             }
-                            outerF.setException(cause);
+                          } else if (cacheMiss(response.status())) {
+                            outerF.setException(new CacheNotFoundException(digest));
+                            return;
                           }
-                        } finally {
-                          releaseDownloadChannel(ch);
                         }
-                      });
-            });
+                        outerF.setException(cause);
+                      }
+                    } finally {
+                      releaseDownloadChannel(ch);
+                    }
+                  });
+        });
     return outerF;
   }
 
@@ -555,8 +640,8 @@ public final class HttpCacheClient implements RemoteCacheClient {
                             outerF.set(null);
                           } else {
                             Throwable cause = f.cause();
-                            if (cause instanceof HttpException) {
-                              HttpResponse response = ((HttpException) cause).response();
+                            if (cause instanceof HttpException httpException) {
+                              HttpResponse response = httpException.response();
                               if (cacheMiss(response.status())) {
                                 outerF.setException(new CacheNotFoundException(cmd.digest()));
                                 return;
@@ -572,13 +657,37 @@ public final class HttpCacheClient implements RemoteCacheClient {
   }
 
   @Override
-  public ListenableFuture<CachedActionResult> downloadActionResult(
-      RemoteActionExecutionContext context, ActionKey actionKey, boolean inlineOutErr) {
-    return Futures.transform(
-        Utils.downloadAsActionResult(
-            actionKey, (digest, out) -> get(digest, out, /* casDownload= */ false)),
-        CachedActionResult::remote,
-        MoreExecutors.directExecutor());
+  public ServerCapabilities getServerCapabilities() {
+    var cacheCapabilities =
+        CacheCapabilities.newBuilder()
+            .setActionCacheUpdateCapabilities(
+                ActionCacheUpdateCapabilities.newBuilder().setUpdateEnabled(true).build())
+            .setSymlinkAbsolutePathStrategy(SymlinkAbsolutePathStrategy.Value.ALLOWED)
+            .build();
+    return ServerCapabilities.newBuilder().setCacheCapabilities(cacheCapabilities).build();
+  }
+
+  @Override
+  public ListenableFuture<ServerCapabilities> serverCapabilities() {
+    return Futures.immediateFuture(getServerCapabilities());
+  }
+
+  @Override
+  public ListenableFuture<String> getAuthority() {
+    return Futures.immediateFuture("");
+  }
+
+  @Override
+  public ListenableFuture<ActionResult> downloadActionResult(
+      RemoteActionExecutionContext context,
+      ActionKey actionKey,
+      boolean inlineOutErr,
+      Set<String> inlineOutputFiles) {
+    return retrier.executeAsync(
+        () ->
+            Utils.downloadAsActionResult(
+                actionKey,
+                (digest, out) -> get(digest, out, /* casBytesDownloaded= */ Optional.empty())));
   }
 
   @SuppressWarnings("FutureReturnValueIgnored")
@@ -590,7 +699,7 @@ public final class HttpCacheClient implements RemoteCacheClient {
           public void close() {
             // Ensure that the InputStream can't be closed somewhere in the Netty
             // pipeline, so that we can support retries. The InputStream is closed in
-            // the finally block below.
+            // the listener block below.
           }
         };
     UploadCommand upload = new UploadCommand(uri, casUpload, key, wrappedIn, length);
@@ -612,8 +721,8 @@ public final class HttpCacheClient implements RemoteCacheClient {
                           result.set(null);
                         } else {
                           Throwable cause = f.cause();
-                          if (cause instanceof HttpException) {
-                            HttpResponse response = ((HttpException) cause).response();
+                          if (cause instanceof HttpException httpException) {
+                            HttpResponse response = httpException.response();
                             try {
                               // If the error is due to an expired auth token and we can reset
                               // the input stream, then try again.
@@ -668,22 +777,12 @@ public final class HttpCacheClient implements RemoteCacheClient {
   }
 
   @Override
-  public ListenableFuture<Void> uploadFile(
-      RemoteActionExecutionContext context, Digest digest, Path file) {
-    try {
-      return uploadAsync(
-          digest.getHash(), digest.getSizeBytes(), file.getInputStream(), /* casUpload= */ true);
-    } catch (IOException e) {
-      // Can be thrown from file.getInputStream.
-      return Futures.immediateFailedFuture(e);
-    }
-  }
-
-  @Override
-  public ListenableFuture<Void> uploadBlob(
-      RemoteActionExecutionContext context, Digest digest, ByteString data) {
-    return uploadAsync(
-        digest.getHash(), digest.getSizeBytes(), data.newInput(), /* casUpload= */ true);
+  public ListenableFuture<Void> uploadBlobImpl(
+      RemoteActionExecutionContext context, Digest digest, Blob blob) {
+    return retrier.executeAsync(
+        () ->
+            uploadAsync(
+                digest.getHash(), digest.getSizeBytes(), blob.get(), /* casUpload= */ true));
   }
 
   @Override
@@ -697,9 +796,9 @@ public final class HttpCacheClient implements RemoteCacheClient {
       in.reset();
       return true;
     }
-    if (in instanceof FileInputStream) {
+    if (in instanceof FileInputStream fileInputStream) {
       // FileInputStream does not support reset().
-      ((FileInputStream) in).getChannel().position(0);
+      fileInputStream.getChannel().position(0);
       return true;
     }
     return false;
@@ -709,11 +808,13 @@ public final class HttpCacheClient implements RemoteCacheClient {
   public ListenableFuture<Void> uploadActionResult(
       RemoteActionExecutionContext context, ActionKey actionKey, ActionResult actionResult) {
     ByteString serialized = actionResult.toByteString();
-    return uploadAsync(
-        actionKey.getDigest().getHash(),
-        serialized.size(),
-        serialized.newInput(),
-        /* casUpload= */ false);
+    return retrier.executeAsync(
+        () ->
+            uploadAsync(
+                actionKey.digest().getHash(),
+                serialized.size(),
+                serialized.newInput(),
+                /* casUpload= */ false));
   }
 
   /**
@@ -729,8 +830,22 @@ public final class HttpCacheClient implements RemoteCacheClient {
       }
 
       isClosed = true;
-      channelPool.close();
-      eventLoop.shutdownGracefully();
+
+      // Clear interrupted status to prevent failure to close, indicated with #14787
+      boolean wasInterrupted = Thread.interrupted();
+      try {
+        channelPool.closeAsync().await(5, TimeUnit.SECONDS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      } finally {
+        try {
+          eventLoop.shutdownGracefully(0, 5, TimeUnit.SECONDS);
+        } finally {
+          if (wasInterrupted) {
+            Thread.currentThread().interrupt();
+          }
+        }
+      }
     }
   }
 
@@ -772,25 +887,36 @@ public final class HttpCacheClient implements RemoteCacheClient {
 
   private static SslContext createSSLContext(AuthAndTLSOptions authAndTlsOptions)
       throws IOException {
-    // OpenSsl gives us a > 2x speed improvement on fast networks, but requires netty tcnative
-    // to be there which is not available on all platforms and environments.
-    SslProvider sslProvider = OpenSsl.isAvailable() ? SslProvider.OPENSSL : SslProvider.JDK;
-    SslContextBuilder sslContextBuilder = SslContextBuilder.forClient().sslProvider(sslProvider);
+    SslContextBuilder sslContextBuilder =
+        SslContextBuilder.forClient().sslProvider(SslProvider.JDK);
 
     // Root CA certificate
-    if (authAndTlsOptions.tlsCertificate != null) {
+    if (authAndTlsOptions.getTlsCertificate() != null) {
       sslContextBuilder =
-          sslContextBuilder.trustManager(new File(authAndTlsOptions.tlsCertificate));
+          sslContextBuilder.trustManager(new File(authAndTlsOptions.getTlsCertificate()));
     }
 
     // Optional client TLS authentication
-    if (authAndTlsOptions.tlsClientCertificate != null && authAndTlsOptions.tlsClientKey != null) {
+    if (authAndTlsOptions.getTlsClientCertificate() != null
+        && authAndTlsOptions.getTlsClientKey() != null) {
       sslContextBuilder =
           sslContextBuilder.keyManager(
-              new File(authAndTlsOptions.tlsClientCertificate),
-              new File(authAndTlsOptions.tlsClientKey));
+              new File(authAndTlsOptions.getTlsClientCertificate()),
+              new File(authAndTlsOptions.getTlsClientKey()));
     }
 
     return sslContextBuilder.build();
+  }
+
+  static void configureSslEngine(SSLEngine engine, AuthAndTLSOptions authAndTlsOptions) {
+    engine.setUseClientMode(true);
+    SSLParameters params = engine.getSSLParameters();
+    params.setEndpointIdentificationAlgorithm("HTTPS");
+    engine.setSSLParameters(params);
+    if (authAndTlsOptions != null
+        && authAndTlsOptions.getTlsClientCertificate() != null
+        && authAndTlsOptions.getTlsClientKey() != null) {
+      engine.setNeedClientAuth(true);
+    }
   }
 }

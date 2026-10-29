@@ -17,34 +17,35 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
 import com.google.devtools.build.lib.actions.Action;
 import com.google.devtools.build.lib.actions.ActionAnalysisMetadata;
+import com.google.devtools.build.lib.actions.ActionConflictException;
 import com.google.devtools.build.lib.actions.ActionExecutionException;
 import com.google.devtools.build.lib.actions.ActionGraph;
 import com.google.devtools.build.lib.actions.ActionKeyContext;
 import com.google.devtools.build.lib.actions.ActionLookupValue;
 import com.google.devtools.build.lib.actions.ActionTemplate;
 import com.google.devtools.build.lib.actions.Actions;
-import com.google.devtools.build.lib.actions.Actions.GeneratingActions;
 import com.google.devtools.build.lib.actions.AlreadyReportedActionExecutionException;
 import com.google.devtools.build.lib.actions.Artifact;
+import com.google.devtools.build.lib.actions.Artifact.TreeArtifact;
 import com.google.devtools.build.lib.actions.Artifact.TreeFileArtifact;
-import com.google.devtools.build.lib.actions.ArtifactPrefixConflictException;
-import com.google.devtools.build.lib.actions.MutableActionGraph.ActionConflictException;
 import com.google.devtools.build.lib.bugreport.BugReport;
-import com.google.devtools.build.lib.bugreport.BugReporter;
+import com.google.devtools.build.lib.collect.nestedset.ArtifactNestedSetKey;
+import com.google.devtools.build.lib.collect.nestedset.NestedSet;
 import com.google.devtools.build.lib.events.Event;
+import com.google.devtools.build.lib.events.EventHandler;
 import com.google.devtools.build.lib.skyframe.ActionTemplateExpansionValue.ActionTemplateExpansionKey;
 import com.google.devtools.build.skyframe.SkyFunction;
 import com.google.devtools.build.skyframe.SkyFunctionException;
 import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.SkyValue;
+import com.google.devtools.build.skyframe.SkyframeLookupResult;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import javax.annotation.Nullable;
 
 /**
@@ -56,18 +57,13 @@ import javax.annotation.Nullable;
  */
 public class ActionTemplateExpansionFunction implements SkyFunction {
   private final ActionKeyContext actionKeyContext;
-  private final BugReporter bugReporter;
-
-  ActionTemplateExpansionFunction(ActionKeyContext actionKeyContext) {
-    this(actionKeyContext, BugReporter.defaultInstance());
-  }
 
   @VisibleForTesting
-  ActionTemplateExpansionFunction(ActionKeyContext actionKeyContext, BugReporter bugReporter) {
+  ActionTemplateExpansionFunction(ActionKeyContext actionKeyContext) {
     this.actionKeyContext = actionKeyContext;
-    this.bugReporter = bugReporter;
   }
 
+  @Nullable
   @Override
   public SkyValue compute(SkyKey skyKey, Environment env)
       throws ActionTemplateExpansionFunctionException, InterruptedException {
@@ -82,20 +78,46 @@ public class ActionTemplateExpansionFunction implements SkyFunction {
     }
     ActionTemplate<?> actionTemplate = value.getActionTemplate(key.getActionIndex());
 
-    TreeArtifactValue treeArtifactValue =
-        (TreeArtifactValue) env.getValue(actionTemplate.getInputTreeArtifact());
+    ImmutableList.Builder<SkyKey> inputKeys =
+        ImmutableList.<SkyKey>builder().addAll(actionTemplate.getInputTreeArtifacts());
+
+    // Following b/143205147, we unwrap the top layer of the NestedSet and evaluate the first layer
+    // of the NestedSet as direct Artifact(s) and transitive NestedSet(s).
+    if (!actionTemplate.getInputs().isEmpty()) {
+      for (Artifact leaf : actionTemplate.getInputs().getLeaves()) {
+        inputKeys.add(Artifact.key(leaf));
+      }
+      for (NestedSet<Artifact> nonLeaf : actionTemplate.getInputs().getNonLeaves()) {
+        inputKeys.add(ArtifactNestedSetKey.create(nonLeaf));
+      }
+    }
+
+    SkyframeLookupResult result = env.getValuesAndExceptions(inputKeys.build());
 
     // Input TreeArtifact is not ready yet.
     if (env.valuesMissing()) {
       return null;
     }
-    ImmutableSet<TreeFileArtifact> inputTreeFileArtifacts = treeArtifactValue.getChildren();
-    ImmutableList<? extends Action> actions;
+    ImmutableList<ActionAnalysisMetadata> actions;
     try {
+      ImmutableList.Builder<TreeFileArtifact> inputTreeFileArtifacts = ImmutableList.builder();
+      for (TreeArtifact inputTreeArtifact : actionTemplate.getInputTreeArtifacts()) {
+        TreeArtifactValue treeArtifactValue =
+            (TreeArtifactValue)
+                result.getOrThrow(inputTreeArtifact, ActionExecutionException.class);
+        // b/507424770#comment10: To handle the case of a wrongly bubbled up exception causing a
+        // null value, we return null here so that we don't crash with an NPE.
+        if (treeArtifactValue == null) {
+          return null;
+        }
+        inputTreeFileArtifacts.addAll(treeArtifactValue.getChildren());
+      }
       // Expand the action template using the list of expanded input TreeFileArtifacts.
       // TODO(rduan): Add a check to verify the inputs of expanded actions are subsets of inputs
       // of the ActionTemplate.
-      actions = generateAndValidateActionsFromTemplate(actionTemplate, inputTreeFileArtifacts, key);
+      actions =
+          generateAndValidateActionsFromTemplate(
+              actionTemplate, inputTreeFileArtifacts.build(), key, env.getListener());
     } catch (ActionExecutionException e) {
       env.getListener()
           .handle(
@@ -104,23 +126,17 @@ public class ActionTemplateExpansionFunction implements SkyFunction {
                   actionTemplate.describe() + " failed: " + e.getMessage()));
       throw new ActionTemplateExpansionFunctionException(
           new AlreadyReportedActionExecutionException(e));
-    }
-    GeneratingActions generatingActions;
-    try {
-      generatingActions = checkActionAndArtifactConflicts(actions, key);
-      // It is currently not possible for Starlark actions to create action template actions, so
-      // no exceptions here are expected. However, they may be possible in the future.
     } catch (ActionConflictException e) {
-      bugReporter.sendBugReport(
-          new IllegalStateException("Unexpected action conflict for " + skyKey, e));
       e.reportTo(env.getListener());
       throw new ActionTemplateExpansionFunctionException(e);
-    } catch (ArtifactPrefixConflictException e) {
-      bugReporter.sendBugReport(
-          new IllegalStateException("Unexpected artifact prefix conflict for " + skyKey, e));
-      env.getListener().handle(Event.error(e.getMessage()));
+    }
+    try {
+      checkActionAndArtifactConflicts(actions, key);
+    } catch (ActionConflictException e) {
+      e.reportTo(env.getListener());
       throw new ActionTemplateExpansionFunctionException(e);
-    } catch (Actions.ArtifactGeneratedByOtherRuleException e) {
+    } catch (Actions.ArtifactGeneratedByOtherRuleException
+        | Actions.SourceArtifactUsedAsOutputException e) {
       throw new IllegalStateException(
           "Actions generated by template "
               + actionTemplate.describe()
@@ -131,7 +147,7 @@ public class ActionTemplateExpansionFunction implements SkyFunction {
           e);
     }
 
-    return new ActionTemplateExpansionValue(generatingActions);
+    return new ActionTemplateExpansionValue(actions);
   }
 
   /** Exception thrown by {@link ActionTemplateExpansionFunction}. */
@@ -140,21 +156,18 @@ public class ActionTemplateExpansionFunction implements SkyFunction {
       super(e, Transience.PERSISTENT);
     }
 
-    ActionTemplateExpansionFunctionException(ArtifactPrefixConflictException e) {
-      super(e, Transience.PERSISTENT);
-    }
-
     ActionTemplateExpansionFunctionException(ActionExecutionException e) {
       super(e, Transience.PERSISTENT);
     }
   }
 
-  private static ImmutableList<? extends Action> generateAndValidateActionsFromTemplate(
+  private static ImmutableList<ActionAnalysisMetadata> generateAndValidateActionsFromTemplate(
       ActionTemplate<?> actionTemplate,
-      ImmutableSet<TreeFileArtifact> inputTreeFileArtifacts,
-      ActionTemplateExpansionKey key)
-      throws ActionExecutionException {
-    Set<Artifact> outputs = actionTemplate.getOutputs();
+      ImmutableList<TreeFileArtifact> inputTreeFileArtifacts,
+      ActionTemplateExpansionKey key,
+      EventHandler eventHandler)
+      throws ActionConflictException, ActionExecutionException, InterruptedException {
+    Collection<Artifact> outputs = actionTemplate.getOutputs();
     for (Artifact output : outputs) {
       Preconditions.checkState(
           output.isTreeArtifact(),
@@ -163,7 +176,7 @@ public class ActionTemplateExpansionFunction implements SkyFunction {
           output);
     }
     ImmutableList<? extends Action> actions =
-        actionTemplate.generateActionsForInputArtifacts(inputTreeFileArtifacts, key);
+        actionTemplate.generateActionsForInputArtifacts(inputTreeFileArtifacts, key, eventHandler);
     for (Action action : actions) {
       for (Artifact output : action.getOutputs()) {
         Preconditions.checkState(
@@ -179,8 +192,12 @@ public class ActionTemplateExpansionFunction implements SkyFunction {
             actionTemplate,
             output,
             action);
+        Artifact outputTree =
+            output.getParent().isSubTreeArtifact()
+                ? output.getParent().getParent()
+                : output.getParent();
         Preconditions.checkState(
-            outputs.contains(output.getParent()),
+            outputs.contains(outputTree),
             "%s generated an action with an output %s under an undeclared tree not in %s (%s)",
             actionTemplate,
             output,
@@ -188,23 +205,22 @@ public class ActionTemplateExpansionFunction implements SkyFunction {
             action);
       }
     }
-    return actions;
+    return ImmutableList.copyOf(actions); // Just a cast, no copy performed.
   }
 
-  private GeneratingActions checkActionAndArtifactConflicts(
-      ImmutableList<? extends Action> actions, ActionTemplateExpansionKey key)
-      throws ActionConflictException, ArtifactPrefixConflictException, InterruptedException,
-          Actions.ArtifactGeneratedByOtherRuleException {
-    GeneratingActions generatingActions =
-        Actions.assignOwnersAndFindAndThrowActionConflict(
-            actionKeyContext, ImmutableList.copyOf(actions), key);
-    Map<ActionAnalysisMetadata, ArtifactPrefixConflictException> artifactPrefixConflictMap =
-        findArtifactPrefixConflicts(getMapForConsistencyCheck(generatingActions.getActions()));
+  private void checkActionAndArtifactConflicts(
+      ImmutableList<ActionAnalysisMetadata> actions, ActionTemplateExpansionKey key)
+      throws ActionConflictException,
+          InterruptedException,
+          Actions.ArtifactGeneratedByOtherRuleException,
+          Actions.SourceArtifactUsedAsOutputException {
+    Actions.assignOwnersAndThrowIfConflict(actionKeyContext, actions, key);
+    Map<ActionAnalysisMetadata, ActionConflictException> artifactPrefixConflictMap =
+        findArtifactPrefixConflicts(getMapForConsistencyCheck(actions));
 
     if (!artifactPrefixConflictMap.isEmpty()) {
       throw artifactPrefixConflictMap.values().iterator().next();
     }
-    return generatingActions;
   }
 
   private static ImmutableMap<Artifact, ActionAnalysisMetadata> getMapForConsistencyCheck(
@@ -230,14 +246,12 @@ public class ActionTemplateExpansionFunction implements SkyFunction {
    * @param generatingActions a map between generated artifacts and their associated generating
    *     actions.
    * @return a map between actions that generated the conflicting artifacts and their associated
-   *     {@link ArtifactPrefixConflictException}.
+   *     {@link ActionConflictException}.
    */
-  private static Map<ActionAnalysisMetadata, ArtifactPrefixConflictException>
-      findArtifactPrefixConflicts(Map<Artifact, ActionAnalysisMetadata> generatingActions) {
+  private static Map<ActionAnalysisMetadata, ActionConflictException> findArtifactPrefixConflicts(
+      Map<Artifact, ActionAnalysisMetadata> generatingActions) {
     return Actions.findArtifactPrefixConflicts(
-        new MapBasedImmutableActionGraph(generatingActions),
-        generatingActions.keySet(),
-        /*strictConflictChecks=*/ true);
+        new MapBasedImmutableActionGraph(generatingActions), generatingActions.keySet());
   }
 
   private static class MapBasedImmutableActionGraph implements ActionGraph {

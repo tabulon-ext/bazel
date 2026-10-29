@@ -14,63 +14,92 @@
 
 package com.google.devtools.build.lib.blackbox.bazel;
 
-import com.google.common.collect.ImmutableList;
 import com.google.devtools.build.lib.blackbox.framework.BlackBoxTestContext;
 import com.google.devtools.build.lib.blackbox.framework.ToolsSetup;
+import com.google.devtools.build.lib.util.OS;
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 /** Setup for Bazel default tools */
 public class DefaultToolsSetup implements ToolsSetup {
-
-  private static ImmutableList<String> repos =
-      ImmutableList.<String>builder().add("rules_cc").add("rules_proto").add("rules_java").build();
-
-  private ImmutableList<String> getRepositoryOverrides() {
-    String sharedRepoHome = System.getenv("TEST_REPOSITORY_HOME");
-    if (sharedRepoHome == null) {
-      return ImmutableList.of();
-    }
-
-    Path sharedRepoHomePath = Paths.get(sharedRepoHome);
-    if (!Files.exists(sharedRepoHomePath)) {
-      return ImmutableList.of();
-    }
-
-    ImmutableList.Builder<String> lines = ImmutableList.builder();
-    for (String repo : repos) {
-      Path sharedRepoPath = sharedRepoHomePath.resolve(repo);
-      lines.add(
-          "common --override_repository="
-              + repo
-              + "="
-              + sharedRepoPath.toString().replace('\\', '/'));
-    }
-
-    return lines.build();
-  }
 
   @Override
   public void setup(BlackBoxTestContext context) throws IOException {
     Path outputRoot = Files.createTempDirectory(context.getTmpDir(), "root").toAbsolutePath();
     ArrayList<String> lines = new ArrayList<>();
     lines.add("startup --output_user_root=" + outputRoot.toString().replace('\\', '/'));
-    lines.addAll(getRepositoryOverrides());
 
     String sharedInstallBase = System.getenv("TEST_INSTALL_BASE");
     if (sharedInstallBase != null) {
-      lines.add("startup --install_base=" + sharedInstallBase);
+      lines.add("startup --install_base=" + installBaseForBazelBinary(sharedInstallBase));
     }
 
     String sharedRepoCache = System.getenv("REPOSITORY_CACHE");
     if (sharedRepoCache != null) {
       lines.add("common --repository_cache=" + sharedRepoCache);
-      lines.add("common --experimental_repository_cache_hardlinks");
+      // TODO: Remove this flag once all dependencies are mirrored.
+      // See https://github.com/bazelbuild/bazel/pull/19549 for more context.
+      lines.add("common --repo_env=BAZEL_HTTP_RULES_URLS_AS_DEFAULT_CANONICAL_ID=0");
+      if (OS.getCurrent() == OS.DARWIN) {
+        // For reducing SSD usage on our physical Mac machines.
+        lines.add("common --experimental_repository_cache_hardlinks");
+      }
+    }
+    // The repo contents cache defaults to a directory under the repository cache, which is shared
+    // with other tests and test attempts on CI. Tests that exercise the repo contents cache opt in
+    // explicitly.
+    lines.add("common --repo_contents_cache=");
+
+    if (OS.getCurrent() == OS.DARWIN && hasIpv6DefaultRouteOnDarwin()) {
+      // Prefer IPv6 network on macOS only when an IPv6 default route exists.
+      lines.add("startup --host_jvm_args=-Djava.net.preferIPv6Addresses=true");
+      lines.add("build --jvmopt=-Djava.net.preferIPv6Addresses");
     }
 
     context.write(".bazelrc", lines);
+  }
+
+  private static String installBaseForBazelBinary(String sharedInstallBase) throws IOException {
+    try (ZipFile bazel = new ZipFile(RunfilesUtil.find("io_bazel/src/bazel").toFile())) {
+      ZipEntry entry = bazel.getEntry("install_base_key");
+      if (entry == null) {
+        throw new IOException("Could not find install_base_key in the Bazel binary");
+      }
+      try (InputStream keyStream = bazel.getInputStream(entry)) {
+        String key = new String(keyStream.readAllBytes(), StandardCharsets.US_ASCII);
+        return sharedInstallBase + "-" + key.trim();
+      }
+    }
+  }
+
+  private static boolean hasIpv6DefaultRouteOnDarwin() {
+    if (OS.getCurrent() != OS.DARWIN) {
+      return false;
+    }
+    try {
+      Process p =
+          new ProcessBuilder("netstat", "-rn", "-f", "inet6").redirectErrorStream(true).start();
+      try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+        String line;
+        while ((line = r.readLine()) != null) {
+          if (line.trim().startsWith("default")) {
+            p.destroy();
+            return true;
+          }
+        }
+      }
+      p.waitFor();
+    } catch (Exception e) {
+      // netstat not found or failed; assume no IPv6 default route.
+    }
+    return false;
   }
 }

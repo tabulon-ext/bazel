@@ -21,6 +21,7 @@ exports_files(glob(["*.bzl"]))
 filegroup(
     name = "srcs",
     srcs = glob(["**"]) + [
+        "//tools/cpp/modules_tools:srcs",
         "//tools/cpp/runfiles:srcs",
     ],
 )
@@ -28,6 +29,7 @@ filegroup(
 filegroup(
     name = "embedded_tools",
     srcs = glob(["**"]) + [
+        "//tools/cpp/modules_tools:embedded_tools",
         "//tools/cpp/runfiles:embedded_tools",
     ],
 )
@@ -36,4 +38,9 @@ filegroup(
     name = "bzl_srcs",
     srcs = glob(["*.bzl"]),
     visibility = ["//tools:__pkg__"],
+)
+
+alias(
+    name = "cc_toolchain_config_lib",
+    actual = "@rules_cc//cc:srcs",
 )

@@ -15,17 +15,13 @@ package com.google.devtools.build.lib.skyframe;
 
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.devtools.build.lib.events.ExtendedEventHandler;
-import com.google.devtools.build.lib.util.GroupedList;
+import com.google.devtools.build.skyframe.GroupedDeps;
 import com.google.devtools.build.skyframe.SkyFunction;
 import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.SkyValue;
-import com.google.devtools.build.skyframe.SkyframeIterableResult;
-import com.google.devtools.build.skyframe.ValueOrException;
-import com.google.devtools.build.skyframe.ValueOrException2;
-import com.google.devtools.build.skyframe.ValueOrException3;
+import com.google.devtools.build.skyframe.SkyframeLookupResult;
 import com.google.devtools.build.skyframe.Version;
-import java.util.List;
-import java.util.Map;
+import java.util.Set;
 import java.util.function.Supplier;
 import javax.annotation.Nullable;
 
@@ -115,119 +111,16 @@ final class StateInformingSkyFunctionEnvironment implements SkyFunction.Environm
   }
 
   @Override
-  public Map<SkyKey, SkyValue> getValues(Iterable<? extends SkyKey> depKeys)
-      throws InterruptedException {
-    preFetch.inform();
-    try {
-      return delegate.getValues(depKeys);
-    } finally {
-      postFetch.inform();
-    }
-  }
-
-  @Override
-  public <E extends Exception> Map<SkyKey, ValueOrException<E>> getValuesOrThrow(
-      Iterable<? extends SkyKey> depKeys, Class<E> exceptionClass) throws InterruptedException {
-    preFetch.inform();
-    try {
-      return delegate.getValuesOrThrow(depKeys, exceptionClass);
-    } finally {
-      postFetch.inform();
-    }
-  }
-
-  @Override
-  public <E1 extends Exception, E2 extends Exception>
-      Map<SkyKey, ValueOrException2<E1, E2>> getValuesOrThrow(
-          Iterable<? extends SkyKey> depKeys, Class<E1> exceptionClass1, Class<E2> exceptionClass2)
-          throws InterruptedException {
-    preFetch.inform();
-    try {
-      return delegate.getValuesOrThrow(depKeys, exceptionClass1, exceptionClass2);
-    } finally {
-      postFetch.inform();
-    }
-  }
-
-  @Override
-  public <E1 extends Exception, E2 extends Exception, E3 extends Exception>
-      Map<SkyKey, ValueOrException3<E1, E2, E3>> getValuesOrThrow(
-          Iterable<? extends SkyKey> depKeys,
-          Class<E1> exceptionClass1,
-          Class<E2> exceptionClass2,
-          Class<E3> exceptionClass3)
-          throws InterruptedException {
-    preFetch.inform();
-    try {
-      return delegate.getValuesOrThrow(depKeys, exceptionClass1, exceptionClass2, exceptionClass3);
-    } finally {
-      postFetch.inform();
-    }
-  }
-
-  @Override
   public boolean valuesMissing() {
     return delegate.valuesMissing();
   }
 
   @Override
-  public List<SkyValue> getOrderedValues(Iterable<? extends SkyKey> depKeys)
+  public SkyframeLookupResult getValuesAndExceptions(Iterable<? extends SkyKey> depKeys)
       throws InterruptedException {
     preFetch.inform();
     try {
-      return delegate.getOrderedValues(depKeys);
-    } finally {
-      postFetch.inform();
-    }
-  }
-
-  @Override
-  public SkyframeIterableResult getOrderedValuesAndExceptions(Iterable<? extends SkyKey> depKeys)
-      throws InterruptedException {
-    preFetch.inform();
-    try {
-      return delegate.getOrderedValuesAndExceptions(depKeys);
-    } finally {
-      postFetch.inform();
-    }
-  }
-
-  @Override
-  public <E extends Exception> List<ValueOrException<E>> getOrderedValuesOrThrow(
-      Iterable<? extends SkyKey> depKeys, Class<E> exceptionClass) throws InterruptedException {
-    preFetch.inform();
-    try {
-      return delegate.getOrderedValuesOrThrow(depKeys, exceptionClass);
-    } finally {
-      postFetch.inform();
-    }
-  }
-
-  @Override
-  public <E1 extends Exception, E2 extends Exception>
-      List<ValueOrException2<E1, E2>> getOrderedValuesOrThrow(
-          Iterable<? extends SkyKey> depKeys, Class<E1> exceptionClass1, Class<E2> exceptionClass2)
-          throws InterruptedException {
-    preFetch.inform();
-    try {
-      return delegate.getOrderedValuesOrThrow(depKeys, exceptionClass1, exceptionClass2);
-    } finally {
-      postFetch.inform();
-    }
-  }
-
-  @Override
-  public <E1 extends Exception, E2 extends Exception, E3 extends Exception>
-      List<ValueOrException3<E1, E2, E3>> getOrderedValuesOrThrow(
-          Iterable<? extends SkyKey> depKeys,
-          Class<E1> exceptionClass1,
-          Class<E2> exceptionClass2,
-          Class<E3> exceptionClass3)
-          throws InterruptedException {
-    preFetch.inform();
-    try {
-      return delegate.getOrderedValuesOrThrow(
-          depKeys, exceptionClass1, exceptionClass2, exceptionClass3);
+      return delegate.getValuesAndExceptions(depKeys);
     } finally {
       postFetch.inform();
     }
@@ -239,19 +132,24 @@ final class StateInformingSkyFunctionEnvironment implements SkyFunction.Environm
   }
 
   @Override
-  public boolean inErrorBubblingForSkyFunctionsThatCanFullyRecoverFromErrors() {
-    return delegate.inErrorBubblingForSkyFunctionsThatCanFullyRecoverFromErrors();
+  public boolean inErrorBubbling() {
+    return delegate.inErrorBubbling();
   }
 
   @Nullable
   @Override
-  public GroupedList<SkyKey> getTemporaryDirectDeps() {
+  public GroupedDeps getTemporaryDirectDeps() {
     return delegate.getTemporaryDirectDeps();
   }
 
   @Override
-  public void injectVersionForNonHermeticFunction(Version version) {
-    delegate.injectVersionForNonHermeticFunction(version);
+  public Set<SkyKey> getNewlyRequestedDeps() {
+    return delegate.getNewlyRequestedDeps();
+  }
+
+  @Override
+  public void injectVersion(Version version) {
+    delegate.injectVersion(version);
   }
 
   @Override
@@ -265,8 +163,8 @@ final class StateInformingSkyFunctionEnvironment implements SkyFunction.Environm
   }
 
   @Override
-  public boolean restartPermitted() {
-    return delegate.restartPermitted();
+  public SkyframeLookupResult getLookupHandleForPreviouslyRequestedDeps() {
+    return delegate.getLookupHandleForPreviouslyRequestedDeps();
   }
 
   @Override
@@ -276,5 +174,11 @@ final class StateInformingSkyFunctionEnvironment implements SkyFunction.Environm
 
   interface Informee {
     void inform() throws InterruptedException;
+  }
+
+  @Override
+  @Nullable
+  public Version getMaxTransitiveSourceVersionSoFar() {
+    return delegate.getMaxTransitiveSourceVersionSoFar();
   }
 }

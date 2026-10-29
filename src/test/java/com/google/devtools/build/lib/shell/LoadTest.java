@@ -13,7 +13,9 @@
 // limitations under the License.
 package com.google.devtools.build.lib.shell;
 
-import com.google.devtools.build.lib.util.OS;
+import static com.google.devtools.build.lib.util.OsUtils.executableExtension;
+
+import com.google.common.collect.ImmutableList;
 import com.google.devtools.build.runfiles.Runfiles;
 import java.io.File;
 import java.io.FileWriter;
@@ -30,16 +32,17 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
-/**
- * Tests {@link Command} execution under load.
- */
+/** Tests {@link Command} execution under load. */
 @RunWith(JUnit4.class)
 public class LoadTest {
+  static {
+    WindowsSubprocessFactory.maybeInstallWindowsSubprocessFactory();
+  }
 
   private File tempFile;
 
   @Before
-  public final void createTempFile() throws Exception  {
+  public final void createTempFile() throws Exception {
     // enable all log statements to ensure there are no problems with
     // logging code
     Logger.getLogger("com.google.devtools.build.lib.shell.Command").setLevel(Level.FINEST);
@@ -61,7 +64,7 @@ public class LoadTest {
   }
 
   @After
-  public final void deleteTempFile() throws Exception  {
+  public final void deleteTempFile() throws Exception {
     tempFile.delete();
   }
 
@@ -69,13 +72,12 @@ public class LoadTest {
   public void testLoad() throws Throwable {
     Runfiles runfiles = Runfiles.create();
     String catBin =
-        "io_bazel/src/test/java/com/google/devtools/build/lib/shell/cat_file";
-    if (OS.getCurrent() == OS.WINDOWS) {
-      catBin += ".exe";
-    }
+        "io_bazel/src/test/java/com/google/devtools/build/lib/shell/cat_file"
+            + executableExtension();
     catBin = runfiles.rlocation(catBin);
 
-    final Command command = new Command(new String[] {catBin, tempFile.getAbsolutePath()});
+    final Command command =
+        new Command(ImmutableList.of(catBin, tempFile.getAbsolutePath()), System.getenv());
     Thread[] threads = new Thread[10];
     List<Throwable> exceptions = Collections.synchronizedList(new ArrayList<Throwable>());
     for (int i = 0; i < threads.length; i++) {

@@ -16,17 +16,20 @@ package com.google.devtools.build.lib.skyframe;
 
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
+import static com.google.common.truth.TruthJUnit.assume;
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.fail;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.eventbus.Subscribe;
+import com.google.devtools.build.lib.actions.BuildFailedException;
+import com.google.devtools.build.lib.actions.ChangedFilesMessage;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
 import com.google.devtools.build.lib.buildtool.util.SkyframeIntegrationTestBase;
+import com.google.devtools.build.lib.cmdline.TargetParsingException;
 import com.google.devtools.build.lib.runtime.BlazeModule;
 import com.google.devtools.build.lib.runtime.BlazeRuntime;
-import com.google.devtools.build.lib.runtime.Command;
 import com.google.devtools.build.lib.runtime.WorkspaceBuilder;
-import com.google.devtools.build.lib.util.AbruptExitException;
-import com.google.devtools.build.lib.util.OS;
 import com.google.devtools.build.lib.vfs.DelegateFileSystem;
 import com.google.devtools.build.lib.vfs.FileStatus;
 import com.google.devtools.build.lib.vfs.FileSystem;
@@ -38,9 +41,9 @@ import com.google.devtools.common.options.OptionsBase;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.After;
-import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -63,11 +66,13 @@ public class LocalDiffAwarenessIntegrationTest extends SkyframeIntegrationTestBa
               @Override
               public void workspaceInit(
                   BlazeRuntime runtime, BlazeDirectories directories, WorkspaceBuilder builder) {
-                builder.addDiffAwarenessFactory(new LocalDiffAwareness.Factory(ImmutableList.of()));
+                builder.addDiffAwarenessFactory(
+                    new LocalDiffAwareness.Factory(
+                        ImmutableList.of(), new FsEventsNativeDepsServiceImpl()));
               }
 
               @Override
-              public Iterable<Class<? extends OptionsBase>> getCommandOptions(Command command) {
+              public Iterable<Class<? extends OptionsBase>> getCommandOptions(String commandName) {
                 return ImmutableList.of(LocalDiffAwareness.Options.class);
               }
             });
@@ -77,8 +82,7 @@ public class LocalDiffAwarenessIntegrationTest extends SkyframeIntegrationTestBa
   public FileSystem createFileSystem() throws Exception {
     return new DelegateFileSystem(super.createFileSystem()) {
       @Override
-      protected FileStatus statIfFound(PathFragment path, boolean followSymlinks)
-          throws IOException {
+      public FileStatus statIfFound(PathFragment path, boolean followSymlinks) throws IOException {
         IOException e = throwOnNextStatIfFound.remove(path);
         if (e != null) {
           throw e;
@@ -100,21 +104,66 @@ public class LocalDiffAwarenessIntegrationTest extends SkyframeIntegrationTestBa
 
   @Test
   public void changedFile_detectsChange() throws Exception {
-    // TODO(bazel-team): Understand why these tests are flaky on Mac. Probably real watchfs bug?
-    Assume.assumeFalse(OS.DARWIN.equals(OS.getCurrent()));
     write("foo/BUILD", "genrule(name='foo', outs=['out'], cmd='echo hello > $@')");
     buildTarget("//foo");
     assertContents("hello", "//foo");
     write("foo/BUILD", "genrule(name='foo', outs=['out'], cmd='echo there > $@')");
 
-    buildTarget("//foo");
+    buildTargetWithRetryUntilSeesChange("//foo", "foo/BUILD");
 
     assertContents("there", "//foo");
   }
 
   @Test
-  public void changedFile_statFails_throwsError() throws Exception {
-    Assume.assumeFalse(OS.DARWIN.equals(OS.getCurrent()));
+  public void changedIgnoredFile_ignoresChange() throws Exception {
+    String notIgnoredFilePath = "foo/BUILD";
+    String ignoredFilePath = "foo/ignored-dir/BUILD";
+
+    write(".bazelignore", "foo/ignored-dir");
+
+    write(ignoredFilePath, "");
+    write(notIgnoredFilePath, "genrule(name='foo', outs=['out'], cmd='echo hello > $@')");
+    buildTarget("//foo");
+    assertContents("hello", "//foo");
+
+    write(notIgnoredFilePath, "genrule(name='foo', outs=['out'], cmd='echo there > $@')");
+    write(ignoredFilePath, "A = 1");
+
+    AtomicBoolean ignoredFileChanged = new AtomicBoolean();
+    AtomicBoolean notIgnoredFileChanged = new AtomicBoolean();
+    runtimeWrapper.registerSubscriber(
+        new Object() {
+          @Subscribe
+          private void onChangedFiles(ChangedFilesMessage changedFiles) {
+            ignoredFileChanged.compareAndSet(
+                false, changedFiles.changedFiles().contains(PathFragment.create(ignoredFilePath)));
+            notIgnoredFileChanged.compareAndSet(
+                false,
+                changedFiles.changedFiles().contains(PathFragment.create(notIgnoredFilePath)));
+          }
+        });
+
+    // Work around the inherent raciness of LocalDiffAwareness where the FS events are
+    // delivered asynchronously and fast running test can trigger an incremental build
+    // before the change is observed.
+    for (int attempt = 0; attempt < 10; ++attempt) {
+      buildTarget("//foo");
+      if (notIgnoredFileChanged.get() && !ignoredFileChanged.get()) {
+        assertContents("there", "//foo");
+        return;
+      }
+    }
+
+    if (!notIgnoredFileChanged.get()) {
+      fail("Didn't observe file change within allowed number of retries");
+    }
+    if (ignoredFileChanged.get()) {
+      fail("Observed ignored file change");
+    }
+  }
+
+  @Test
+  public void changedFile_statFails_errorDeferredUntilBuild() throws Exception {
     write("foo/BUILD", "genrule(name='foo', outs=['out'], cmd='echo hello > $@')");
     buildTarget("//foo");
     assertContents("hello", "//foo");
@@ -122,9 +171,194 @@ public class LocalDiffAwarenessIntegrationTest extends SkyframeIntegrationTestBa
     IOException injectedException = new IOException("oh no!");
     throwOnNextStatIfFound.put(buildFile.asFragment(), injectedException);
 
-    AbruptExitException e = assertThrows(AbruptExitException.class, () -> buildTarget("//foo"));
+    var e =
+        assertThrows(
+            TargetParsingException.class,
+            () -> buildTargetWithRetryUntilSeesChange("//foo", "foo/BUILD"));
 
-    assertThat(e.getCause()).hasCauseThat().hasCauseThat().isSameInstanceAs(injectedException);
+    assertThat(e).hasMessageThat().contains(injectedException.getMessage());
+  }
+
+  @Test
+  public void renameDirectory_thenRenameBackWithRemovedFile_glob() throws Exception {
+    write(
+        "foo/BUILD",
+        """
+        genrule(
+            name = "foo",
+            srcs = glob(["*dir*/**"]),
+            outs = ["out"],
+            cmd = "echo $(SRCS) > $@",
+        )
+        """);
+    Path dir = write("foo/dir/file1.txt").getParentDirectory();
+    write("foo/dir/file2.txt");
+    buildTarget("//foo");
+    assertContents("foo/dir/file1.txt foo/dir/file2.txt", "//foo");
+
+    Path newDir = dir.getParentDirectory().getChild("new_dir");
+    dir.renameTo(newDir);
+    buildTargetWithRetryUntilSeesChange("//foo", "foo/dir/file1.txt");
+    assertContents("foo/new_dir/file1.txt foo/new_dir/file2.txt", "//foo");
+
+    newDir.getChild("file2.txt").delete();
+    newDir.renameTo(dir);
+    buildTargetWithRetryUntilSeesChange("//foo", "foo/new_dir/file1.txt");
+    assertContents("foo/dir/file1.txt", "//foo");
+  }
+
+  @Test
+  public void renameDirectory_thenRenameBackWithRemovedFile_inputs() throws Exception {
+    write(
+        "foo/BUILD",
+        """
+        genrule(
+            name = "foo",
+            srcs = ["dir/file1.txt", "dir/file2.txt"],
+            outs = ["out"],
+            cmd = "echo $(SRCS) > $@",
+        )
+        """);
+    Path dir = write("foo/dir/file1.txt").getParentDirectory();
+    write("foo/dir/file2.txt");
+    buildTarget("//foo");
+    assertContents("foo/dir/file1.txt foo/dir/file2.txt", "//foo");
+
+    Path newDir = dir.getParentDirectory().getChild("new_dir");
+    dir.renameTo(newDir);
+    write(
+        "foo/BUILD",
+        """
+        genrule(
+            name = "foo",
+            srcs = ["new_dir/file1.txt", "new_dir/file2.txt"],
+            outs = ["out"],
+            cmd = "echo $(SRCS) > $@",
+        )
+        """);
+    buildTargetWithRetryUntilSeesChange("//foo", "foo/dir/file1.txt");
+    assertContents("foo/new_dir/file1.txt foo/new_dir/file2.txt", "//foo");
+
+    newDir.getChild("file2.txt").delete();
+    newDir.renameTo(dir);
+    write(
+        "foo/BUILD",
+        """
+        genrule(
+            name = "foo",
+            srcs = ["dir/file1.txt"],
+            outs = ["out"],
+            cmd = "echo $(SRCS) > $@",
+        )
+        """);
+    buildTargetWithRetryUntilSeesChange("//foo", "foo/new_dir/file1.txt");
+    assertContents("foo/dir/file1.txt", "//foo");
+
+    write(
+        "foo/BUILD",
+        """
+        genrule(
+            name = "foo",
+            srcs = ["dir/file2.txt"],
+            outs = ["out"],
+            cmd = "echo $(SRCS) > $@",
+        )
+        """);
+    var e = assertThrows(BuildFailedException.class, () -> buildTarget("//foo"));
+    // It is important that the error message says "do not exist", not "are in error". The latter
+    // would indicate that the corresponding FileStateValue still considers the file to exist.
+    assertThat(e).hasMessageThat().contains("1 input file(s) do not exist");
+  }
+
+  @Test
+  public void fileWithTransientErrorIsFixedAndModifiedAfterUnrelatedBuild() throws Exception {
+    // Builds garbage collect dirty nodes that they did not need by default, which would remove the
+    // dirty file state node this test is about. Commands that do not run BuildTool, such as query,
+    // never do so, and this option disables it for builds, too.
+    addOptions("--version_window_for_dirty_node_gc=-1");
+    write(
+        "sub/BUILD",
+        """
+        genrule(
+            name = "copy",
+            srcs = ["inner/f.txt"],
+            outs = ["copy.out"],
+            cmd = "cp $< $@",
+            tags = ["manual"],
+        )
+
+        genrule(
+            name = "other",
+            outs = ["other.out"],
+            cmd = "echo other > $@",
+        )
+        """);
+    Path file = write("sub/inner/f.txt", "v1");
+    Path inner = file.getParentDirectory();
+
+    // Populates the directory listing of sub/inner, which the diff processing below consults.
+    buildTarget("//sub/...");
+
+    try {
+      // Readable but not searchable: the listing stays valid, but stats of entries fail.
+      inner.chmod(0444);
+      assume()
+          .withMessage("Directory permissions are not enforced for the current user")
+          .that(statFails(file))
+          .isTrue();
+      // The file state of sub/inner/f.txt is evaluated to a transient error, which makes that node
+      // depend on the error transience node.
+      var e = assertThrows(BuildFailedException.class, () -> buildTarget("//sub:copy"));
+      assertThat(e).hasMessageThat().contains("1 input file(s) are in error");
+      // An unrelated build invalidates the error transience node and thereby dirties the file state
+      // node without re-evaluating it.
+      buildTarget("//sub:other");
+    } finally {
+      inner.chmod(0755);
+    }
+
+    // The user fixes the permissions and edits the file. The diff processing finds no usable old
+    // value for the dirty file state node and injects a freshly computed one.
+    write("sub/inner/f.txt", "v2");
+    buildTargetWithRetryUntilSeesChange("//sub:other", "sub/inner/f.txt");
+
+    buildTarget("//sub:copy");
+    assertContents("v2", "//sub:copy");
+  }
+
+  private static boolean statFails(Path path) {
+    try {
+      path.stat();
+      return false;
+    } catch (IOException e) {
+      return true;
+    }
+  }
+
+  /**
+   * Runs {@link #buildTarget(String...)} repeatedly until we observe a change for the given path.
+   *
+   * <p>This allows to work around the inherent raciness of {@code LocalDiffAwareness} where the FS
+   * events are delivered asynchronously and fast running test can trigger an incremental build
+   * before the change is observed.
+   */
+  private void buildTargetWithRetryUntilSeesChange(String target, String path) throws Exception {
+    AtomicBoolean changed = new AtomicBoolean();
+    runtimeWrapper.registerSubscriber(
+        new Object() {
+          @Subscribe
+          private void onChangedFiles(ChangedFilesMessage changedFiles) {
+            changed.compareAndSet(
+                false, changedFiles.changedFiles().contains(PathFragment.create(path)));
+          }
+        });
+    for (int attempt = 0; attempt < 10; ++attempt) {
+      buildTarget(target);
+      if (changed.get()) {
+        return;
+      }
+    }
+    fail("Didn't observe file change within allowed number of retries");
   }
 
   // This test doesn't use --watchfs functionality, but if the source filesystem doesn't offer diffs
@@ -190,8 +424,8 @@ public class LocalDiffAwarenessIntegrationTest extends SkyframeIntegrationTestBa
     buildTarget("//hello:BUILD");
     // New package path on first build triggers full-graph work.
     calledGetValues.set(0);
-    // getValues() called during output file checking (although if an output service is able to
-    // report modified files in practice there is no iteration).
+    // getValuesAndExceptions() called during output file checking (although if an output service is
+    // able to report modified files in practice there is no iteration).
 
     buildTarget("//hello:BUILD");
     assertThat(calledGetValues.getAndSet(0)).isEqualTo(1);

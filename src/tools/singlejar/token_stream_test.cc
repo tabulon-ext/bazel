@@ -19,6 +19,8 @@
 #include <wchar.h>
 
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "src/main/cpp/util/path_platform.h"
 #include "src/tools/singlejar/test_util.h"
@@ -27,21 +29,21 @@
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 
 // Indirect command file contents (each string is a separate line):
-static const char *lines[] = {
+static const char* lines[] = {
     "-cmd1 foo", "bar",       "'abcd'",    "\"efg\"", "hi'x'",
     "'\\jkl'",   "\"\\xyz\"", "\"\\\"0\"", "cont\\",  "inue x",
 };
 
 // Tokens that the tokenizer is expected to return from the
 // indirect file above:
-static const char *expected_tokens[] = {
+static const char* expected_tokens[] = {
     "-cmd1", "foo",   "bar", "abcd",     "efg", "hix",
     "\\jkl", "\\xyz", "\"0", "continue", "x",
 };
 
 // Simple '-foo -bar' command line.
 TEST(TokenStreamTest, SimpleArgs) {
-  const char *args[] = {"-foo", "-bar"};
+  const char* args[] = {"-foo", "-bar"};
   ArgTokenStream token_stream(ARRAY_SIZE(args), args);
   EXPECT_EQ("-foo", token_stream.token());
   bool flag_foo = false;
@@ -56,10 +58,10 @@ TEST(TokenStreamTest, SimpleArgs) {
 
 // '-foo @commandfile -bar' command line.
 TEST(TokenStreamTest, CommandFile) {
-  const char *tempdir = getenv("TEST_TMPDIR");
+  const char* tempdir = getenv("TEST_TMPDIR");
   ASSERT_NE(nullptr, tempdir);
   std::string command_file_path = singlejar_test_util::OutputFilePath("tokens");
-  FILE *fp = fopen(command_file_path.c_str(), "w");
+  FILE* fp = fopen(command_file_path.c_str(), "w");
   ASSERT_NE(nullptr, fp);
   for (size_t i = 0; i < ARRAY_SIZE(lines); ++i) {
     fprintf(fp, "%s\n", lines[i]);
@@ -67,7 +69,7 @@ TEST(TokenStreamTest, CommandFile) {
   fclose(fp);
 
   std::string command_file_arg = std::string("@") + command_file_path;
-  const char *args[] = {"-before_file", "", "-after_file"};
+  const char* args[] = {"-before_file", "", "-after_file"};
   args[1] = command_file_arg.c_str();
   ArgTokenStream token_stream(ARRAY_SIZE(args), args);
   bool flag = false;
@@ -86,7 +88,7 @@ TEST(TokenStreamTest, CommandFile) {
 #ifdef _WIN32
 // '-foo @commandfile -bar' command line.
 TEST(TokenStreamTest, CommandFileLongPath) {
-  const char *tempdir = getenv("TEST_TMPDIR");
+  const char* tempdir = getenv("TEST_TMPDIR");
   ASSERT_NE(nullptr, tempdir);
 
   std::wstring wpath;
@@ -113,7 +115,7 @@ TEST(TokenStreamTest, CommandFileLongPath) {
       blaze_util::AsAbsoluteWindowsPath(command_file_path, &wpath, &error))
       << error;
 
-  FILE *fp = _wfopen(wpath.c_str(), L"w");
+  FILE* fp = _wfopen(wpath.c_str(), L"w");
   ASSERT_NE(nullptr, fp);
   for (size_t i = 0; i < ARRAY_SIZE(lines); ++i) {
     fprintf(fp, "%s\n", lines[i]);
@@ -121,7 +123,7 @@ TEST(TokenStreamTest, CommandFileLongPath) {
   fclose(fp);
 
   std::string command_file_arg = std::string("@") + command_file_path;
-  const char *args[] = {"-before_file", "", "-after_file"};
+  const char* args[] = {"-before_file", "", "-after_file"};
   args[1] = command_file_arg.c_str();
   ArgTokenStream token_stream(ARRAY_SIZE(args), args);
   bool flag = false;
@@ -138,9 +140,43 @@ TEST(TokenStreamTest, CommandFileLongPath) {
 }
 #endif
 
+// Unquoted backslash escapes and quotes in the middle of a token, which
+// interrupt the run of ordinary characters, and a token terminated by EOF
+// rather than whitespace (the file has no trailing newline).
+TEST(TokenStreamTest, CommandFileEscapesAndNoTrailingNewline) {
+  const char* tempdir = getenv("TEST_TMPDIR");
+  ASSERT_NE(nullptr, tempdir);
+  std::string command_file_path =
+      singlejar_test_util::OutputFilePath("tokens_escapes");
+  FILE* fp = fopen(command_file_path.c_str(), "w");
+  ASSERT_NE(nullptr, fp);
+  // foo\ bar foo\\bar foo\'bar ab"cd"ef ab'c d'ef con\<newline>tinued last
+  fputs(
+      "foo\\ bar foo\\\\bar foo\\'bar ab\"cd\"ef ab'c d'ef con\\\ntinued last",
+      fp);
+  fclose(fp);
+
+  std::string command_file_arg = std::string("@") + command_file_path;
+  const char* args[] = {"", "-after_file"};
+  args[0] = command_file_arg.c_str();
+  ArgTokenStream token_stream(ARRAY_SIZE(args), args);
+  const char* expected[] = {"foo bar", "foo\\bar",  "foo'bar", "abcdef",
+                            "abc def", "continued", "last"};
+  for (size_t i = 0; i < ARRAY_SIZE(expected); ++i) {
+    bool flag = false;
+    EXPECT_EQ(expected[i], token_stream.token());
+    ASSERT_TRUE(token_stream.MatchAndSet(expected[i], &flag));
+    EXPECT_TRUE(flag);
+  }
+  bool flag = false;
+  ASSERT_TRUE(token_stream.MatchAndSet("-after_file", &flag));
+  EXPECT_TRUE(flag);
+  EXPECT_TRUE(token_stream.AtEnd());
+}
+
 // '--arg1 optval1 --arg2' command line.
 TEST(TokenStreamTest, OptargOne) {
-  const char *args[] = {"--arg1", "optval1", "--arg2", "--arg3", "optval3"};
+  const char* args[] = {"--arg1", "optval1", "--arg2", "--arg3", "optval3"};
   ArgTokenStream token_stream(ARRAY_SIZE(args), args);
   std::string optval;
   EXPECT_FALSE(token_stream.MatchAndSet("--foo", &optval));
@@ -156,7 +192,7 @@ TEST(TokenStreamTest, OptargOne) {
 
 // '--arg1 value1 value2 --arg2' command line.
 TEST(TokenStreamTest, OptargMulti) {
-  const char *args[] = {"--arg1", "value11", "value12",
+  const char* args[] = {"--arg1", "value11", "value12",
                         "--arg2", "value21", "value22"};
   ArgTokenStream token_stream(ARRAY_SIZE(args), args);
   std::vector<std::string> optvals1;
@@ -177,7 +213,7 @@ TEST(TokenStreamTest, OptargMulti) {
 
 // '--arg1 optval1,optsuff1 optval2,optstuff2 --arg2' command line.
 TEST(TokenStreamTest, OptargMultiSplit) {
-  const char *args[] = {"--arg1", "optval1,optsuff1", "optval2,optsuff2",
+  const char* args[] = {"--arg1", "optval1,optsuff1", "optval2,optsuff2",
                         "optvalnosuff"};
   ArgTokenStream token_stream(ARRAY_SIZE(args), args);
   std::vector<std::pair<std::string, std::string> > optvals1;

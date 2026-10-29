@@ -15,7 +15,6 @@ package com.google.devtools.build.lib.skyframe.util;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
-import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.devtools.build.lib.analysis.ConfiguredTarget;
 import com.google.devtools.build.lib.analysis.ConfiguredTargetValue;
@@ -35,7 +34,6 @@ import com.google.devtools.build.skyframe.MemoizingEvaluator;
 import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.SkyValue;
 import java.util.Collection;
-import java.util.List;
 import javax.annotation.Nullable;
 
 /**
@@ -72,7 +70,7 @@ public class SkyframeExecutorTestUtils {
     EvaluationContext evaluationContext =
         EvaluationContext.newBuilder()
             .setKeepGoing(keepGoing)
-            .setNumThreads(SkyframeExecutor.DEFAULT_THREAD_COUNT)
+            .setParallelism(SkyframeExecutor.DEFAULT_THREAD_COUNT)
             .setEventHandler(errorEventListener)
             .build();
     return skyframeExecutor.getEvaluator().evaluate(ImmutableList.of(key), evaluationContext);
@@ -88,8 +86,10 @@ public class SkyframeExecutorTestUtils {
   public static ConfiguredTargetValue getExistingConfiguredTargetValue(
       SkyframeExecutor skyframeExecutor, Label label, BuildConfigurationValue config)
       throws InterruptedException {
-    SkyKey key = ConfiguredTargetKey.builder().setLabel(label).setConfiguration(config).build();
-    return (ConfiguredTargetValue) getExistingValue(skyframeExecutor, key);
+    return (ConfiguredTargetValue)
+        getExistingValue(
+            skyframeExecutor,
+            ConfiguredTargetKey.builder().setLabel(label).setConfiguration(config).build());
   }
 
   /**
@@ -121,23 +121,21 @@ public class SkyframeExecutorTestUtils {
         getAllExistingConfiguredTargets(skyframeExecutor), input -> input.getLabel().equals(label));
   }
 
-  /**
-   * Returns all configured targets currently in the graph.
-   */
-  public static Iterable<ConfiguredTarget> getAllExistingConfiguredTargets(
+  /** Returns all configured targets currently in the graph. */
+  public static ImmutableList<ConfiguredTarget> getAllExistingConfiguredTargets(
       SkyframeExecutor skyframeExecutor) {
     Collection<SkyValue> values =
         Maps.filterKeys(
                 skyframeExecutor.getEvaluator().getValues(),
                 SkyFunctions.isSkyFunction(SkyFunctions.CONFIGURED_TARGET))
             .values();
-    List<ConfiguredTarget> cts = Lists.newArrayList();
+    var cts = ImmutableList.<ConfiguredTarget>builder();
     for (SkyValue value : values) {
       if (value != null) {
         cts.add(((ConfiguredTargetValue) value).getConfiguredTarget());
       }
     }
-    return cts;
+    return cts.build();
   }
 
   /**
@@ -149,8 +147,8 @@ public class SkyframeExecutorTestUtils {
   @Nullable
   public static Target getExistingTarget(SkyframeExecutor skyframeExecutor, Label label)
       throws InterruptedException {
-    PackageValue value = (PackageValue) getExistingValue(skyframeExecutor,
-        PackageValue.key(label.getPackageIdentifier()));
+    PackageValue value =
+        (PackageValue) getExistingValue(skyframeExecutor, label.getPackageIdentifier());
     if (value == null) {
       return null;
     }
@@ -170,7 +168,7 @@ public class SkyframeExecutorTestUtils {
   @Nullable
   public static ErrorInfo getExistingFailedPackage(SkyframeExecutor skyframeExecutor, Label label)
       throws InterruptedException {
-    SkyKey key = PackageValue.key(label.getPackageIdentifier());
+    SkyKey key = label.getPackageIdentifier();
     return getExistingError(skyframeExecutor, key);
   }
 }

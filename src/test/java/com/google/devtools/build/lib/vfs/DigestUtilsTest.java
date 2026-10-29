@@ -15,84 +15,23 @@ package com.google.devtools.build.lib.vfs;
 
 import static com.google.common.truth.Truth.assertThat;
 
-import com.google.devtools.build.lib.testutil.TestThread;
-import com.google.devtools.build.lib.testutil.TestUtils;
 import com.google.devtools.build.lib.vfs.inmemoryfs.InMemoryFileSystem;
+import com.google.testing.junit.testparameterinjector.TestParameter;
+import com.google.testing.junit.testparameterinjector.TestParameterInjector;
 import java.io.IOException;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
+import java.util.HexFormat;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.After;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.junit.runners.JUnit4;
 
 /** Tests for {@link DigestUtils}. */
-@RunWith(JUnit4.class)
+@RunWith(TestParameterInjector.class)
 public final class DigestUtilsTest {
 
   @After
   public void tearDown() {
     DigestUtils.configureCache(/*maximumSize=*/ 0);
-  }
-
-  private static void assertDigestCalculationConcurrency(
-      boolean expectConcurrent,
-      boolean fastDigest,
-      int fileSize1,
-      int fileSize2,
-      DigestHashFunction hf)
-      throws Exception {
-    CountDownLatch barrierLatch = new CountDownLatch(2); // Used to block test threads.
-    CountDownLatch readyLatch = new CountDownLatch(1); // Used to block main thread.
-
-    FileSystem myfs =
-        new InMemoryFileSystem(hf) {
-          @Override
-          protected byte[] getDigest(PathFragment path) throws IOException {
-            try {
-              barrierLatch.countDown();
-              readyLatch.countDown();
-              // Either both threads will be inside getDigest at the same time or they
-              // both will be blocked.
-              barrierLatch.await();
-            } catch (Exception e) {
-              throw new IOException(e);
-            }
-            return super.getDigest(path);
-          }
-
-          @Override
-          protected byte[] getFastDigest(PathFragment path) throws IOException {
-            return fastDigest ? super.getDigest(path) : null;
-          }
-        };
-
-    Path myFile1 = myfs.getPath("/f1.dat");
-    Path myFile2 = myfs.getPath("/f2.dat");
-    FileSystemUtils.writeContentAsLatin1(myFile1, "a".repeat(fileSize1));
-    FileSystemUtils.writeContentAsLatin1(myFile2, "b".repeat(fileSize2));
-
-    TestThread thread1 =
-        new TestThread(
-            () ->
-                DigestUtils.getDigestWithManualFallback(myFile1, fileSize1, SyscallCache.NO_CACHE));
-    TestThread thread2 =
-        new TestThread(
-            () ->
-                DigestUtils.getDigestWithManualFallback(myFile2, fileSize2, SyscallCache.NO_CACHE));
-     thread1.start();
-     thread2.start();
-     if (!expectConcurrent) { // Synchronized case.
-      // Wait until at least one thread reached getDigest().
-      assertThat(readyLatch.await(TestUtils.WAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
-      // Only 1 thread should be inside getDigest().
-      assertThat(barrierLatch.getCount()).isEqualTo(1);
-       barrierLatch.countDown(); // Release barrier latch, allowing both threads to proceed.
-     }
-     // Test successful execution within 5 seconds.
-     thread1.joinAndAssertState(TestUtils.WAIT_TIMEOUT_MILLISECONDS);
-     thread2.joinAndAssertState(TestUtils.WAIT_TIMEOUT_MILLISECONDS);
   }
 
   @Test
@@ -103,13 +42,13 @@ public final class DigestUtilsTest {
     FileSystem tracingFileSystem =
         new InMemoryFileSystem(DigestHashFunction.SHA256) {
           @Override
-          protected byte[] getFastDigest(PathFragment path) {
+          public byte[] getFastDigest(PathFragment path) {
             getFastDigestCounter.incrementAndGet();
             return null;
           }
 
           @Override
-          protected byte[] getDigest(PathFragment path) throws IOException {
+          public byte[] getDigest(PathFragment path) throws IOException {
             getDigestCounter.incrementAndGet();
             return super.getDigest(path);
           }
@@ -120,17 +59,175 @@ public final class DigestUtilsTest {
     Path file = tracingFileSystem.getPath("/file.txt");
     FileSystemUtils.writeContentAsLatin1(file, "some contents");
 
-    byte[] digest1 =
-        DigestUtils.getDigestWithManualFallback(file, file.getFileSize(), SyscallCache.NO_CACHE);
+    byte[] digest =
+        DigestUtils.getDigestWithManualFallback(file, SyscallCache.NO_CACHE, /* status= */ null);
     assertThat(getFastDigestCounter.get()).isEqualTo(1);
     assertThat(getDigestCounter.get()).isEqualTo(1);
 
     assertThat(
             DigestUtils.getDigestWithManualFallback(
-                file, file.getFileSize(), SyscallCache.NO_CACHE))
-        .isEqualTo(digest1);
+                file, SyscallCache.NO_CACHE, /* status= */ null))
+        .isEqualTo(digest);
     assertThat(getFastDigestCounter.get()).isEqualTo(2);
     assertThat(getDigestCounter.get()).isEqualTo(1); // Cached.
+
+    DigestUtils.clearCache();
+
+    assertThat(
+            DigestUtils.getDigestWithManualFallback(
+                file, SyscallCache.NO_CACHE, /* status= */ null))
+        .isEqualTo(digest);
+    assertThat(getFastDigestCounter.get()).isEqualTo(3);
+    assertThat(getDigestCounter.get()).isEqualTo(2); // Not cached.
+  }
+
+  @Test
+  public void cacheHitWithoutRestatingWhenTheCallerSuppliesTheStat() throws Exception {
+    AtomicInteger getDigestCounter = new AtomicInteger(0);
+    AtomicInteger statCounter = new AtomicInteger(0);
+
+    FileSystem tracingFileSystem =
+        new InMemoryFileSystem(DigestHashFunction.SHA256) {
+          @Override
+          public byte[] getDigest(PathFragment path) throws IOException {
+            getDigestCounter.incrementAndGet();
+            return super.getDigest(path);
+          }
+
+          @Override
+          public FileStatus stat(PathFragment path, boolean followSymlinks) throws IOException {
+            statCounter.incrementAndGet();
+            return super.stat(path, followSymlinks);
+          }
+        };
+
+    DigestUtils.configureCache(/* maximumSize= */ 100);
+
+    Path file = tracingFileSystem.getPath("/file.txt");
+    FileSystemUtils.writeContentAsLatin1(file, "some contents");
+
+    // Without a stat, DigestUtils has to stat the file itself to build the cache key.
+    byte[] digest = DigestUtils.manuallyComputeDigest(file, /* status= */ null);
+    assertThat(getDigestCounter.get()).isEqualTo(1);
+    assertThat(statCounter.get()).isEqualTo(1);
+
+    // A caller that already stat'ed the file gets the cached digest without a further stat, which
+    // only works if both spellings of the key agree.
+    FileStatus stat = file.stat();
+    getDigestCounter.set(0);
+    statCounter.set(0);
+    assertThat(DigestUtils.manuallyComputeDigest(file, stat)).isEqualTo(digest);
+    assertThat(getDigestCounter.get()).isEqualTo(0);
+    assertThat(statCounter.get()).isEqualTo(0);
+  }
+
+  @Test
+  public void modifiedFile_staleEntryIsAMissAndIsReplaced() throws Exception {
+    AtomicInteger getDigestCounter = new AtomicInteger(0);
+    FileSystem tracingFileSystem =
+        new InMemoryFileSystem(DigestHashFunction.SHA256) {
+          @Override
+          public byte[] getDigest(PathFragment path) throws IOException {
+            getDigestCounter.incrementAndGet();
+            return super.getDigest(path);
+          }
+        };
+
+    DigestUtils.configureCache(/* maximumSize= */ 100);
+
+    Path file = tracingFileSystem.getPath("/file.txt");
+    FileSystemUtils.writeContentAsLatin1(file, "some contents");
+    byte[] digest = DigestUtils.manuallyComputeDigest(file, /* status= */ null);
+    assertThat(getDigestCounter.get()).isEqualTo(1);
+    assertThat(DigestUtils.getCacheStats().missCount()).isEqualTo(1);
+
+    // The file changes (in size, so no clock is needed). The entry is present but stale: that is a
+    // miss, the digest is recomputed, and the entry is replaced rather than kept alongside.
+    FileSystemUtils.writeContentAsLatin1(file, "other contents!");
+    byte[] newDigest = DigestUtils.manuallyComputeDigest(file, /* status= */ null);
+    assertThat(newDigest).isNotEqualTo(digest);
+    assertThat(getDigestCounter.get()).isEqualTo(2);
+    assertThat(DigestUtils.getCacheStats().missCount()).isEqualTo(2);
+    assertThat(DigestUtils.getCacheStats().hitCount()).isEqualTo(0);
+    assertThat(DigestUtils.getCacheStats().evictionCount()).isEqualTo(0);
+
+    // The replaced entry serves the new contents without a further read.
+    assertThat(DigestUtils.manuallyComputeDigest(file, /* status= */ null)).isEqualTo(newDigest);
+    assertThat(getDigestCounter.get()).isEqualTo(2);
+    assertThat(DigestUtils.getCacheStats().hitCount()).isEqualTo(1);
+  }
+
+  @Test
+  public void changeWithinTheSameMillisecond_isAMiss() throws Exception {
+    AtomicInteger getDigestCounter = new AtomicInteger(0);
+    FileSystem tracingFileSystem =
+        new InMemoryFileSystem(DigestHashFunction.SHA256) {
+          @Override
+          public byte[] getDigest(PathFragment path) throws IOException {
+            getDigestCounter.incrementAndGet();
+            return super.getDigest(path);
+          }
+        };
+
+    DigestUtils.configureCache(/* maximumSize= */ 100);
+
+    Path file = tracingFileSystem.getPath("/file.txt");
+    FileSystemUtils.writeContentAsLatin1(file, "some contents");
+    FileStatus stat = file.stat();
+    var unused1 = DigestUtils.manuallyComputeDigest(file, withChangeTimeNanos(stat, 1_000_001));
+    var unused2 = DigestUtils.manuallyComputeDigest(file, withChangeTimeNanos(stat, 1_000_002));
+
+    assertThat(getDigestCounter.get()).isEqualTo(2);
+    assertThat(DigestUtils.getCacheStats().hitCount()).isEqualTo(0);
+  }
+
+  private static FileStatus withChangeTimeNanos(FileStatus stat, long changeTimeNanos) {
+    return new FileStatus() {
+      @Override
+      public boolean isFile() {
+        return stat.isFile();
+      }
+
+      @Override
+      public boolean isDirectory() {
+        return stat.isDirectory();
+      }
+
+      @Override
+      public boolean isSymbolicLink() {
+        return stat.isSymbolicLink();
+      }
+
+      @Override
+      public boolean isSpecialFile() {
+        return stat.isSpecialFile();
+      }
+
+      @Override
+      public long getSize() throws IOException {
+        return stat.getSize();
+      }
+
+      @Override
+      public long getLastModifiedTime() throws IOException {
+        return stat.getLastModifiedTime();
+      }
+
+      @Override
+      public long getLastChangeTime() {
+        return Math.floorDiv(changeTimeNanos, 1_000_000);
+      }
+
+      @Override
+      public long getLastChangeTimeNanos() {
+        return changeTimeNanos;
+      }
+
+      @Override
+      public long getNodeId() throws IOException {
+        return stat.getNodeId();
+      }
+    };
   }
 
   @Test
@@ -139,18 +236,51 @@ public final class DigestUtilsTest {
     FileSystem noDigestFileSystem =
         new InMemoryFileSystem(DigestHashFunction.SHA256) {
           @Override
-          protected byte[] getFastDigest(PathFragment path) {
+          public byte[] getFastDigest(PathFragment path) {
             throw new AssertionError("Unexpected call to getFastDigest");
           }
 
           @Override
-          protected byte[] getDigest(PathFragment path) {
+          public byte[] getDigest(PathFragment path) {
             return digest;
           }
         };
     Path file = noDigestFileSystem.getPath("/f.txt");
     FileSystemUtils.writeContentAsLatin1(file, "contents");
 
-    assertThat(DigestUtils.manuallyComputeDigest(file, /*fileSize=*/ 8)).isEqualTo(digest);
+    assertThat(DigestUtils.manuallyComputeDigest(file, /* status= */ null)).isEqualTo(digest);
+  }
+
+  @Test
+  public void combineUnordered_commutative() {
+    byte[] a = {1, 2, 3};
+    byte[] b = {4, 5, 6};
+    assertThat(DigestUtils.combineUnordered(a.clone(), b.clone()))
+        .isEqualTo(DigestUtils.combineUnordered(b.clone(), a.clone()));
+  }
+
+  @Test
+  public void combineUnordered_noCancellation() {
+    byte[] a = {1, 2, 3};
+    assertThat(DigestUtils.combineUnordered(a.clone(), a.clone()))
+        .isNotEqualTo(new byte[] {0, 0, 0});
+  }
+
+  @Test
+  public void toHexByteString_matchesLowercaseHexEncoding(
+      @TestParameter({
+            "",
+            "00",
+            "0f",
+            "10",
+            "7f",
+            "80",
+            "ff",
+            "0123456789abcdef",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          })
+          String hex) {
+    assertThat(DigestUtils.toHexByteString(HexFormat.of().parseHex(hex)).toStringUtf8())
+        .isEqualTo(hex);
   }
 }

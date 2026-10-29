@@ -14,10 +14,13 @@
 
 package com.google.devtools.build.lib.skyframe;
 
+
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import com.google.devtools.build.lib.cmdline.IgnoredSubdirectories;
 import com.google.devtools.build.lib.util.OS;
+import com.google.devtools.build.lib.util.StringEncoding;
 import com.google.devtools.build.lib.vfs.ModifiedFileSet;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.Root;
@@ -25,10 +28,12 @@ import com.google.devtools.common.options.Option;
 import com.google.devtools.common.options.OptionDocumentationCategory;
 import com.google.devtools.common.options.OptionEffectTag;
 import com.google.devtools.common.options.OptionsBase;
+import com.google.devtools.common.options.OptionsClass;
+import com.google.devtools.common.options.OptionsProvider;
 import java.io.IOException;
-import java.nio.file.FileSystems;
 import java.nio.file.Path;
 import java.util.Set;
+import javax.annotation.Nullable;
 
 /**
  * File system watcher for local filesystems. It's able to provide a list of changed files between
@@ -40,10 +45,9 @@ import java.util.Set;
  * {@link WatchServiceDiffAwareness}.
  */
 public abstract class LocalDiffAwareness implements DiffAwareness {
-  /**
-   * Option to enable / disable local diff awareness.
-   */
-  public static final class Options extends OptionsBase {
+  /** Option to enable / disable local diff awareness. */
+  @OptionsClass
+  public abstract static class Options extends OptionsBase {
     @Option(
         name = "watchfs",
         defaultValue = "false",
@@ -56,7 +60,9 @@ public abstract class LocalDiffAwareness implements DiffAwareness {
                 + "with --experimental_windows_watchfs. On any OS: The behavior is undefined "
                 + "if your workspace is on a network file system, and files are edited on a "
                 + "remote machine.")
-    public boolean watchFS;
+    public abstract boolean getWatchFS();
+
+    public abstract void setWatchFS(boolean value);
 
     @Option(
         name = "experimental_windows_watchfs",
@@ -66,24 +72,30 @@ public abstract class LocalDiffAwareness implements DiffAwareness {
         help =
             "If true, experimental Windows support for --watchfs is enabled. Otherwise --watchfs"
                 + "is a non-op on Windows. Make sure to also enable --watchfs.")
-    public boolean windowsWatchFS;
+    public abstract boolean getWindowsWatchFS();
   }
 
   /** Factory for creating {@link LocalDiffAwareness} instances. */
   public static class Factory implements DiffAwareness.Factory {
     private final ImmutableList<String> excludedNetworkFileSystemsPrefixes;
+    private final FsEventsNativeDepsService fsEventsNativeDepsService;
 
     /**
      * Creates a new factory; the file system watcher may not work on all file systems, particularly
      * for network file systems. The prefix list can be used to exclude known paths that point to
      * network file systems.
      */
-    public Factory(ImmutableList<String> excludedNetworkFileSystemsPrefixes) {
+    public Factory(
+        ImmutableList<String> excludedNetworkFileSystemsPrefixes,
+        FsEventsNativeDepsService fsEventsNativeDepsService) {
       this.excludedNetworkFileSystemsPrefixes = excludedNetworkFileSystemsPrefixes;
+      this.fsEventsNativeDepsService = fsEventsNativeDepsService;
     }
 
     @Override
-    public DiffAwareness maybeCreate(Root pathEntry) {
+    @Nullable
+    public DiffAwareness maybeCreate(
+        Root pathEntry, IgnoredSubdirectories ignoredPaths, OptionsProvider optionsProvider) {
       com.google.devtools.build.lib.vfs.Path resolvedPathEntry;
       try {
         resolvedPathEntry = pathEntry.asPath().resolveSymbolicLinks();
@@ -98,25 +110,28 @@ public abstract class LocalDiffAwareness implements DiffAwareness {
           return null;
         }
       }
+      Path watchRoot =
+          Path.of(StringEncoding.internalToPlatform(resolvedPathEntryFragment.getPathString()));
       // On OSX uses FsEvents due to https://bugs.openjdk.java.net/browse/JDK-7133447
       if (OS.getCurrent() == OS.DARWIN) {
-        return new MacOSXFsEventsDiffAwareness(resolvedPathEntryFragment.toString());
+        return new MacOSXFsEventsDiffAwareness(watchRoot, ignoredPaths, fsEventsNativeDepsService);
       }
 
-      return new WatchServiceDiffAwareness(resolvedPathEntryFragment.toString());
+      return new WatchServiceDiffAwareness(watchRoot, ignoredPaths);
     }
   }
 
   /**
-   * A view that results in any subsequent getDiff calls returning
-   * {@link ModifiedFileSet#EVERYTHING_MODIFIED}. Use this if --watchFs is disabled.
+   * A view that results in any subsequent getDiff calls returning {@link
+   * ModifiedFileSet#EVERYTHING_MODIFIED}. Use this if --watchFs is disabled.
    *
    * <p>The position is set to -2 in order for {@link #areInSequence} below to always return false
-   * if this view is passed to it. Any negative number would work; we don't use -1 as the other
-   * view may have a position of 0.
+   * if this view is passed to it. Any negative number would work; we don't use -1 as the other view
+   * may have a position of 0.
    */
   protected static final View EVERYTHING_MODIFIED =
-      new SequentialView(/*owner=*/null, /*position=*/-2, ImmutableSet.<Path>of());
+      new SequentialView(
+          /* owner= */ null, /* position= */ -2, ImmutableSet.<Path>of(), /* isOverflow= */ false);
 
   public static boolean areInSequence(SequentialView oldView, SequentialView newView) {
     // Keep this in sync with the EVERYTHING_MODIFIED View above.
@@ -126,10 +141,10 @@ public abstract class LocalDiffAwareness implements DiffAwareness {
   private int numGetCurrentViewCalls = 0;
 
   /** Root directory to watch. This is an absolute path. */
-  protected final Path watchRootPath;
+  protected final Path watchRoot;
 
-  protected LocalDiffAwareness(String watchRoot) {
-    this.watchRootPath = FileSystems.getDefault().getPath(watchRoot);
+  protected LocalDiffAwareness(Path watchRoot) {
+    this.watchRoot = watchRoot;
   }
 
   /**
@@ -141,17 +156,28 @@ public abstract class LocalDiffAwareness implements DiffAwareness {
     private final LocalDiffAwareness owner;
     private final int position;
     private final Set<Path> modifiedAbsolutePaths;
+    private final boolean isOverflow;
 
-    public SequentialView(LocalDiffAwareness owner, int position, Set<Path> modifiedAbsolutePaths) {
+    public SequentialView(
+        LocalDiffAwareness owner,
+        int position,
+        Set<Path> modifiedAbsolutePaths,
+        boolean isOverflow) {
       this.owner = owner;
       this.position = position;
       this.modifiedAbsolutePaths = modifiedAbsolutePaths;
+      this.isOverflow = isOverflow;
+    }
+
+    public boolean isOverflow() {
+      return isOverflow;
     }
 
     @Override
     public String toString() {
-      return String.format("SequentialView[owner=%s, position=%d, modifiedAbsolutePaths=%s]", owner,
-          position, modifiedAbsolutePaths);
+      return String.format(
+          "SequentialView[owner=%s, position=%d, modifiedAbsolutePaths=%s, isOverflow=%b]",
+          owner, position, modifiedAbsolutePaths, isOverflow);
     }
   }
 
@@ -168,12 +194,28 @@ public abstract class LocalDiffAwareness implements DiffAwareness {
    */
   protected SequentialView newView(Set<Path> modifiedAbsolutePaths) {
     numGetCurrentViewCalls++;
-    return new SequentialView(this, numGetCurrentViewCalls, modifiedAbsolutePaths);
+    return new SequentialView(
+        this, numGetCurrentViewCalls, modifiedAbsolutePaths, /* isOverflow= */ false);
+  }
+
+  /**
+   * Create a new view representing an overflow condition. This increases the view counter so that
+   * sequential ordering is preserved for subsequent calls, but indicates that all files must be
+   * treated as modified for the current diff.
+   */
+  protected SequentialView newOverflowView() {
+    numGetCurrentViewCalls++;
+    return new SequentialView(
+        this, numGetCurrentViewCalls, ImmutableSet.of(), /* isOverflow= */ true);
   }
 
   @Override
-  public ModifiedFileSet getDiff(View oldView, View newView)
+  public ModifiedFileSet getDiff(@Nullable View oldView, View newView)
       throws IncompatibleViewException, BrokenDiffAwarenessException {
+    if (oldView == null) {
+      return ModifiedFileSet.EVERYTHING_MODIFIED;
+    }
+
     SequentialView oldSequentialView;
     SequentialView newSequentialView;
     try {
@@ -185,15 +227,19 @@ public abstract class LocalDiffAwareness implements DiffAwareness {
     if (!areInSequence(oldSequentialView, newSequentialView)) {
       return ModifiedFileSet.EVERYTHING_MODIFIED;
     }
+    if (newSequentialView.isOverflow()) {
+      return ModifiedFileSet.EVERYTHING_MODIFIED;
+    }
 
     ModifiedFileSet.Builder resultBuilder = ModifiedFileSet.builder();
     for (Path modifiedPath : newSequentialView.modifiedAbsolutePaths) {
-      if (!modifiedPath.startsWith(watchRootPath)) {
+      if (!modifiedPath.startsWith(watchRoot)) {
         throw new BrokenDiffAwarenessException(
-            String.format("%s is not under %s", modifiedPath, watchRootPath));
+            String.format("%s is not under %s", modifiedPath, watchRoot));
       }
       PathFragment relativePath =
-          PathFragment.create(watchRootPath.relativize(modifiedPath).toString());
+          PathFragment.create(
+              StringEncoding.platformToInternal(watchRoot.relativize(modifiedPath).toString()));
       if (!relativePath.isEmpty()) {
         resultBuilder.modify(relativePath);
       }

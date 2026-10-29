@@ -236,7 +236,6 @@ public class KeepGoingTest extends BuildIntegrationTestCase {
     write("keepgoing/badsrc.sh", "exit 0");
     buildTarget("//keepgoing:topgen");
     write("keepgoing/badsrc.sh", "exit 42");
-    events.clear();
     BuildFailedException e =
         assertThrows(BuildFailedException.class, () -> buildTarget("//keepgoing:topgen"));
     assertThat(e).hasMessageThat().isNull();
@@ -248,8 +247,15 @@ public class KeepGoingTest extends BuildIntegrationTestCase {
 
   @Test
   public void testConfigurationErrorsAreToleratedWithKeepGoing() throws Exception {
-    write("a/BUILD", "cc_library(name='a', srcs=['missing.foo'])");
-    write("b/BUILD", "cc_library(name='b')");
+    runtimeWrapper.addOptions("--experimental_builtins_injection_override=+cc_library");
+    write(
+        "a/BUILD",
+        "load('@rules_cc//cc:cc_library.bzl', 'cc_library')",
+        "cc_library(name='a', srcs=['missing.foo'])");
+    write(
+        "b/BUILD",
+        "load('@rules_cc//cc:cc_library.bzl', 'cc_library')",
+        "cc_library(name='b')");
 
     /**
      * Regression coverage for bug 1191396: "blaze build -k exits zero if execution succeeds, even
@@ -258,16 +264,23 @@ public class KeepGoingTest extends BuildIntegrationTestCase {
     assertBuildFailedExceptionFromBuilding(
         "command succeeded, but not all targets were analyzed", "//a", "//b");
     events.assertContainsError(
-        "in srcs attribute of cc_library rule //a:a: " + "target '//a:missing.foo' does not exist");
-    events.assertContainsInfo("Analysis succeeded for only 1 of 2 top-level targets");
+        "in srcs attribute of cc_library rule @@//a:a: source file '@@//a:missing.foo' is misplaced"
+            + " here");
+    events.assertContainsInfo("Build succeeded for only 1 of 2 top-level targets");
 
     assertSameConfiguredTarget("//b:b");
   }
 
   @Test
   public void testKeepGoingAfterLoadingPhaseErrors() throws Exception {
-    write("a/BUILD", "cc_library(name='a')");
-    write("b/BUILD", "cc_library(name='b', deps = ['//missing:lib'])");
+    write(
+        "a/BUILD",
+        "load('@rules_cc//cc:cc_library.bzl', 'cc_library')",
+        "cc_library(name='a')");
+    write(
+        "b/BUILD",
+        "load('@rules_cc//cc:cc_library.bzl', 'cc_library')",
+        "cc_library(name='b', deps = ['//missing:lib'])");
 
     assertBuildFailedExceptionFromBuilding(
         "command succeeded, but not all targets were analyzed", "//a", "//b"); //
@@ -279,10 +292,22 @@ public class KeepGoingTest extends BuildIntegrationTestCase {
 
   @Test
   public void testKeepGoingAfterTargetParsingErrors() throws Exception {
-    write("a/BUILD", "cc_library(name='a', xyz)");
-    write("b/BUILD", "cc_library(name='b', xyz)");
-    write("b/b1/BUILD", "cc_library(name='b1')");
-    write("b/b2/BUILD", "cc_library(name='b2', xyz)");
+    write(
+        "a/BUILD",
+        "load('@rules_cc//cc:cc_library.bzl', 'cc_library')",
+        "cc_library(name='a', xyz)");
+    write(
+        "b/BUILD",
+        "load('@rules_cc//cc:cc_library.bzl', 'cc_library')",
+        "cc_library(name='b', xyz)");
+    write(
+        "b/b1/BUILD",
+        "load('@rules_cc//cc:cc_library.bzl', 'cc_library')",
+        "cc_library(name='b1')");
+    write(
+        "b/b2/BUILD",
+        "load('@rules_cc//cc:cc_library.bzl', 'cc_library')",
+        "cc_library(name='b2', xyz)");
 
     assertBuildFailedExceptionFromBuilding(
         "command succeeded, but there were errors parsing the target pattern", "b/...", "//a");
@@ -292,13 +317,34 @@ public class KeepGoingTest extends BuildIntegrationTestCase {
   }
 
   @Test
-  public void testKeepGoingAfterSchedulingDependencyMiddlemanFailure() throws Exception {
+  public void testKeepGoingAfterSchedulingDependencyFailure() throws Exception {
     write("foo/foo.cc", "int main() { return 0; }");
     write(
         "foo/BUILD",
-        "cc_binary(name='foo', srcs=['foo.cc', 'gen.h'], malloc='system_malloc')",
-        "cc_library(name='system_malloc', linkstatic=1)",
-        "genrule(name='gen', srcs=[], outs=['gen.h'], cmd = 'exit 1')");
+        """
+        load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+        load("@rules_cc//cc:cc_library.bzl", "cc_library")
+        cc_binary(
+            name = "foo",
+            srcs = [
+                "foo.cc",
+                "gen.h",
+            ],
+            malloc = "system_malloc",
+        )
+
+        cc_library(
+            name = "system_malloc",
+            linkstatic = 1,
+        )
+
+        genrule(
+            name = "gen",
+            srcs = [],
+            outs = ["gen.h"],
+            cmd = "exit 1",
+        )
+        """);
 
     assertThrows(BuildFailedException.class, () -> buildTarget("//foo:foo"));
   }
@@ -312,23 +358,36 @@ public class KeepGoingTest extends BuildIntegrationTestCase {
   public void testKeepGoingAfterAnalysisFailure() throws Exception {
     write(
         "analysiserror/failer.bzl",
-        "def _failer_impl(ctx):",
-        "  fail('BOOM!')",
-        "",
-        "failer = rule(implementation = _failer_impl)");
+        """
+        def _failer_impl(ctx):
+            fail("BOOM!")
+
+        failer = rule(implementation = _failer_impl)
+        """);
     write(
         "analysiserror/BUILD",
-        "load(':failer.bzl', 'failer')",
-        "genrule(name='gen', srcs=[], outs=['gen.h'], cmd='exit 1')",
-        // The next line has an analysis failure: the xmb_lint rule is devoid of xmb files.
-        "failer(name='foo')",
-        "cc_library(name='bar')");
+        """
+        load("@rules_cc//cc:cc_library.bzl", "cc_library")
+        load(":failer.bzl", "failer")
+
+        genrule(
+            name = "gen",
+            srcs = [],
+            outs = ["gen.h"],
+            cmd = "exit 1",
+        )
+
+        # The next line has an analysis failure: the xmb_lint rule is devoid of xmb files.
+        failer(name = "foo")
+
+        cc_library(name = "bar")
+        """);
 
     assertBuildFailedExceptionFromBuilding(
         "command succeeded, but not all targets were analyzed",
         "//analysiserror:foo",
         "//analysiserror:bar");
-    events.assertContainsError("Error in fail: BOOM!");
+    events.assertContainsError("Error: BOOM!");
 
     assertSameConfiguredTarget("//analysiserror:bar");
   }

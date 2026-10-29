@@ -17,7 +17,6 @@ import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.Immutable;
 import com.google.devtools.build.lib.events.EventHandler;
 import java.util.List;
-import javax.annotation.Nullable;
 import net.starlark.java.eval.StarlarkValue;
 
 /**
@@ -50,21 +49,17 @@ public abstract class Fragment implements StarlarkValue {
     return true; // immutable and Starlark-hashable
   }
 
+  @Override
+  public boolean isAcyclic() {
+    return true;
+  }
+
   /**
    * Validates the options for this Fragment. Issues warnings for the use of deprecated options, and
    * warnings or errors for any option settings that conflict.
    */
   @SuppressWarnings("unused")
   public void reportInvalidOptions(EventHandler reporter, BuildOptions buildOptions) {}
-
-  /**
-   * Returns a fragment of the output directory name for this configuration. The output directory
-   * for the whole configuration contains all the short names by all fragments.
-   */
-  @Nullable
-  public String getOutputDirectoryName() {
-    return null;
-  }
 
   /** Returns the option classes needed to create a fragment. */
   public static ImmutableSet<Class<? extends FragmentOptions>> requiredOptions(

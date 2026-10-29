@@ -14,11 +14,12 @@
 package com.google.devtools.build.lib.remote.util;
 
 import static com.google.common.base.Preconditions.checkState;
+import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 
-import com.google.common.util.concurrent.AbstractFuture;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.SettableFuture;
 import io.reactivex.rxjava3.annotations.NonNull;
 import io.reactivex.rxjava3.core.Completable;
 import io.reactivex.rxjava3.core.CompletableEmitter;
@@ -34,7 +35,6 @@ import io.reactivex.rxjava3.functions.Supplier;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 
 /** Methods for interoperating between Rx and ListenableFuture. */
@@ -92,10 +92,11 @@ public class RxFutures {
                  *   1. The ListenableFuture itself is cancelled.
                  *   2. Completable is disposed by downstream.
                  *
-                 * This check is used to prevent propagating CancellationException to downstream
-                 * when it has already disposed the Completable.
+                 * In the second case, the CancellationException must not be propagated to
+                 * downstream.
                  */
-                if (throwable instanceof CancellationException && emitter.isDisposed()) {
+                if (throwable instanceof CancellationException) {
+                  emitter.tryOnError(throwable);
                   return;
                 }
 
@@ -162,10 +163,11 @@ public class RxFutures {
                  *   1. The ListenableFuture itself is cancelled.
                  *   2. Single is disposed by downstream.
                  *
-                 * This check is used to prevent propagating CancellationException to downstream
-                 * when it has already disposed the Single.
+                 * In the second case, the CancellationException must not be propagated to
+                 * downstream.
                  */
-                if (throwable instanceof CancellationException && emitter.isDisposed()) {
+                if (throwable instanceof CancellationException) {
+                  emitter.tryOnError(throwable);
                   return;
                 }
 
@@ -191,12 +193,18 @@ public class RxFutures {
    * the {@link Completable} will automatically be cancelled.
    */
   public static ListenableFuture<Void> toListenableFuture(Completable completable) {
-    CompletableFuture<Void> future = new CompletableFuture<>();
+    SettableFuture<Void> future = SettableFuture.create();
     completable.subscribe(
         new CompletableObserver() {
           @Override
           public void onSubscribe(Disposable d) {
-            future.setCancelCallback(d);
+            future.addListener(
+                () -> {
+                  if (future.isCancelled()) {
+                    d.dispose();
+                  }
+                },
+                directExecutor());
           }
 
           @Override
@@ -207,7 +215,9 @@ public class RxFutures {
 
           @Override
           public void onError(Throwable e) {
-            if (e instanceof CancellationException) {
+            if (e instanceof InterruptedException) {
+              future.cancel(true);
+            } else if (e instanceof CancellationException) {
               future.cancel(true);
             } else {
               future.setException(e);
@@ -224,12 +234,18 @@ public class RxFutures {
    * the {@link Single} will automatically be cancelled.
    */
   public static <T> ListenableFuture<T> toListenableFuture(Single<T> single) {
-    CompletableFuture<T> future = new CompletableFuture<>();
+    SettableFuture<T> future = SettableFuture.create();
     single.subscribe(
         new SingleObserver<T>() {
           @Override
           public void onSubscribe(Disposable d) {
-            future.setCancelCallback(d);
+            future.addListener(
+                () -> {
+                  if (future.isCancelled()) {
+                    d.dispose();
+                  }
+                },
+                directExecutor());
           }
 
           @Override
@@ -247,41 +263,5 @@ public class RxFutures {
           }
         });
     return future;
-  }
-
-  private static final class CompletableFuture<T> extends AbstractFuture<T> {
-    private final AtomicReference<Disposable> cancelCallback = new AtomicReference<>();
-
-    private void setCancelCallback(Disposable cancelCallback) {
-      this.cancelCallback.set(cancelCallback);
-      // Just in case it was already canceled before we set the callback.
-      doCancelIfCancelled();
-    }
-
-    private void doCancelIfCancelled() {
-      if (isCancelled()) {
-        Disposable callback = cancelCallback.getAndSet(null);
-        if (callback != null) {
-          callback.dispose();
-        }
-      }
-    }
-
-    @Override
-    protected void afterDone() {
-      doCancelIfCancelled();
-    }
-
-    // Allow set to be called by other members.
-    @Override
-    protected boolean set(@Nullable T t) {
-      return super.set(t);
-    }
-
-    // Allow setException to be called by other members.
-    @Override
-    protected boolean setException(Throwable throwable) {
-      return super.setException(throwable);
-    }
   }
 }

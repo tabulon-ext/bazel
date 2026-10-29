@@ -16,7 +16,9 @@ package com.google.devtools.build.lib.buildeventservice;
 
 import static com.google.common.truth.Truth.assertThat;
 
+import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.buildeventservice.client.BuildEventServiceGrpcClient;
+import com.google.devtools.build.lib.buildeventservice.client.CommandContext;
 import com.google.devtools.build.v1.PublishBuildEventGrpc;
 import com.google.devtools.build.v1.PublishBuildToolEventStreamRequest;
 import com.google.devtools.build.v1.PublishBuildToolEventStreamResponse;
@@ -44,6 +46,16 @@ import org.junit.runners.JUnit4;
 /** Tests {@link BuildEventServiceGrpcClient}. */
 @RunWith(JUnit4.class)
 public class BuildEventServiceGrpcClientTest {
+
+  private static final CommandContext COMMAND_CONTEXT =
+      CommandContextImpl.builder()
+          .setBuildId(UUID.randomUUID().toString())
+          .setInvocationId(UUID.randomUUID().toString())
+          .setAttemptNumber(1)
+          .setKeywords(ImmutableSet.of())
+          .setProjectId(null)
+          .setCheckPrecedingLifecycleEvents(false)
+          .build();
 
   private static final PublishBuildEventGrpc.PublishBuildEventImplBase NOOP_SERVER =
       new PublishBuildEventGrpc.PublishBuildEventImplBase() {
@@ -121,7 +133,8 @@ public class BuildEventServiceGrpcClientTest {
       ClientInterceptor interceptor = MetadataUtils.newAttachHeadersInterceptor(extraHeaders);
       BuildEventServiceGrpcClient grpcClient =
           new BuildEventServiceGrpcClient(server.getChannel(), null, interceptor);
-      assertThat(grpcClient.openStream(ack -> {}).getStatus().get()).isEqualTo(Status.OK);
+      assertThat(grpcClient.openStream(COMMAND_CONTEXT, ack -> {}).getStatus().get().isOk())
+          .isTrue();
       assertThat(seenHeaders).hasSize(1);
       Metadata headers = seenHeaders.get(0);
       assertThat(headers.get(Metadata.Key.of("metadata-foo", Metadata.ASCII_STRING_MARSHALLER)))
@@ -134,10 +147,11 @@ public class BuildEventServiceGrpcClientTest {
     try (TestServer server = startTestServer(NOOP_SERVER.bindService())) {
       assertThat(
               new BuildEventServiceGrpcClient(server.getChannel(), null, null)
-                  .openStream(ack -> {})
+                  .openStream(COMMAND_CONTEXT, ack -> {})
                   .getStatus()
-                  .get())
-          .isEqualTo(Status.OK);
+                  .get()
+                  .isOk())
+          .isTrue();
     }
   }
 
@@ -155,10 +169,11 @@ public class BuildEventServiceGrpcClientTest {
             }.bindService())) {
       assertThat(
               new BuildEventServiceGrpcClient(server.getChannel(), null, null)
-                  .openStream(ack -> {})
+                  .openStream(COMMAND_CONTEXT, ack -> {})
                   .getStatus()
-                  .get())
-          .isEqualTo(Status.INTERNAL);
+                  .get()
+                  .getErrorMessage())
+          .contains("INTERNAL");
     }
   }
 }

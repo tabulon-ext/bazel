@@ -13,7 +13,12 @@
 // limitations under the License.
 package com.google.devtools.build.lib.bazel.repository.downloader;
 
+import static com.google.devtools.build.lib.util.StringEncoding.unicodeToInternal;
+
+import com.google.common.base.Ascii;
+import com.google.common.base.Preconditions;
 import com.google.common.base.Splitter;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMultimap;
 import com.google.common.collect.ImmutableSet;
 import java.io.BufferedReader;
@@ -25,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 import javax.annotation.Nullable;
 import net.starlark.java.syntax.Location;
 
@@ -45,20 +51,20 @@ import net.starlark.java.syntax.Location;
  * The directives are applied in the order `rewrite, allow, block'. An example config may look like:
  *
  * <pre>
- *     all_blocked_message See mycorp.com/blocked-bazel-fetches for more information.
- *     block mvnrepository.com
- *     block maven-central.storage.googleapis.com
- *     block gitblit.github.io
- *     rewrite repo.maven.apache.org/maven2/(.*) artifacts.mycorp.com/libs-release/$1
+ *     all_blocked_message See example.com/blocked-bazel-fetches for more information.
+ *     block mvnrepository.com.example
+ *     block maven-central.storage.googleapis.com.example
+ *     block gitblit.github.io.example
+ *     rewrite repo.maven.apache.org.example/maven2/(.*) artifacts.example.com/libs-release/$1
  *
- *     block github.com
- *     rewrite github.com/([^/]+)/([^/]+)/releases/download/([^/]+)/(.*) \
- *             artifacts.mycorp.com/github-releases/$1/$2/releases/download/$3/$4
- *     rewrite github.com/([^/]+)/([^/]+)/archive/(.+).(tar.gz|zip) \
- *             artifacts.mycorp.com/api/vcs/downloadRelease/github.com/$1/$2/$3?ext=$4
+ *     block github.com.example
+ *     rewrite github.com.example/([^/]+)/([^/]+)/releases/download/([^/]+)/(.*) \
+ *             artifacts.example.com/github-releases/$1/$2/releases/download/$3/$4
+ *     rewrite github.com.example/([^/]+)/([^/]+)/archive/(.+).(tar.gz|zip) \
+ *             artifacts.example.com/api/vcs/downloadRelease/github.com.example/$1/$2/$3?ext=$4
  * </pre>
  *
- * In addition, you can block all hosts using the @{code *} wildcard.
+ * In addition, you can block all hosts using the {@code *} wildcard.
  *
  * <p>Comments within the config file are allowed, and must be on their own line preceded by a
  * {@code #}.
@@ -79,18 +85,55 @@ class UrlRewriterConfig {
   @Nullable private final String allBlockedMessage;
 
   /**
-   * Constructor to use. The {@code config} will be read to completion.
+   * Constructor for a single file. The {@code config} will be read to completion.
    *
    * @throws UrlRewriterParseException If the file contents was invalid.
    * @throws UncheckedIOException If any processing problems occur.
    */
   public UrlRewriterConfig(String filePathForErrorReporting, Reader config)
       throws UrlRewriterParseException {
+    this(ImmutableList.of(filePathForErrorReporting), ImmutableList.of(config));
+  }
+
+  /**
+   * Constructor for multiple files. The {@code configs} will be read to completion.
+   *
+   * @throws UrlRewriterParseException If the file(s) contents was invalid.
+   * @throws UncheckedIOException If any processing problems occur.
+   */
+  public UrlRewriterConfig(List<String> filePathsForErrorReporting, List<Reader> configs)
+      throws UrlRewriterParseException {
+    Preconditions.checkArgument(
+        filePathsForErrorReporting.size() == configs.size(),
+        "Number of file paths do not match number of readers");
+
     ImmutableSet.Builder<String> allowList = ImmutableSet.builder();
     ImmutableSet.Builder<String> blockList = ImmutableSet.builder();
     ImmutableMultimap.Builder<Pattern, String> rewrites = ImmutableMultimap.builder();
-    String allBlockedMessage = null;
+    StringBuilder allBlockedMessage = new StringBuilder();
 
+    for (int i = 0; i < filePathsForErrorReporting.size(); i++) {
+      String filePathForErrorReporting = filePathsForErrorReporting.get(i);
+      Reader config = configs.get(i);
+      parseConfig(
+          config, filePathForErrorReporting, allowList, blockList, rewrites, allBlockedMessage);
+    }
+
+    this.allowList = allowList.build();
+    this.blockList = blockList.build();
+    this.rewrites = rewrites.build();
+    this.allBlockedMessage =
+        allBlockedMessage.isEmpty() ? null : unicodeToInternal(allBlockedMessage.toString());
+  }
+
+  private static void parseConfig(
+      Reader config,
+      String filePathForErrorReporting,
+      ImmutableSet.Builder<String> allowList,
+      ImmutableSet.Builder<String> blockList,
+      ImmutableMultimap.Builder<Pattern, String> rewrites,
+      StringBuilder allBlockedMessage)
+      throws UrlRewriterParseException {
     try (BufferedReader reader = new BufferedReader(config)) {
       int lineNumber = 1;
       for (String line = reader.readLine(); line != null; line = reader.readLine(), lineNumber++) {
@@ -108,56 +151,65 @@ class UrlRewriterConfig {
         Location location = Location.fromFileLineColumn(filePathForErrorReporting, lineNumber, 0);
 
         switch (parts.get(0)) {
-          case "allow":
+          case "allow" -> {
             if (parts.size() != 2) {
-              throw new UrlRewriterParseException(
+              throw parseException(
                   "Only the host name is allowed after `allow`: " + line, location);
             }
-            allowList.add(parts.get(1));
-            break;
-
-          case "block":
+            allowList.add(Ascii.toLowerCase(parts.get(1)));
+          }
+          case "block" -> {
             if (parts.size() != 2) {
-              throw new UrlRewriterParseException(
+              throw parseException(
                   "Only the host name is allowed after `block`: " + line, location);
             }
-            blockList.add(parts.get(1));
-            break;
-
-          case "rewrite":
+            blockList.add(Ascii.toLowerCase(parts.get(1)));
+          }
+          case "rewrite" -> {
             if (parts.size() != 3) {
-              throw new UrlRewriterParseException(
+              throw parseException(
                   "Only the matching pattern and rewrite pattern is allowed after `rewrite`: "
                       + line,
                   location);
             }
-            rewrites.put(Pattern.compile(parts.get(1)), parts.get(2));
-            break;
-
-          case ALL_BLOCKED_MESSAGE_DIRECTIVE:
-            if (parts.size() == 1) {
-              throw new UrlRewriterParseException(
-                  "all_blocked_message must be followed by a message", location);
+            if (!UrlRewriter.isValidUrlEncodeSyntax(parts.get(2))) {
+              throw parseException(
+                  "Invalid urlencode syntax in `rewrite` replacement: " + parts.get(2), location);
             }
-            if (allBlockedMessage != null) {
-              throw new UrlRewriterParseException(
+            try {
+              rewrites.put(Pattern.compile(parts.get(1)), parts.get(2));
+            } catch (PatternSyntaxException e) {
+              throw parseException(
+                  "Invalid regex in `rewrite`: "
+                      + e.getDescription()
+                      + " at index "
+                      + e.getIndex()
+                      + " in `"
+                      + parts.get(1)
+                      + "`",
+                  location);
+            }
+          }
+          case ALL_BLOCKED_MESSAGE_DIRECTIVE -> {
+            if (parts.size() == 1) {
+              throw parseException("all_blocked_message must be followed by a message", location);
+            }
+            if (!allBlockedMessage.isEmpty()) {
+              throw parseException(
                   "At most one all_blocked_message directive is allowed", location);
             }
-            allBlockedMessage = line.substring(ALL_BLOCKED_MESSAGE_DIRECTIVE.length() + 1);
-            break;
-
-          default:
-            throw new UrlRewriterParseException("Unable to parse: " + line, location);
+            allBlockedMessage.append(line.substring(ALL_BLOCKED_MESSAGE_DIRECTIVE.length() + 1));
+          }
+          default -> throw parseException("Unable to parse: " + line, location);
         }
       }
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
+  }
 
-    this.allowList = allowList.build();
-    this.blockList = blockList.build();
-    this.rewrites = rewrites.build();
-    this.allBlockedMessage = allBlockedMessage;
+  private static UrlRewriterParseException parseException(String message, Location location) {
+    return new UrlRewriterParseException(unicodeToInternal(message), location);
   }
 
   /** Returns all {@code allow} directives. */

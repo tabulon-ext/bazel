@@ -18,11 +18,14 @@ package com.google.devtools.build.lib.bazel.bzlmod;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableTable;
+import com.google.devtools.build.lib.cmdline.RepositoryMapping;
+import com.google.devtools.build.lib.skyframe.RepositoryMappingValue;
 import com.google.devtools.build.skyframe.SkyFunction;
-import com.google.devtools.build.skyframe.SkyFunctionException;
 import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.SkyValue;
+import javax.annotation.Nullable;
 
 /**
  * A simple SkyFunction that takes the information needed by a {@link SingleExtensionEvalFunction}
@@ -40,26 +43,46 @@ import com.google.devtools.build.skyframe.SkyValue;
 public class SingleExtensionUsagesFunction implements SkyFunction {
 
   @Override
-  public SkyValue compute(SkyKey skyKey, Environment env)
-      throws SkyFunctionException, InterruptedException {
-    BazelModuleResolutionValue bazelModuleResolutionValue =
-        (BazelModuleResolutionValue) env.getValue(BazelModuleResolutionValue.KEY);
-    if (bazelModuleResolutionValue == null) {
+  @Nullable
+  public SkyValue compute(SkyKey skyKey, Environment env) throws InterruptedException {
+    BazelDepGraphValue bazelDepGraphValue =
+        (BazelDepGraphValue) env.getValue(BazelDepGraphValue.KEY);
+    if (bazelDepGraphValue == null) {
       return null;
     }
 
     ModuleExtensionId id = (ModuleExtensionId) skyKey.argument();
+    // We never request an extension without usages in Skyframe.
     ImmutableTable<ModuleExtensionId, ModuleKey, ModuleExtensionUsage> usagesTable =
-        bazelModuleResolutionValue.getExtensionUsagesTable();
+        bazelDepGraphValue.getExtensionUsagesTable();
+    var usages = usagesTable.row(id);
+    var canonicalRepoNames = bazelDepGraphValue.getCanonicalRepoNameLookup().inverse();
+    var repoMappingKeys =
+        usages.keySet().stream()
+            .collect(
+                toImmutableMap(
+                    moduleKey -> moduleKey,
+                    moduleKey -> RepositoryMappingValue.key(canonicalRepoNames.get(moduleKey))));
+    var repoMappingValues = env.getValuesAndExceptions(repoMappingKeys.values());
+    var repoMappings =
+        ImmutableMap.<ModuleKey, RepositoryMapping>builderWithExpectedSize(usages.size());
+    for (var entry : repoMappingKeys.entrySet()) {
+      var repoMapping = (RepositoryMappingValue) repoMappingValues.get(entry.getValue());
+      if (repoMapping != null) {
+        repoMappings.put(entry.getKey(), repoMapping.repositoryMapping());
+      }
+    }
+    if (env.valuesMissing()) {
+      return null;
+    }
     return SingleExtensionUsagesValue.create(
-        usagesTable.row(id),
-        bazelModuleResolutionValue.getExtensionUniqueNames().get(id),
+        usages,
+        bazelDepGraphValue.getExtensionUniqueNames().get(id),
         // Filter abridged modules down to only those that actually used this extension.
-        bazelModuleResolutionValue.getAbridgedModules().stream()
-            .filter(module -> usagesTable.contains(id, module.getKey()))
+        bazelDepGraphValue.getAbridgedModules().stream()
+            .filter(module -> usages.containsKey(module.getKey()))
             .collect(toImmutableList()),
-        // TODO(wyv): Maybe cache these mappings?
-        usagesTable.row(id).keySet().stream()
-            .collect(toImmutableMap(key -> key, bazelModuleResolutionValue::getFullRepoMapping)));
+        repoMappings.buildOrThrow(),
+        bazelDepGraphValue.getRepoOverrides().row(id));
   }
 }

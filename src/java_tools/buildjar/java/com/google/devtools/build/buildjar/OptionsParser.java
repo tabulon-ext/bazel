@@ -46,10 +46,14 @@ public final class OptionsParser {
   private final Set<String> directJars = new LinkedHashSet<>();
 
   private String strictJavaDeps;
+  private String unusedDeps;
   private String fixDepsTool;
 
   private String outputDepsProtoFile;
   private final Set<String> depsArtifacts = new LinkedHashSet<>();
+  // Separate from directJars / `--direct_dependencies` because an `export`ed transitive dep is
+  // indistinguishable from a direct dep
+  private final Set<String> targetDeclaredDeps = new LinkedHashSet<>();
 
   /** This modes controls how a probablistic Java classpath reduction is used. */
   public enum ReduceClasspathMode {
@@ -83,7 +87,6 @@ public final class OptionsParser {
 
   private final List<String> processorPath = new ArrayList<>();
   private final List<String> processorNames = new ArrayList<>();
-  private final List<String> builtinProcessorNames = new ArrayList<>();
 
   private String outputJar;
   @Nullable private String nativeHeaderOutput;
@@ -94,8 +97,6 @@ public final class OptionsParser {
 
   private String targetLabel;
   private String injectingRuleKind;
-
-  @Nullable private String profile;
 
   @Nullable private final JavacOptions normalizer;
 
@@ -141,6 +142,9 @@ public final class OptionsParser {
         case "--strict_java_deps":
           strictJavaDeps = getArgument(argQueue, arg);
           break;
+        case "--experimental_check_unused_deps":
+          unusedDeps = getArgument(argQueue, arg);
+          break;
         case "--experimental_fix_deps_tool":
           fixDepsTool = getArgument(argQueue, arg);
           break;
@@ -149,6 +153,9 @@ public final class OptionsParser {
           break;
         case "--deps_artifacts":
           collectFlagArguments(depsArtifacts, argQueue, "--");
+          break;
+        case "--target_declared_deps":
+          collectFlagArguments(targetDeclaredDeps, argQueue, "--");
           break;
         case "--reduce_classpath":
           reduceClasspathMode = ReduceClasspathMode.JAVABUILDER_REDUCED;
@@ -193,9 +200,6 @@ public final class OptionsParser {
         case "--processors":
           collectProcessorArguments(processorNames, argQueue, "-");
           break;
-        case "--builtin_processors":
-          collectProcessorArguments(builtinProcessorNames, argQueue, "-");
-          break;
         case "--output":
           outputJar = getArgument(argQueue, arg);
           break;
@@ -213,9 +217,6 @@ public final class OptionsParser {
           break;
         case "--injecting_rule_kind":
           injectingRuleKind = getArgument(argQueue, arg);
-          break;
-        case "--profile":
-          profile = getArgument(argQueue, arg);
           break;
         default:
           throw new InvalidCommandLineException("unknown option : '" + arg + "'");
@@ -362,6 +363,11 @@ public final class OptionsParser {
     return strictJavaDeps;
   }
 
+  /** Returns the unused dependency checking mode. */
+  public String getUnusedDeps() {
+    return unusedDeps;
+  }
+
   public String getFixDepsTool() {
     return fixDepsTool;
   }
@@ -372,6 +378,11 @@ public final class OptionsParser {
 
   public Set<String> getDepsArtifacts() {
     return depsArtifacts;
+  }
+
+  /** Returns the target labels of declared direct dependencies. */
+  public Set<String> getTargetDeclaredDeps() {
+    return targetDeclaredDeps;
   }
 
   public ReduceClasspathMode reduceClasspathMode() {
@@ -426,10 +437,6 @@ public final class OptionsParser {
     return processorNames;
   }
 
-  public List<String> getBuiltinProcessorNames() {
-    return builtinProcessorNames;
-  }
-
   public String getOutputJar() {
     return outputJar;
   }
@@ -453,9 +460,5 @@ public final class OptionsParser {
 
   public String getInjectingRuleKind() {
     return injectingRuleKind;
-  }
-
-  public String getProfile() {
-    return profile;
   }
 }

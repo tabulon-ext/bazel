@@ -20,10 +20,12 @@
 // topmost header file as it defines types used by later-included headers.
 #include <stdarg.h>  // NOLINT
 #include <stdlib.h>  // NOLINT
+#include <memory>  // NOLINT
+#include <string>  // NOLINT
 
 #include "src/tools/singlejar/input_jar_scan_entries_test.h"
 
-using bazel::tools::cpp::runfiles::Runfiles;
+using rules_cc::cc::runfiles::Runfiles;
 
 class JartoolCreator {
  public:
@@ -35,7 +37,7 @@ class JartoolCreator {
 
   static void TearDownTestCase() {}
 
-  static int Jar(bool compress, const char *output_jar, ...) {
+  static int Jar(bool compress, const char* output_jar, ...) {
     std::string command(jar_path_);
     if (access(output_jar, F_OK) == 0) {
       command += compress ? " -uf " : " -u0f ";
@@ -45,17 +47,17 @@ class JartoolCreator {
     command += output_jar;
     va_list paths;
     va_start(paths, output_jar);
-    char *path;
-    while ((path = va_arg(paths, char *))) {
+    char* path;
+    while ((path = va_arg(paths, char*))) {
       command += ' ';
       command += path;
     }
     return system(command.c_str());
   }
-  static const char *jar_path_;
+  static const char* jar_path_;
 };
 
-const char *JartoolCreator::jar_path_ = nullptr;
+const char* JartoolCreator::jar_path_ = nullptr;
 
 typedef testing::Types<JartoolCreator> Creators;
 INSTANTIATE_TYPED_TEST_SUITE_P(Jartool, InputJarScanEntries, Creators);

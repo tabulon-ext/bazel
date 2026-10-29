@@ -17,7 +17,7 @@ import static com.google.devtools.build.lib.packages.Attribute.attr;
 import static com.google.devtools.build.lib.packages.BuildType.LABEL_LIST;
 import static com.google.devtools.build.lib.packages.Type.BOOLEAN;
 import static com.google.devtools.build.lib.packages.Type.STRING;
-import static com.google.devtools.build.lib.packages.Type.STRING_LIST;
+import static com.google.devtools.build.lib.packages.Types.STRING_LIST;
 
 import com.google.devtools.build.lib.analysis.BaseRuleClasses;
 import com.google.devtools.build.lib.analysis.RuleDefinition;
@@ -39,13 +39,13 @@ public final class ExtraActionRule implements RuleDefinition {
         /*<!-- #BLAZE_RULE(extra_action).ATTRIBUTE(tools) -->
         A list of <code>tool</code> dependencies for this rule.
         <p>
-          See the definition of <a href="../build-ref.html#deps">dependencies</a> for more
+          See the definition of <a href="${link build-ref#deps}">dependencies</a> for more
           information.
         </p>
         <p>
           The build system ensures these prerequisites are built before running the
           <code>extra_action</code> command; they are built using the
-          <a href='${link user-manual#configurations}'><code>host</code>configuration</a>,
+          <a href='${link user-manual#configurations}'><code>exec</code>configuration</a>,
           since they must run as a tool during the build itself. The path of an individual
           <code>tools</code> target <code>//x:y</code> can be obtained using
           <code>$(location //x:y)</code>.
@@ -58,7 +58,7 @@ public final class ExtraActionRule implements RuleDefinition {
         <!-- #END_BLAZE_RULE.ATTRIBUTE -->*/
         .add(
             attr("tools", LABEL_LIST)
-                .cfg(ExecutionTransitionFactory.create())
+                .cfg(ExecutionTransitionFactory.createFactory())
                 .allowedFileTypes()
                 .exec())
         /*<!-- #BLAZE_RULE(extra_action).ATTRIBUTE(out_templates) -->
@@ -135,7 +135,7 @@ public final class ExtraActionRule implements RuleDefinition {
 
 <p>
   <b>WARNING:</b> Extra actions are deprecated. Use
-  <a href="https://docs.bazel.build/versions/main/skylark/aspects.html">aspects</a>
+  <a href="https://bazel.build/rules/aspects">aspects</a>
   instead.
 </p>
 

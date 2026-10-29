@@ -17,10 +17,8 @@ import static com.google.common.collect.ImmutableList.toImmutableList;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.cmdline.Label;
-import com.google.devtools.build.lib.cmdline.LabelSyntaxException;
 import com.google.devtools.build.lib.cmdline.ResolvedTargets;
 import com.google.devtools.build.lib.cmdline.SignedTargetPattern;
 import com.google.devtools.build.lib.cmdline.SignedTargetPattern.Sign;
@@ -171,15 +169,7 @@ public final class TargetPatternValue implements SkyValue {
           }
         }
       } else if (excludeSingleTargets && laterParsedPattern.getType() == Type.SINGLE_TARGET) {
-        try {
-          Label label =
-              Label.parseAbsolute(
-                  laterParsedPattern.getSingleTargetPath(),
-                  /*repositoryMapping=*/ ImmutableMap.of());
-          excludedSingleTargetsBuilder.add(label);
-        } catch (LabelSyntaxException e) {
-          indicesOfNegativePatternsThatNeedToBeIncludedBuilder.add(j);
-        }
+        excludedSingleTargetsBuilder.add(laterParsedPattern.getSingleTargetLabel());
       } else {
         indicesOfNegativePatternsThatNeedToBeIncludedBuilder.add(j);
       }
@@ -208,8 +198,8 @@ public final class TargetPatternValue implements SkyValue {
 
     /**
      * Must be "compatible" with {@link #signedParsedPattern}: if {@link #signedParsedPattern} is a
-     * {@link TargetsBelowDirectory} object, then {@link TargetsBelowDirectory#containedIn} is false
-     * for every element of {@code excludedSubdirectories}.
+     * {@link TargetsBelowDirectory} object, then every element of {@code excludedSubdirectories} is
+     * not an ancestor of or equal to its directory.
      */
     private final ImmutableSet<PathFragment> excludedSubdirectories;
 
@@ -271,10 +261,9 @@ public final class TargetPatternValue implements SkyValue {
 
     @Override
     public boolean equals(Object obj) {
-      if (!(obj instanceof TargetPatternKey)) {
+      if (!(obj instanceof TargetPatternKey other)) {
         return false;
       }
-      TargetPatternKey other = (TargetPatternKey) obj;
 
       return other.signedParsedPattern.equals(this.signedParsedPattern)
           && other.policy.equals(this.policy)

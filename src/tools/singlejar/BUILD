@@ -1,4 +1,9 @@
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_java//java:defs.bzl", "java_library")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//src:release_archive.bzl", "release_archive")
 
 # Description:
@@ -17,6 +22,8 @@ SOURCES = [
     "diag.h",
     "input_jar.cc",
     "input_jar.h",
+    "log4j2_plugin_dat_combiner.cc",
+    "log4j2_plugin_dat_combiner.h",
     "mapped_file.cc",
     "mapped_file.h",
     "mapped_file_posix.inc",
@@ -37,19 +44,23 @@ filegroup(
     name = "embedded_java_tools",
     srcs = SOURCES + [
         "//src/main/cpp/util:embedded_java_tools",
-        "//third_party/zlib:embedded_tools",
         "//src/main/protobuf:desugar_deps_filegroup",
     ],
-    visibility = ["//src:__pkg__"],
+    visibility = [
+        "//src:__pkg__",
+        "//src/tools/one_version:__pkg__",
+    ],
 )
 
 release_archive(
     name = "singlejar_transitive_zip",
     package_dir = "java_tools",
-    visibility = ["//src:__pkg__"],
+    visibility = [
+        "//src:__pkg__",
+        "//src/tools/one_version:__pkg__",
+    ],
     deps = [
         ":singlejar_zip",
-        "//src:zlib_zip",
         "//src/main/cpp/util:cpp_util_with_deps_zip",
         "//src/main/protobuf:desugar_deps_zip",
     ],
@@ -82,9 +93,11 @@ cc_binary(
     linkstatic = 1,
     visibility = ["//visibility:public"],
     deps = [
-        "options",
-        "output_jar",
-        "//third_party/zlib",
+        ":combiners",
+        ":options",
+        ":output_jar",
+        "//src/main/cpp/util:strings",
+        "@zlib",
     ],
 )
 
@@ -101,11 +114,12 @@ cc_binary(
     linkstatic = 1,
     visibility = ["//visibility:public"],
     deps = [
-        "combiners",
-        "desugar_checking",
-        "options",
-        "output_jar",
-        "//third_party/zlib",
+        ":combiners",
+        ":desugar_checking",
+        ":options",
+        ":output_jar",
+        "//src/main/cpp/util:strings",
+        "@zlib",
     ],
 )
 
@@ -126,8 +140,28 @@ cc_test(
         ":combiners",
         ":input_jar",
         ":test_util",
-        "//third_party/zlib",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@zlib",
+    ],
+)
+
+cc_test(
+    name = "log4j2_plugin_dat_combiner_test",
+    srcs = ["log4j2_plugin_dat_combiner_test.cc"],
+    data = [
+        "data/log4j2_malformed_empty_plugin.jar",
+        "data/log4j2_plugins_set_1.jar",
+        "data/log4j2_plugins_set_2.jar",
+        "data/log4j2_plugins_set_result.dat",
+    ],
+    deps = [
+        ":combiners",
+        ":input_jar",
+        ":test_util",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
 )
 
@@ -142,8 +176,9 @@ cc_test(
         ":combiners",
         ":desugar_checking",
         ":input_jar",
-        "//third_party/zlib",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@zlib",
     ],
 )
 
@@ -158,7 +193,10 @@ cc_test(
     deps = [
         ":input_jar",
         ":test_util",
-        "//src/main/cpp/util",
+        "//src/main/cpp/util:filesystem",
+        "//src/main/cpp/util:port",
+        "//src/main/cpp/util:strings",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -175,7 +213,10 @@ cc_test(
     deps = [
         ":input_jar",
         ":test_util",
-        "//src/main/cpp/util",
+        "//src/main/cpp/util:filesystem",
+        "//src/main/cpp/util:port",
+        "//src/main/cpp/util:strings",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -191,13 +232,14 @@ cc_test(
         "//src/conditions:windows": ["-DJAR_TOOL_PATH=\\\"io_bazel/$(JAVABASE)/bin/jar.exe\\\""],
         "//conditions:default": ["-DJAR_TOOL_PATH=\\\"io_bazel/$(JAVABASE)/bin/jar\\\""],
     }),
-    data = ["@bazel_tools//tools/jdk:current_java_runtime"],
+    data = ["@rules_java//toolchains:current_java_runtime"],
     # Timing out, see https://github.com/bazelbuild/bazel/issues/1555
     tags = ["manual"],
-    toolchains = ["@bazel_tools//tools/jdk:current_java_runtime"],
+    toolchains = ["@rules_java//toolchains:current_java_runtime"],
     deps = [
         ":input_jar",
         ":test_util",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -214,6 +256,7 @@ cc_test(
     deps = [
         ":input_jar",
         ":test_util",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -226,20 +269,16 @@ cc_test(
     deps = [
         ":input_jar",
         ":test_util",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],
 )
 
 cc_test(
     name = "options_test",
-    srcs = [
-        "options.h",
-        "options_test.cc",
-    ],
+    srcs = ["options_test.cc"],
     deps = [
         ":options",
-        ":token_stream",
-        "//src/main/cpp/util",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -261,25 +300,30 @@ cc_test(
         "output_jar_simple_test.cc",
     ],
     copts = select({
-        "//src/conditions:windows": ["-DJAR_TOOL_PATH=\\\"io_bazel/$(JAVABASE)/bin/jar.exe\\\""],
-        "//conditions:default": ["-DJAR_TOOL_PATH=\\\"io_bazel/$(JAVABASE)/bin/jar\\\""],
+        "//src/conditions:windows": ["-DJAR_TOOL_PATH=\\\"$(JAVABASE_ROOTPATH)/bin/jar.exe\\\""],
+        "//conditions:default": ["-DJAR_TOOL_PATH=\\\"$(JAVABASE_ROOTPATH)/bin/jar\\\""],
     }),
     data = [
+        "data/log4j2_plugins_set_1.jar",
+        "data/log4j2_plugins_set_2.jar",
+        "data/log4j2_plugins_set_result.dat",
         ":data1",
         ":data2",
         ":stored_jar",
         ":test1",
         ":test2",
-        "@bazel_tools//tools/jdk:current_java_runtime",
+        "@rules_java//toolchains:current_java_runtime",
     ],
-    toolchains = ["@bazel_tools//tools/jdk:current_java_runtime"],
+    toolchains = ["@rules_java//toolchains:current_java_runtime"],
     deps = [
         ":input_jar",
         ":options",
         ":output_jar",
         ":port",
         ":test_util",
-        "//src/main/cpp/util",
+        "//src/main/cpp/util:filesystem",
+        "//src/main/cpp/util:port",
+        "@abseil-cpp//absl/strings",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -292,6 +336,8 @@ cc_test(
     deps = [
         ":test_util",
         ":token_stream",
+        "//src/main/cpp/util:filesystem",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -309,8 +355,9 @@ cc_test(
     deps = [
         ":input_jar",
         ":test_util",
-        "//third_party/zlib",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@zlib",
     ],
 )
 
@@ -322,6 +369,7 @@ cc_test(
         ":zip_headers",
     ],
     deps = [
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -333,8 +381,9 @@ cc_test(
         ":zlib_interface",
     ],
     deps = [
-        "//third_party/zlib",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@zlib",
     ],
 )
 
@@ -346,9 +395,23 @@ sh_test(
         ":singlejar",
         "//src/test/shell:bashunit",
         "@bazel_tools//tools/bash/runfiles",
-        "@bazel_tools//tools/jdk:current_java_runtime",
+        "@rules_java//toolchains:current_java_runtime",
     ],
-    toolchains = ["@bazel_tools//tools/jdk:current_java_runtime"],
+    toolchains = ["@rules_java//toolchains:current_java_runtime"],
+    deps = ["//src/test/shell:bashunit"],
+)
+
+sh_test(
+    name = "zip64_huge_entry_test",
+    srcs = ["zip64_huge_entry_test.sh"],
+    args = ["$(JAVABASE)"],
+    data = [
+        ":singlejar",
+        "//src/test/shell:bashunit",
+        "@bazel_tools//tools/bash/runfiles",
+        "@rules_java//toolchains:current_java_runtime",
+    ],
+    toolchains = ["@rules_java//toolchains:current_java_runtime"],
     deps = ["//src/test/shell:bashunit"],
 )
 
@@ -356,12 +419,16 @@ cc_library(
     name = "combiners",
     srcs = [
         "combiners.cc",
+        "log4j2_plugin_dat_combiner.cc",
         ":transient_bytes",
         ":zip_headers",
     ],
-    hdrs = ["combiners.h"],
+    hdrs = [
+        "combiners.h",
+        "log4j2_plugin_dat_combiner.h",
+    ],
     deps = [
-        "//third_party/zlib",
+        "@zlib",
     ],
 )
 
@@ -397,8 +464,7 @@ cc_library(
     visibility = ["//visibility:private"],
     deps = [
         ":diag",
-        ":port",
-        "//src/main/cpp/util",
+        "//src/main/cpp/util:filesystem",  # buildcleaner: keep for windows
     ],
 )
 
@@ -419,14 +485,12 @@ cc_library(
 
 cc_library(
     name = "options",
-    srcs = [
-        "options.cc",
-        "options.h",
-    ],
+    srcs = ["options.cc"],
     hdrs = ["options.h"],
     deps = [
         ":diag",
         ":token_stream",
+        "@abseil-cpp//absl/container:flat_hash_set",
     ],
 )
 
@@ -445,8 +509,10 @@ cc_library(
         ":mapped_file",
         ":options",
         ":port",
-        "//src/main/cpp/util",
-        "//third_party/zlib",
+        "@abseil-cpp//absl/container:flat_hash_map",
+        "@abseil-cpp//absl/strings",
+        "@re2",
+        "@zlib",
     ],
 )
 
@@ -456,9 +522,11 @@ cc_library(
     srcs = ["test_util.cc"],
     hdrs = ["test_util.h"],
     deps = [
-        "//src/main/cpp/util",
-        "@bazel_tools//tools/cpp/runfiles",
+        "//src/main/cpp/util:filesystem",
+        "//src/main/cpp/util:strings",
+        "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
 )
 
@@ -467,7 +535,9 @@ cc_library(
     hdrs = ["token_stream.h"],
     deps = [
         ":diag",
-        "//src/main/cpp/util",
+        ":mapped_file",
+        "//src/main/cpp/util:filesystem",
+        "@abseil-cpp//absl/container:flat_hash_set",
     ],
 )
 
@@ -535,6 +605,27 @@ genrule(
     ],
     outs = ["stored.jar"],
     cmd = "$(JAVABASE)/bin/jar -0cf \"$@\" $(location :output_jar.cc)",
-    toolchains = ["@bazel_tools//tools/jdk:current_java_runtime"],
-    tools = ["@bazel_tools//tools/jdk:current_java_runtime"],
+    toolchains = ["@rules_java//toolchains:current_java_runtime"],
+    tools = ["@rules_java//toolchains:current_java_runtime"],
+)
+
+build_test(
+    name = "singlejar_unicode_filenames_test",
+    targets = [
+        ":gen_singlejar_unicode_filenames",
+    ],
+)
+
+genrule(
+    name = "gen_singlejar_unicode_filenames",
+    outs = [
+        "unicode_filenames.jar",
+    ],
+    cmd = """
+          touch रैन्डम.txt らんどみ.txt 艾诶艾迪勒开.txt
+          $(location :singlejar) --resources रैन्डम.txt らんどみ.txt 艾诶艾迪勒开.txt --output $@
+          """,
+    tools = [
+        ":singlejar",
+    ],
 )

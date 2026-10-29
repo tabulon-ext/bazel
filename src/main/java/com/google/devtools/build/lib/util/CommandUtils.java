@@ -19,33 +19,33 @@ import com.google.devtools.build.lib.shell.AbnormalTerminationException;
 import com.google.devtools.build.lib.shell.Command;
 import com.google.devtools.build.lib.shell.CommandException;
 import com.google.devtools.build.lib.shell.CommandResult;
+import javax.annotation.Nullable;
 
-/**
- * Utility methods relating to the {@link Command} class.
- */
+/** Utility methods relating to the {@link Command} class. */
 public class CommandUtils {
 
   private CommandUtils() {} // Prevent instantiation.
 
   @VisibleForTesting
+  @Nullable
   static String cwd(Command command) {
     return command.getWorkingDirectory() == null ? null : command.getWorkingDirectory().getPath();
   }
 
   /**
-   * Construct an error message that describes a failed command invocation.
-   * Currently this returns a message of the form "foo failed: error executing
-   * command /dir/foo bar baz: exception message", with the
-   * command's stdout and stderr output appended if available.
+   * Construct an error message that describes a failed command invocation. Currently this returns a
+   * message of the form "foo failed: error executing command /dir/foo bar baz: exception message",
+   * with the command's stdout and stderr output appended if available.
    */
-  public static String describeCommandFailure(boolean verbose, CommandException exception) {
+  public static String describeCommandFailure(
+      boolean verbose, boolean expandParamFiles, CommandException exception) {
     Command command = exception.getCommand();
     String message =
-        CommandFailureUtils.describeCommandFailure(verbose, cwd(command), command)
+        CommandFailureUtils.describeCommandFailure(verbose, expandParamFiles, cwd(command), command)
             + ": "
             + exception.getMessage();
-    if (exception instanceof AbnormalTerminationException) {
-      CommandResult result = ((AbnormalTerminationException) exception).getResult();
+    if (exception instanceof AbnormalTerminationException abnormalTerminationException) {
+      CommandResult result = abnormalTerminationException.getResult();
       try {
         return message + "\n"
             + new String(result.getStdout())

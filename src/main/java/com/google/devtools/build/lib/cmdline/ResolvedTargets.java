@@ -15,7 +15,7 @@ package com.google.devtools.build.lib.cmdline;
 
 import com.google.common.base.Predicate;
 import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Sets;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.Set;
@@ -82,37 +82,23 @@ public final class ResolvedTargets<T> {
     return filteredTargets;
   }
 
-  /**
-   * Returns a builder using concurrent sets, as long as you don't call filter.
-   */
-  public static <T> ResolvedTargets.Builder<T> concurrentBuilder() {
-    return new ResolvedTargets.Builder<>(
-        Sets.<T>newConcurrentHashSet(),
-        Sets.<T>newConcurrentHashSet());
-  }
-
   public static <T> ResolvedTargets.Builder<T> builder() {
     return new ResolvedTargets.Builder<>();
   }
 
+  /** A builder for {@link ResolvedTargets}. */
   public static final class Builder<T> {
-    private Set<T> targets;
-    private Set<T> filteredTargets;
+    private Set<T> targets = new LinkedHashSet<>();
+    private final Set<T> filteredTargets = new LinkedHashSet<>();
     private volatile boolean hasError = false;
 
-    private Builder() {
-      this(new LinkedHashSet<>(), new LinkedHashSet<>());
-    }
-
-    private Builder(Set<T> targets, Set<T> filteredTargets) {
-      this.targets = targets;
-      this.filteredTargets = filteredTargets;
-    }
+    private Builder() {}
 
     public ResolvedTargets<T> build() {
       return new ResolvedTargets<>(targets, filteredTargets, hasError);
     }
 
+    @CanIgnoreReturnValue
     public Builder<T> merge(ResolvedTargets<T> other) {
       removeAll(other.filteredTargets);
       addAll(other.targets);
@@ -122,12 +108,14 @@ public final class ResolvedTargets<T> {
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder<T> add(T target) {
       targets.add(target);
       filteredTargets.remove(target);
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder<T> addAll(Collection<T> targets) {
       this.targets.addAll(targets);
       this.filteredTargets.removeAll(targets);
@@ -139,15 +127,17 @@ public final class ResolvedTargets<T> {
       filteredTargets.add(target);
     }
 
+    @CanIgnoreReturnValue
     public Builder<T> removeAll(Collection<T> targets) {
       this.filteredTargets.addAll(targets);
       this.targets.removeAll(targets);
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder<T> filter(Predicate<T> predicate) {
       Set<T> oldTargets = targets;
-      targets = Sets.newLinkedHashSet();
+      targets = new LinkedHashSet<>();
       for (T target : oldTargets) {
         if (predicate.apply(target)) {
           add(target);
@@ -158,11 +148,13 @@ public final class ResolvedTargets<T> {
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder<T> setError() {
       this.hasError = true;
       return this;
     }
 
+    @CanIgnoreReturnValue
     public Builder<T> mergeError(boolean hasError) {
       this.hasError |= hasError;
       return this;

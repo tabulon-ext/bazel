@@ -24,7 +24,6 @@ import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.collect.nestedset.NestedSet;
 import com.google.devtools.build.lib.packages.PackageSpecification.PackageGroupContents;
 import com.google.devtools.build.lib.packages.Target;
-import com.google.devtools.build.lib.skyframe.BuildConfigurationKey;
 import com.google.devtools.build.lib.skyframe.ConfiguredTargetAndData;
 import java.util.List;
 import java.util.Optional;
@@ -33,8 +32,8 @@ import javax.annotation.Nullable;
 
 /**
  * A helper class for building {@link ConfiguredTarget} instances, in particular for non-rule ones.
- * For {@link com.google.devtools.build.lib.analysis.configuredtargets.RuleConfiguredTarget}
- * instances, use {@link RuleContext} instead, which is a subclass of this class.
+ * For {@code com.google.devtools.build.lib.analysis.configuredtargets.RuleConfiguredTarget}
+ * instances, use {@code RuleContext} instead, which is a subclass of this class.
  *
  * <p>The class is intended to be sub-classed by RuleContext, in order to share the code. However,
  * it's not intended for sub-classing beyond that, and the constructor is intentionally package
@@ -49,11 +48,14 @@ public class TargetContext {
   /**
    * This only contains prerequisites that are not declared in rule attributes, with the exception
    * of visibility (i.e., visibility is represented here, even though it is a rule attribute in case
-   * of a rule). Rule attributes are handled by the {@link RuleContext} subclass.
+   * of a rule). Rule attributes are handled by the {@code RuleContext} subclass.
    */
   private final ListMultimap<Label, ConfiguredTargetAndData> directPrerequisites;
 
   private final NestedSet<PackageGroupContents> visibility;
+
+  @Nullable
+  private final TransitiveVisibilityProvider.Requirement transitiveVisibilityImposedByThisPackage;
 
   /**
    * The constructor is intentionally package private.
@@ -65,13 +67,15 @@ public class TargetContext {
       Target target,
       BuildConfigurationValue configuration,
       Set<ConfiguredTargetAndData> directPrerequisites,
-      NestedSet<PackageGroupContents> visibility) {
+      NestedSet<PackageGroupContents> visibility,
+      @Nullable TransitiveVisibilityProvider.Requirement transitiveVisibility) {
     this.env = env;
     this.target = target;
     this.configuration = configuration;
     this.directPrerequisites =
-        Multimaps.index(directPrerequisites, prereq -> prereq.getTarget().getLabel());
+        Multimaps.index(directPrerequisites, ConfiguredTargetAndData::getTargetLabel);
     this.visibility = visibility;
+    this.transitiveVisibilityImposedByThisPackage = transitiveVisibility;
   }
 
   public AnalysisEnvironment getAnalysisEnvironment() {
@@ -90,6 +94,11 @@ public class TargetContext {
     return target.getLabel();
   }
 
+  public Label.PackageContext getPackageContext() {
+    return Label.PackageContext.of(
+        getLabel().getPackageIdentifier(), target.getPackageMetadata().repositoryMapping());
+  }
+
   /**
    * Returns the configuration for this target. This may return null if the target is supposed to be
    * configuration-independent (like an input file, or a visibility rule). However, this is
@@ -100,12 +109,13 @@ public class TargetContext {
     return configuration;
   }
 
-  public BuildConfigurationKey getConfigurationKey() {
-    return configuration.getKey();
-  }
-
   public NestedSet<PackageGroupContents> getVisibility() {
     return visibility;
+  }
+
+  @Nullable
+  public TransitiveVisibilityProvider.Requirement getTransitiveVisibilityImposedByThisPackage() {
+    return transitiveVisibilityImposedByThisPackage;
   }
 
   /**

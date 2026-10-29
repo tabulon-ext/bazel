@@ -13,13 +13,11 @@
 // limitations under the License.
 package com.google.devtools.build.lib.skyframe;
 
-import com.google.common.base.Predicates;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
-import com.google.common.collect.Maps;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
+import com.google.devtools.build.lib.cmdline.IgnoredSubdirectories;
 import com.google.devtools.build.lib.cmdline.PackageIdentifier;
 import com.google.devtools.build.lib.cmdline.RepositoryName;
 import com.google.devtools.build.lib.events.Event;
@@ -29,6 +27,7 @@ import com.google.devtools.build.lib.vfs.RootedPath;
 import com.google.devtools.build.skyframe.SkyFunction.Environment;
 import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.SkyValue;
+import com.google.devtools.build.skyframe.SkyframeLookupResult;
 import com.google.errorprone.annotations.ForOverride;
 import java.util.Map;
 import javax.annotation.Nullable;
@@ -86,7 +85,7 @@ public abstract class RecursiveDirectoryTraversalFunction<
   protected abstract SkyKey getSkyKeyForSubdirectory(
       RepositoryName repository,
       RootedPath subdirectory,
-      ImmutableSet<PathFragment> excludedSubdirectoriesBeneathSubdirectory);
+      IgnoredSubdirectories excludedSubdirectoriesBeneathSubdirectory);
 
   /**
    * Called by {@link #visitDirectory} to compute the {@code TReturn} value it returns, as a
@@ -146,7 +145,7 @@ public abstract class RecursiveDirectoryTraversalFunction<
     Iterable<SkyKey> childDeps = processPackageDirectoryResult.getChildDeps();
     ConsumerT consumer = getInitialConsumer();
 
-    Map<SkyKey, SkyValue> subdirectorySkyValuesFromDeps;
+    SkyframeLookupResult dependentSkyValues;
     if (processPackageDirectoryResult.packageExists()) {
       PathFragment rootRelativePath = recursivePkgKey.getRootedPath().getRootRelativePath();
       SkyKey packageErrorMessageKey =
@@ -155,13 +154,17 @@ public abstract class RecursiveDirectoryTraversalFunction<
       // In a no-keep-going build during error bubbling, PackageErrorMessageFunction may throw a
       // NoSuchPackageException. Since we don't catch such an exception here, this SkyFunction will
       // return immediately with a missing value, and the NoSuchPackageException will propagate up.
-      Map<SkyKey, SkyValue> dependentSkyValues =
-          env.getValues(Iterables.concat(childDeps, ImmutableList.of(packageErrorMessageKey)));
+      dependentSkyValues =
+          env.getValuesAndExceptions(
+              Iterables.concat(ImmutableList.of(packageErrorMessageKey), childDeps));
       if (env.valuesMissing()) {
         return null;
       }
       PackageErrorMessageValue pkgErrorMessageValue =
           (PackageErrorMessageValue) dependentSkyValues.get(packageErrorMessageKey);
+      if (pkgErrorMessageValue == null) {
+        return null;
+      }
       switch (pkgErrorMessageValue.getResult()) {
         case NO_ERROR:
           consumer.notePackage(rootRelativePath);
@@ -181,32 +184,25 @@ public abstract class RecursiveDirectoryTraversalFunction<
         default:
           throw new IllegalStateException(pkgErrorMessageValue.getResult().toString());
       }
-      subdirectorySkyValuesFromDeps =
-          ImmutableMap.copyOf(
-              Maps.filterKeys(
-                  dependentSkyValues, Predicates.not(Predicates.equalTo(packageErrorMessageKey))));
     } else {
-      subdirectorySkyValuesFromDeps = env.getValues(childDeps);
+      dependentSkyValues = env.getValuesAndExceptions(childDeps);
+      if (env.valuesMissing()) {
+        return null;
+      }
     }
-    if (env.valuesMissing()) {
-      return null;
+    ImmutableMap.Builder<SkyKey, SkyValue> subdirectorySkyValuesFromDeps =
+        ImmutableMap.builderWithExpectedSize(Iterables.size(childDeps));
+    for (SkyKey skyKey : childDeps) {
+      SkyValue skyValue = dependentSkyValues.get(skyKey);
+      if (skyValue == null) {
+        return null;
+      }
+      subdirectorySkyValuesFromDeps.put(skyKey, skyValue);
     }
-    return aggregateWithSubdirectorySkyValues(
-        consumer,
-        union(
-            subdirectorySkyValuesFromDeps,
-            processPackageDirectoryResult.getAdditionalValuesToAggregate()));
-  }
 
-  private static Map<SkyKey, SkyValue> union(
-      Map<SkyKey, SkyValue> subdirectorySkyValuesFromDeps,
-      Map<SkyKey, SkyValue> additionalValuesToAggregate) {
-    if (additionalValuesToAggregate.isEmpty()) {
-      return subdirectorySkyValuesFromDeps;
-    }
-    return ImmutableMap.<SkyKey, SkyValue>builder()
-        .putAll(subdirectorySkyValuesFromDeps)
-        .putAll(additionalValuesToAggregate)
-        .buildOrThrow();
+    subdirectorySkyValuesFromDeps.putAll(
+        processPackageDirectoryResult.getAdditionalValuesToAggregate());
+    return aggregateWithSubdirectorySkyValues(
+        consumer, subdirectorySkyValuesFromDeps.buildOrThrow());
   }
 }

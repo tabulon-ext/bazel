@@ -13,10 +13,11 @@
 // limitations under the License.
 package com.google.devtools.build.lib.rules.core;
 
-import com.google.common.collect.ImmutableList;
 import com.google.devtools.build.lib.analysis.BaseRuleClasses;
 import com.google.devtools.build.lib.analysis.ConfiguredRuleClassProvider;
 import com.google.devtools.build.lib.analysis.ConfiguredRuleClassProvider.RuleSet;
+import com.google.devtools.build.lib.analysis.constraints.RuleContextConstraintSemantics;
+import com.google.devtools.build.lib.analysis.test.CoverageConfiguration;
 import com.google.devtools.build.lib.analysis.test.TestConfiguration;
 import com.google.devtools.build.lib.analysis.test.TestTrimmingTransitionFactory;
 
@@ -30,20 +31,15 @@ public final class CoreRules implements RuleSet {
 
   @Override
   public void init(ConfiguredRuleClassProvider.Builder builder) {
+    builder.setConstraintSemantics(new RuleContextConstraintSemantics());
     builder.setShouldInvalidateCacheForOptionDiff(
         TestConfiguration.SHOULD_INVALIDATE_FOR_OPTION_DIFF);
     builder.addConfigurationFragment(TestConfiguration.class);
+    builder.addConfigurationFragment(CoverageConfiguration.class);
     builder.addTrimmingTransitionFactory(new TestTrimmingTransitionFactory());
     builder.addRuleDefinition(new BaseRuleClasses.NativeBuildRule());
     builder.addRuleDefinition(new BaseRuleClasses.NativeActionCreatingRule());
     builder.addRuleDefinition(new BaseRuleClasses.MakeVariableExpandingRule());
-    builder.addRuleDefinition(new BaseRuleClasses.BinaryBaseRule());
-    builder.addRuleDefinition(new BaseRuleClasses.TestBaseRule());
     builder.addNativeAspectClass(new ValidateTarget()); // internally used aspect
-  }
-
-  @Override
-  public ImmutableList<RuleSet> requires() {
-    return ImmutableList.of();
   }
 }

@@ -1,20 +1,13 @@
-load("//tools/distributions:distribution_rules.bzl", "distrib_java_import")
+package(default_visibility = ["//visibility:public"])
 
-licenses(["notice"])  # Apache License 2.0
+licenses(["notice"])
 
-exports_files(["LICENSE"])
-
-package(
-    default_visibility = ["//visibility:public"],
+alias(
+    name = "javapoet",
+    actual = "@maven//:com_squareup_javapoet",
 )
 
 filegroup(
     name = "srcs",
     srcs = glob(["**"]),
-)
-
-distrib_java_import(
-    name = "javapoet",
-    enable_distributions = ["debian"],
-    jars = ["javapoet-1.8.0.jar"],
 )

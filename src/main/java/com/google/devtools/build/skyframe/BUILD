@@ -1,5 +1,6 @@
+load("@com_google_protobuf//bazel:java_proto_library.bzl", "java_proto_library")
+load("@com_google_protobuf//bazel:proto_library.bzl", "proto_library")
 load("@rules_java//java:defs.bzl", "java_library")
-load("@rules_proto//proto:defs.bzl", "proto_library")
 load("//tools/build_rules:utilities.bzl", "java_library_srcs")
 
 # Description:
@@ -11,9 +12,20 @@ package(
 SKYFRAME_OBJECT_SRCS = [
     "AbstractSkyKey.java",
     "FunctionHermeticity.java",
+    "GroupedDeps.java",
+    "IntVersion.java",
+    "NotComparableSkyValue.java",
+    "SkyframeLookupResult.java",
+    "SkyFunction.java",
+    "SkyFunctionException.java",
     "SkyFunctionName.java",
     "SkyKey.java",
     "SkyValue.java",
+]
+
+VERSION_SRCS = [
+    "NodeVersion.java",
+    "NodeVersionGetter.java",
     "Version.java",
 ]
 
@@ -22,8 +34,27 @@ java_library(
     srcs = SKYFRAME_OBJECT_SRCS,
     visibility = ["//visibility:public"],
     deps = [
+        ":version",
+        "//src/main/java/com/google/devtools/build/lib/bugreport",
+        "//src/main/java/com/google/devtools/build/lib/collect/compacthashset",
         "//src/main/java/com/google/devtools/build/lib/concurrent",
+        "//src/main/java/com/google/devtools/build/lib/concurrent:thread_safety",
+        "//src/main/java/com/google/devtools/build/lib/events",
+        "//src/main/java/com/google/devtools/build/lib/skyframe/serialization/autocodec:serialization-constant",
+        "//src/main/java/com/google/devtools/build/lib/util:TestType",
+        "//third_party:auto_value",
+        "//third_party:checker_framework_annotations",
         "//third_party:guava",
+    ],
+)
+
+java_library(
+    name = "version",
+    srcs = VERSION_SRCS,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/main/java/com/google/devtools/build/lib/skybridge:skybridge_interface",
+        "//third_party:auto_value",
     ],
 )
 
@@ -31,25 +62,35 @@ java_library(
     name = "skyframe",
     srcs = glob(
         ["**/*.java"],
-        exclude = SKYFRAME_OBJECT_SRCS + ["CPUHeavySkyKey.java"],
+        exclude = SKYFRAME_OBJECT_SRCS + VERSION_SRCS + ["CPUHeavySkyKey.java"],
     ),
     deps = [
         ":cpu_heavy_skykey",
         ":graph_inconsistency_java_proto",
         ":skyframe-objects",
+        ":version",
         "//src/main/java/com/google/devtools/build/lib/bugreport",
         "//src/main/java/com/google/devtools/build/lib/clock",  # keep
+        "//src/main/java/com/google/devtools/build/lib/cmdline",
         "//src/main/java/com/google/devtools/build/lib/collect/compacthashmap",
         "//src/main/java/com/google/devtools/build/lib/collect/compacthashset",
         "//src/main/java/com/google/devtools/build/lib/collect/nestedset",
         "//src/main/java/com/google/devtools/build/lib/concurrent",
+        "//src/main/java/com/google/devtools/build/lib/concurrent:thread_safety",
         "//src/main/java/com/google/devtools/build/lib/events",
+        "//src/main/java/com/google/devtools/build/lib/packages",
+        "//src/main/java/com/google/devtools/build/lib/packages:package_piece_identifier",
         "//src/main/java/com/google/devtools/build/lib/profiler",
+        "//src/main/java/com/google/devtools/build/lib/profiler:auto_profiler",
         "//src/main/java/com/google/devtools/build/lib/profiler:google-auto-profiler-utils",
+        "//src/main/java/com/google/devtools/build/lib/skyframe:package_value",
+        "//src/main/java/com/google/devtools/build/lib/skyframe:sky_functions",
+        "//src/main/java/com/google/devtools/build/lib/skyframe/serialization:deserialized-sky-value",
         "//src/main/java/com/google/devtools/build/lib/skyframe/serialization/autocodec",
         "//src/main/java/com/google/devtools/build/lib/skyframe/serialization/autocodec:serialization-constant",
         "//src/main/java/com/google/devtools/build/lib/supplier",
         "//src/main/java/com/google/devtools/build/lib/util",
+        "//src/main/java/com/google/devtools/build/lib/util:TestType",
         "//src/main/java/com/google/devtools/build/lib/util:abrupt_exit_exception",
         "//src/main/java/com/google/devtools/build/lib/util:string",
         "//src/main/java/com/google/devtools/common/options",
@@ -65,7 +106,9 @@ java_library(
     name = "skyframe_graph_stats_event",
     srcs = ["SkyframeGraphStatsEvent.java"],
     deps = [
+        ":skyframe-objects",
         "//src/main/java/com/google/devtools/build/lib/events",
+        "//third_party:guava",
     ],
 )
 
@@ -79,6 +122,13 @@ java_library(
 java_library(
     name = "execution_phase_skykey",
     srcs = ["ExecutionPhaseSkyKey.java"],
+    visibility = ["//visibility:public"],
+    deps = [":skyframe-objects"],
+)
+
+java_library(
+    name = "stallable_skykey",
+    srcs = ["StallableSkykey.java"],
     visibility = ["//visibility:public"],
     deps = [":skyframe-objects"],
 )

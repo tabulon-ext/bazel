@@ -1,6 +1,9 @@
 load("@rules_java//java:defs.bzl", "java_library")
 
-package(default_visibility = ["//visibility:public"])
+package(
+    default_applicable_licenses = ["//:license"],
+    default_visibility = ["//visibility:public"],
+)
 
 java_library(
     name = "statistics",
@@ -9,9 +12,9 @@ java_library(
         "--add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED",
     ],
     deps = [
-        "//third_party:auto_value",
-        "//third_party:caffeine",
-        "//third_party:guava",
+        "//third_party/java/auto:auto_value",
+        "//third_party/java/caffeine",
+        "//third_party/java/guava:collect",
     ],
 )
 
@@ -20,5 +23,4 @@ filegroup(
     srcs = glob(["**/*.java"]) + [
         "BUILD",
     ],
-    visibility = ["//src:__subpackages__"],
 )

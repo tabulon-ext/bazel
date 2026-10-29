@@ -28,6 +28,7 @@ import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.TooLongFrameException;
 import io.netty.handler.codec.http.DefaultHttpContent;
 import io.netty.handler.codec.http.DefaultHttpResponse;
 import io.netty.handler.codec.http.DefaultLastHttpContent;
@@ -161,5 +162,74 @@ public class HttpDownloadHandlerTest extends AbstractHttpHandlerTest {
     // The caller is responsible for closing the stream.
     verify(out, never()).close();
     assertThat(ch.isOpen()).isFalse();
+  }
+
+  /** Test that the handler correctly supports downloads at an offset, e.g. on retry. */
+  @Test
+  public void downloadAtOffsetShouldWork() throws IOException {
+    EmbeddedChannel ch = new EmbeddedChannel(new HttpDownloadHandler(null, ImmutableList.of()));
+    ByteArrayOutputStream out = Mockito.spy(new ByteArrayOutputStream());
+    DownloadCommand cmd = new DownloadCommand(CACHE_URI, true, DIGEST, out, 2);
+    ChannelPromise writePromise = ch.newPromise();
+    ch.writeOneOutbound(cmd, writePromise);
+
+    HttpResponse response = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
+    response.headers().set(HttpHeaders.CONTENT_LENGTH, 5);
+    response.headers().set(HttpHeaders.CONNECTION, HttpHeaderValues.KEEP_ALIVE);
+    ch.writeInbound(response);
+    ByteBuf content = Unpooled.buffer();
+    content.writeBytes(new byte[] {1, 2, 3, 4, 5});
+    ch.writeInbound(new DefaultLastHttpContent(content));
+
+    assertThat(writePromise.isDone()).isTrue();
+    assertThat(out.toByteArray()).isEqualTo(new byte[] {3, 4, 5});
+    verify(out, never()).close();
+    assertThat(ch.isActive()).isTrue();
+  }
+
+  /** Test that the handler correctly supports chunked downloads at an offset, e.g. on retry. */
+  @Test
+  public void chunkedDownloadAtOffsetShouldWork() throws IOException {
+    EmbeddedChannel ch = new EmbeddedChannel(new HttpDownloadHandler(null, ImmutableList.of()));
+    ByteArrayOutputStream out = Mockito.spy(new ByteArrayOutputStream());
+    DownloadCommand cmd = new DownloadCommand(CACHE_URI, true, DIGEST, out, 3);
+    ChannelPromise writePromise = ch.newPromise();
+    ch.writeOneOutbound(cmd, writePromise);
+
+    HttpResponse response = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
+    response.headers().set(HttpHeaders.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
+    response.headers().set(HttpHeaders.CONNECTION, HttpHeaderValues.KEEP_ALIVE);
+    ch.writeInbound(response);
+    ByteBuf content1 = Unpooled.buffer();
+    content1.writeBytes(new byte[] {1, 2});
+    ch.writeInbound(new DefaultHttpContent(content1));
+    ByteBuf content2 = Unpooled.buffer();
+    content2.writeBytes(new byte[] {3, 4});
+    ch.writeInbound(new DefaultHttpContent(content2));
+    ByteBuf content3 = Unpooled.buffer();
+    content3.writeBytes(new byte[] {5});
+    ch.writeInbound(new DefaultLastHttpContent(content3));
+
+    assertThat(writePromise.isDone()).isTrue();
+    assertThat(out.toByteArray()).isEqualTo(new byte[] {4, 5});
+    verify(out, never()).close();
+    assertThat(ch.isActive()).isTrue();
+  }
+
+  @Test
+  public void tooLongFrameExceptionHasCleanMessage() throws Exception {
+    URI uri = new URI("http://does.not.exist/foo");
+    EmbeddedChannel ch = new EmbeddedChannel(new HttpDownloadHandler(null, ImmutableList.of()));
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    DownloadCommand cmd = new DownloadCommand(uri, true, DIGEST, out);
+    ChannelPromise writePromise = ch.newPromise();
+    ch.writeOneOutbound(cmd, writePromise);
+
+    ch.pipeline().fireExceptionCaught(new TooLongFrameException("too long"));
+
+    assertThat(writePromise.isDone()).isTrue();
+    assertThat(writePromise.cause()).isInstanceOf(IOException.class);
+    assertThat(writePromise.cause()).hasMessageThat().isEqualTo("HTTP response too large");
+    assertThat(writePromise.cause()).hasCauseThat().isInstanceOf(TooLongFrameException.class);
   }
 }

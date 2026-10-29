@@ -15,18 +15,20 @@
 package com.google.devtools.build.lib.dynamic;
 
 import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.flogger.GoogleLogger;
-import com.google.common.io.Files;
 import com.google.common.util.concurrent.ListeningExecutorService;
 import com.google.common.util.concurrent.SettableFuture;
 import com.google.devtools.build.lib.actions.ActionExecutionContext;
 import com.google.devtools.build.lib.actions.DynamicStrategyRegistry.DynamicMode;
 import com.google.devtools.build.lib.actions.ExecException;
+import com.google.devtools.build.lib.actions.LostInputsExecException;
 import com.google.devtools.build.lib.actions.Spawn;
 import com.google.devtools.build.lib.actions.SpawnResult;
 import com.google.devtools.build.lib.util.io.FileOutErr;
+import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.Path;
 import java.io.IOException;
 import java.util.concurrent.Callable;
@@ -48,8 +50,10 @@ abstract class Branch implements Callable<ImmutableList<SpawnResult>> {
    * #callImpl(ActionExecutionContext)} yet.
    */
   protected final AtomicBoolean starting = new AtomicBoolean(true);
+
   /** The {@link Spawn} this branch is running. */
   protected final Spawn spawn;
+
   /**
    * The {@link SettableFuture} with the results from running the spawn. Must not be null if
    * execution succeeded.
@@ -61,6 +65,7 @@ abstract class Branch implements Callable<ImmutableList<SpawnResult>> {
    * This object is shared between the local and remote branch of an action.
    */
   protected final AtomicReference<DynamicMode> strategyThatCancelled;
+
   /**
    * Semaphore that indicates whether this branch is done, i.e. either completed or cancelled. This
    * is needed to wait for the branch to finish its own cleanup (e.g. terminating subprocesses) once
@@ -70,6 +75,8 @@ abstract class Branch implements Callable<ImmutableList<SpawnResult>> {
 
   protected final DynamicExecutionOptions options;
   protected final ActionExecutionContext context;
+
+  protected Branch otherBranch;
 
   /**
    * Creates a new branch of dynamic execution.
@@ -130,6 +137,46 @@ abstract class Branch implements Callable<ImmutableList<SpawnResult>> {
     future.setFuture(executor.submit(this));
   }
 
+  /** Sets up the {@link Future} used in the current branch to know what other branch to cancel. */
+  protected void prepareFuture(Branch otherBranch) {
+    this.otherBranch = otherBranch;
+    future.addListener(
+        () -> {
+          if (starting.compareAndSet(true, false)) {
+            // If the current branch got cancelled before even starting, we release its semaphore
+            // for it.
+            done.release();
+          }
+          // If the current branch succeeds, there is no need to keep the other branch running.
+          // If the current branch fails, cancel the other branch as well. However, that one may
+          // in turn cancel us, thus causing an interruption. Don't consider that a failure as
+          // we otherwise risk canceling both branches.
+          var state = future.state();
+          if ((state == Future.State.SUCCESS
+                  && (getMode() == DynamicMode.REMOTE || options.getCancelRemoteBranchOnLocalWin()))
+              || (state == Future.State.FAILED
+                  && !(future.exceptionNow() instanceof InterruptedException)
+                  // An input lost while setting up the local branch may not be needed by the remote
+                  // one at all, e.g. for a remote cache hit, so that one is left to finish.
+                  && !(getMode() == DynamicMode.LOCAL
+                      && future.exceptionNow() instanceof LostInputsExecException))) {
+            otherBranch.cancel();
+          }
+          if (options.getDebugSpawnScheduler()) {
+            logger.atInfo().log(
+                "In listener callback, the future of the remote branch is %s",
+                future.state().name());
+            try {
+              future.get();
+            } catch (InterruptedException | ExecutionException e) {
+              logger.atInfo().withCause(e).log(
+                  "The future of the remote branch failed with an exception.");
+            }
+          }
+        },
+        directExecutor());
+  }
+
   /**
    * Moves a set of stdout/stderr files over another one. Errors during the move are logged and
    * swallowed.
@@ -140,10 +187,10 @@ abstract class Branch implements Callable<ImmutableList<SpawnResult>> {
   private static void moveFileOutErr(FileOutErr from, FileOutErr to) {
     try {
       if (from.getOutputPath().exists()) {
-        Files.move(from.getOutputPath().getPathFile(), to.getOutputPath().getPathFile());
+        FileSystemUtils.moveFile(from.getOutputPath(), to.getOutputPath());
       }
       if (from.getErrorPath().exists()) {
-        Files.move(from.getErrorPath().getPathFile(), to.getErrorPath().getPathFile());
+        FileSystemUtils.moveFile(from.getErrorPath(), to.getErrorPath());
       }
     } catch (IOException e) {
       logger.atWarning().withCause(e).log("Could not move action logs from execution");
@@ -196,7 +243,9 @@ abstract class Branch implements Callable<ImmutableList<SpawnResult>> {
       }
     }
 
-    moveFileOutErr(fileOutErr, context.getFileOutErr());
+    if (strategyThatCancelled.get() == null || strategyThatCancelled.get() == getMode()) {
+      moveFileOutErr(fileOutErr, context.getFileOutErr());
+    }
 
     if (exception != null) {
       throw exception;

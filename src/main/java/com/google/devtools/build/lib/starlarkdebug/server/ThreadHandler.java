@@ -15,9 +15,11 @@
 package com.google.devtools.build.lib.starlarkdebug.server;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.starlarkdebugging.StarlarkDebuggingProtos;
 import com.google.devtools.build.lib.starlarkdebugging.StarlarkDebuggingProtos.Breakpoint;
 import com.google.devtools.build.lib.starlarkdebugging.StarlarkDebuggingProtos.Error;
@@ -36,7 +38,6 @@ import net.starlark.java.eval.EvalException;
 import net.starlark.java.eval.Module;
 import net.starlark.java.eval.Starlark;
 import net.starlark.java.eval.StarlarkThread;
-import net.starlark.java.syntax.FileOptions;
 import net.starlark.java.syntax.Location;
 import net.starlark.java.syntax.ParserInput;
 import net.starlark.java.syntax.SyntaxError;
@@ -150,6 +151,12 @@ final class ThreadHandler {
       map.put(location, breakpoint);
     }
     this.breakpoints = ImmutableMap.copyOf(map);
+  }
+
+  ImmutableSet<String> getBreakpointFilePaths() {
+    return breakpoints.keySet().stream()
+        .map(StarlarkDebuggingProtos.Location::getPath)
+        .collect(toImmutableSet());
   }
 
   /**
@@ -306,7 +313,7 @@ final class ThreadHandler {
       ParserInput input = ParserInput.fromString(content, "<debug eval>");
       // TODO(adonovan): the module or call frame should be a parameter to doEvaluate.
       Module module = Module.ofInnermostEnclosingStarlarkFunction(thread);
-      return Starlark.execFile(input, FileOptions.DEFAULT, module, thread);
+      return Starlark.execFile(input, module, thread);
     } finally {
       servicingEvalRequest.set(false);
     }

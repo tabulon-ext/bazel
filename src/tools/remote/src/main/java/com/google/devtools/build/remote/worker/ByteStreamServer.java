@@ -14,7 +14,7 @@
 
 package com.google.devtools.build.remote.worker;
 
-import static com.google.devtools.build.lib.remote.util.Utils.getFromFuture;
+import static com.google.devtools.build.lib.remote.util.Futures.getFromFuture;
 
 import build.bazel.remote.execution.v2.Digest;
 import build.bazel.remote.execution.v2.RequestMetadata;
@@ -34,6 +34,7 @@ import com.google.devtools.build.lib.vfs.Path;
 import io.grpc.Status;
 import io.grpc.protobuf.StatusProto;
 import io.grpc.stub.StreamObserver;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.UUID;
@@ -78,20 +79,48 @@ final class ByteStreamServer extends ByteStreamImplBase {
           StatusUtils.invalidArgumentError(
               "resource_name",
               "Failed parsing digest from resource_name:" + request.getResourceName()));
+      return;
     }
 
     try {
       // This still relies on the blob size to be small enough to fit in memory.
       // TODO(olaola): refactor to fix this if the need arises.
-      Chunker c =
-          Chunker.builder().setInput(getFromFuture(cache.downloadBlob(context, digest))).build();
-      while (c.hasNext()) {
-        responseObserver.onNext(
-            ReadResponse.newBuilder().setData(c.next().getData()).build());
+      byte[] bytes = getFromFuture(cache.downloadBlob(context, digest));
+      long readOffset = request.getReadOffset();
+      long readLimit = request.getReadLimit();
+      if (readOffset < 0 || readOffset > bytes.length) {
+        responseObserver.onError(
+            StatusUtils.outOfRangeError(
+                "read_offset",
+                "Expected a value in [0, %d], received: %d".formatted(bytes.length, readOffset)));
+        return;
+      }
+      if (readLimit < 0) {
+        responseObserver.onError(
+            StatusUtils.invalidArgumentError(
+                "read_limit", "Expected a non-negative value, received: %d".formatted(readLimit)));
+        return;
+      }
+      int offset = (int) readOffset;
+      int length =
+          readLimit > 0
+              ? (int) Math.min(bytes.length - readOffset, readLimit)
+              : bytes.length - offset;
+      try (Chunker c =
+          Chunker.builder()
+              .setInput(length, () -> new ByteArrayInputStream(bytes, offset, length))
+              .build()) {
+        while (c.hasNext()) {
+          responseObserver.onNext(ReadResponse.newBuilder().setData(c.next().getData()).build());
+        }
       }
       responseObserver.onCompleted();
     } catch (CacheNotFoundException e) {
       responseObserver.onError(StatusUtils.notFoundError(digest));
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      logger.atWarning().withCause(e).log("Read request interrupted");
+      responseObserver.onError(StatusUtils.interruptedError(digest));
     } catch (Exception e) {
       logger.atWarning().withCause(e).log("Read request failed");
       responseObserver.onError(StatusUtils.internalError(e));
@@ -141,7 +170,15 @@ final class ByteStreamServer extends ByteStreamImplBase {
         }
 
         if (offset == 0) {
-          if (cache.containsKey(digest)) {
+          boolean exists = false;
+          try {
+            exists = cache.refresh(digest);
+          } catch (IOException e) {
+            responseObserver.onError(StatusUtils.internalError(e));
+            closed = true;
+            return;
+          }
+          if (exists) {
             responseObserver.onNext(
                 WriteResponse.newBuilder().setCommittedSize(digest.getSizeBytes()).build());
             responseObserver.onCompleted();
@@ -225,7 +262,7 @@ final class ByteStreamServer extends ByteStreamImplBase {
         }
 
         try {
-          Digest d = digestUtil.compute(temp);
+          Digest d = digestUtil.compute(temp, temp.stat());
           getFromFuture(cache.uploadFile(context, d, temp));
           try {
             temp.delete();
@@ -244,6 +281,11 @@ final class ByteStreamServer extends ByteStreamImplBase {
 
           responseObserver.onNext(WriteResponse.newBuilder().setCommittedSize(offset).build());
           responseObserver.onCompleted();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          logger.atWarning().withCause(e).log("Write request interrupted");
+          responseObserver.onError(StatusUtils.interruptedError(digest));
+          closed = true;
         } catch (Exception e) {
           logger.atWarning().withCause(e).log("Write request failed");
           responseObserver.onError(StatusUtils.internalError(e));
@@ -255,15 +297,12 @@ final class ByteStreamServer extends ByteStreamImplBase {
 
   private static class NoOpStreamObserver<T> implements StreamObserver<T> {
     @Override
-    public void onNext(T value) {
-    }
+    public void onNext(T value) {}
 
     @Override
-    public void onError(Throwable t) {
-    }
+    public void onError(Throwable t) {}
 
     @Override
-    public void onCompleted() {
-    }
+    public void onCompleted() {}
   }
 }

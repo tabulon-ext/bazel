@@ -29,12 +29,13 @@ import com.google.devtools.build.lib.analysis.config.CoreOptions;
 import com.google.devtools.build.lib.analysis.config.Fragment;
 import com.google.devtools.build.lib.analysis.config.FragmentClassSet;
 import com.google.devtools.build.lib.analysis.config.FragmentOptions;
+import com.google.devtools.build.lib.analysis.util.AnalysisTestUtil;
+import com.google.devtools.build.lib.analysis.util.BuildViewTestCase;
 import com.google.devtools.build.lib.bazel.rules.BazelRuleClassProvider.StrictActionEnvOptions;
 import com.google.devtools.build.lib.cmdline.RepositoryName;
 import com.google.devtools.build.lib.packages.RuleClass;
 import com.google.devtools.build.lib.rules.config.ConfigRules;
 import com.google.devtools.build.lib.rules.core.CoreRules;
-import com.google.devtools.build.lib.rules.repository.CoreWorkspaceRules;
 import com.google.devtools.build.lib.util.OS;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.common.options.Options;
@@ -44,11 +45,9 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
-/**
- * Tests consistency of {@link BazelRuleClassProvider}.
- */
+/** Tests consistency of {@link BazelRuleClassProvider}. */
 @RunWith(JUnit4.class)
-public class BazelRuleClassProviderTest {
+public class BazelRuleClassProviderTest extends BuildViewTestCase {
 
   private static void checkConfigConsistency(ConfiguredRuleClassProvider provider) {
     // Check that every fragment required by a rule is present.
@@ -98,11 +97,6 @@ public class BazelRuleClassProviderTest {
   }
 
   @Test
-  public void coreWorkspaceConsistency() {
-    checkModule(CoreWorkspaceRules.INSTANCE);
-  }
-
-  @Test
   public void genericConsistency() {
     checkModule(GenericRules.INSTANCE);
   }
@@ -110,11 +104,6 @@ public class BazelRuleClassProviderTest {
   @Test
   public void configConsistency() {
     checkModule(ConfigRules.INSTANCE);
-  }
-
-  @Test
-  public void shConsistency() {
-    checkModule(ShRules.INSTANCE);
   }
 
   @Test
@@ -148,16 +137,6 @@ public class BazelRuleClassProviderTest {
   }
 
   @Test
-  public void j2objcConsistency() {
-    checkModule(J2ObjcRules.INSTANCE);
-  }
-
-  @Test
-  public void variousWorkspaceConsistency() {
-    checkModule(BazelRuleClassProvider.VARIOUS_WORKSPACE_RULES);
-  }
-
-  @Test
   public void toolchainConsistency() {
     checkModule(ToolchainRules.INSTANCE);
   }
@@ -176,14 +155,20 @@ public class BazelRuleClassProviderTest {
             "--action_env=FOO=bar");
 
     ActionEnvironment env = BazelRuleClassProvider.SHELL_ACTION_ENV.apply(options);
-    assertThat(env.getFixedEnv().toMap()).containsEntry("PATH", "/bin:/usr/bin:/usr/local/bin");
-    assertThat(env.getFixedEnv().toMap()).containsEntry("FOO", "bar");
+    assertThat(env.getFixedEnv()).containsEntry("PATH", "/bin:/usr/bin:/sbin:/usr/sbin");
+    assertThat(env.getFixedEnv()).containsEntry("FOO", "bar");
   }
 
   @Test
-  public void pathOrDefaultOnLinux() {
-    assertThat(pathOrDefault(OS.LINUX, null, null)).isEqualTo("/bin:/usr/bin:/usr/local/bin");
-    assertThat(pathOrDefault(OS.LINUX, "/not/bin", null)).isEqualTo("/bin:/usr/bin:/usr/local/bin");
+  public void pathOrDefaultOnUnix() {
+    assertThat(pathOrDefault(OS.LINUX, null, null)).isEqualTo("/bin:/usr/bin:/sbin:/usr/sbin");
+    assertThat(pathOrDefault(OS.LINUX, "/not/bin", null))
+        .isEqualTo("/bin:/usr/bin:/sbin:/usr/sbin");
+    assertThat(pathOrDefault(OS.OPENBSD, null, null))
+        .isEqualTo("/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin");
+    assertThat(pathOrDefault(OS.FREEBSD, null, null))
+        .isEqualTo("/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin");
+    assertThat(pathOrDefault(OS.DARWIN, null, null)).isEqualTo("/bin:/usr/bin:/sbin:/usr/sbin");
   }
 
   @Test
@@ -204,11 +189,50 @@ public class BazelRuleClassProviderTest {
   }
 
   @Test
-  public void optionsAlsoApplyToHost() {
-    StrictActionEnvOptions o = Options.getDefaults(
-        StrictActionEnvOptions.class);
-    o.useStrictActionEnv = true;
-    StrictActionEnvOptions h = o.getHost();
-    assertThat(h.useStrictActionEnv).isTrue();
+  public void optionsAlsoApplyToHost() throws Exception {
+    BuildOptions options = targetConfig.getOptions().clone();
+    var strictActionEnvOptions = options.get(StrictActionEnvOptions.class);
+    if (strictActionEnvOptions == null) {
+      // This Bazel build doesn't include StrictActionEnvOptions. Nothing to test.
+      return;
+    }
+    strictActionEnvOptions.setUseStrictActionEnv(true);
+
+    StrictActionEnvOptions h =
+        AnalysisTestUtil.execOptions(options, skyframeExecutor, reporter)
+            .get(StrictActionEnvOptions.class);
+
+    assertThat(h.getUseStrictActionEnv()).isTrue();
+  }
+
+  @Test
+  public void getShellExecutableUnset() {
+    assertThat(determineShellExecutable(OS.LINUX, null))
+        .isEqualTo(PathFragment.create("/bin/bash"));
+    assertThat(determineShellExecutable(OS.FREEBSD, null))
+        .isEqualTo(PathFragment.create("/usr/local/bin/bash"));
+    assertThat(determineShellExecutable(OS.OPENBSD, null))
+        .isEqualTo(PathFragment.create("/usr/local/bin/bash"));
+    assertThat(determineShellExecutable(OS.WINDOWS, null))
+        .isEqualTo(PathFragment.create("C:/msys64/usr/bin/bash.exe"));
+  }
+
+  @Test
+  public void getShellExecutableIfSet() {
+    PathFragment binBash = PathFragment.create("/bin/bash");
+    assertThat(determineShellExecutable(OS.LINUX, binBash))
+        .isEqualTo(PathFragment.create("/bin/bash"));
+    assertThat(determineShellExecutable(OS.FREEBSD, binBash))
+        .isEqualTo(PathFragment.create("/bin/bash"));
+    assertThat(determineShellExecutable(OS.OPENBSD, binBash))
+        .isEqualTo(PathFragment.create("/bin/bash"));
+    assertThat(determineShellExecutable(OS.WINDOWS, binBash))
+        .isEqualTo(PathFragment.create("/bin/bash"));
+  }
+
+  private static PathFragment determineShellExecutable(OS os, PathFragment executableOption) {
+    ShellConfiguration.Options options = Options.getDefaults(ShellConfiguration.Options.class);
+    options.setShellExecutable(executableOption);
+    return BazelRuleClassProvider.getShellExecutableForOs(os, options);
   }
 }

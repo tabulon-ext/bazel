@@ -16,14 +16,8 @@ package com.google.devtools.build.lib.actions;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.collect.ImmutableCollection;
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
-import com.google.devtools.build.lib.actions.FilesetManifest.RelativeSymlinkBehaviorWithoutError;
-import com.google.devtools.build.lib.bugreport.BugReport;
-import com.google.devtools.build.lib.bugreport.BugReporter;
-import com.google.devtools.build.lib.vfs.Path;
-import com.google.devtools.build.lib.vfs.PathFragment;
+import com.google.devtools.build.lib.actions.Artifact.TreeFileArtifact;
+import com.google.devtools.build.lib.skyframe.TreeArtifactValue;
 import java.util.Map;
 import javax.annotation.Nullable;
 
@@ -35,162 +29,88 @@ import javax.annotation.Nullable;
  * <p>This is needed because some artifacts (tree artifacts and Filesets) are in fact aggregations
  * of multiple files.
  */
-public class CompletionContext {
+public final class CompletionContext {
   public static final CompletionContext FAILED_COMPLETION_CTX =
-      new CompletionContext(
-          null,
-          ImmutableMap.of(),
-          ImmutableMap.of(),
-          ArtifactPathResolver.IDENTITY,
-          new ActionInputMap(BugReporter.defaultInstance(), 0),
-          false,
-          false);
+      new CompletionContext(ArtifactPathResolver.IDENTITY, new ActionInputMap(0));
 
-  private final Path execRoot;
   private final ArtifactPathResolver pathResolver;
-  private final Map<Artifact, ImmutableCollection<? extends Artifact>> expandedArtifacts;
-  private final Map<Artifact, ImmutableList<FilesetOutputSymlink>> expandedFilesets;
   // Only contains the metadata for 'important' artifacts of the Target/Aspect that completed. Any
   // 'unimportant' artifacts produced by internal output groups (most importantly, _validation) will
   // not be included to avoid retaining many GB on the heap. This ActionInputMap must only be
-  // consulted with respect to known-important artifacts (eg. artifacts referenced in BEP).
+  // consulted with respect to known-important artifacts (e.g. artifacts referenced in BEP).
   private final ActionInputMap importantInputMap;
-  private final boolean expandFilesets;
-  private final boolean fullyResolveFilesetLinks;
 
   @VisibleForTesting
-  CompletionContext(
-      Path execRoot,
-      Map<Artifact, ImmutableCollection<? extends Artifact>> expandedArtifacts,
-      Map<Artifact, ImmutableList<FilesetOutputSymlink>> expandedFilesets,
-      ArtifactPathResolver pathResolver,
-      ActionInputMap importantInputMap,
-      boolean expandFilesets,
-      boolean fullyResolveFilesetLinks) {
-    this.execRoot = execRoot;
-    this.expandedArtifacts = expandedArtifacts;
-    this.expandedFilesets = expandedFilesets;
+  public CompletionContext(ArtifactPathResolver pathResolver, ActionInputMap importantInputMap) {
     this.pathResolver = pathResolver;
     this.importantInputMap = importantInputMap;
-    this.expandFilesets = expandFilesets;
-    this.fullyResolveFilesetLinks = fullyResolveFilesetLinks;
   }
 
   public static CompletionContext create(
-      Map<Artifact, ImmutableCollection<? extends Artifact>> expandedArtifacts,
-      Map<Artifact, ImmutableList<FilesetOutputSymlink>> expandedFilesets,
-      boolean expandFilesets,
-      boolean fullyResolveFilesetSymlinks,
-      ActionInputMap inputMap,
-      ActionInputMap importantInputMap,
-      PathResolverFactory pathResolverFactory,
-      Path execRoot,
-      String workspaceName) {
-    ArtifactPathResolver pathResolver =
-        pathResolverFactory.shouldCreatePathResolverForArtifactValues()
-            ? pathResolverFactory.createPathResolverForArtifactValues(
-                inputMap, expandedArtifacts, expandedFilesets, workspaceName)
-            : ArtifactPathResolver.IDENTITY;
+      ActionInputMap importantInputMap, PathResolverFactory pathResolverFactory) {
     return new CompletionContext(
-        execRoot,
-        expandedArtifacts,
-        expandedFilesets,
-        pathResolver,
-        importantInputMap,
-        expandFilesets,
-        fullyResolveFilesetSymlinks);
+        pathResolverFactory.createPathResolverForArtifactValues(importantInputMap),
+        importantInputMap);
   }
 
   public ArtifactPathResolver pathResolver() {
     return pathResolver;
   }
 
+  public ActionInputMap getImportantInputMap() {
+    return importantInputMap;
+  }
+
   @Nullable
   public FileArtifactValue getFileArtifactValue(Artifact artifact) {
-    return importantInputMap.getMetadata(artifact);
+    return importantInputMap.getInputMetadata(artifact);
   }
 
-  /** Returns true if the given artifact is guaranteed to be a file (and not a directory). */
-  public static boolean isGuaranteedToBeOutputFile(FileStateType type) {
-    return type == FileStateType.REGULAR_FILE
-        || type == FileStateType.SPECIAL_FILE
-        || type == FileStateType.NONEXISTENT;
-  }
-
+  /** Visits the expansion of the given artifacts. */
   public void visitArtifacts(Iterable<Artifact> artifacts, ArtifactReceiver receiver) {
     for (Artifact artifact : artifacts) {
-      if (artifact.isMiddlemanArtifact()) {
+      if (artifact.isRunfilesTree()) {
         continue;
       }
       if (artifact.isFileset()) {
-        if (expandFilesets) {
-          visitFileset(
-              artifact,
-              receiver,
-              fullyResolveFilesetLinks
-                  ? RelativeSymlinkBehaviorWithoutError.RESOLVE_FULLY
-                  : RelativeSymlinkBehaviorWithoutError.RESOLVE);
+        FilesetOutputTree filesetOutput =
+            checkNotNull(
+                importantInputMap.getFileset(artifact),
+                "missing metadata for fileset: %s",
+                artifact);
+        for (FilesetOutputSymlink link : filesetOutput.symlinks()) {
+          receiver.acceptFilesetMapping(artifact, link);
         }
       } else if (artifact.isTreeArtifact()) {
-        FileArtifactValue treeArtifactMetadata = importantInputMap.getMetadata(artifact);
-        if (treeArtifactMetadata == null) {
-          BugReport.sendBugReport(
-              new IllegalStateException(
-                  String.format(
-                      "missing artifact metadata for tree artifact: %s",
-                      artifact.toDebugString())));
-        }
-        if (FileArtifactValue.OMITTED_FILE_MARKER.equals(treeArtifactMetadata)) {
-          // Expansion can be missing for omitted tree artifacts -- skip the whole tree.
-          continue;
-        }
-        ImmutableCollection<? extends Artifact> expandedArtifacts =
+        TreeArtifactValue treeValue =
             checkNotNull(
-                this.expandedArtifacts.get(artifact),
-                "Missing expansion for tree artifact: %s",
+                importantInputMap.getTreeMetadata(artifact),
+                "missing metadata for tree artifact: %s",
                 artifact);
-        for (Artifact expandedArtifact :
-            checkNotNull(expandedArtifacts, "Missing expansion for tree artifact: %s", artifact)) {
-          receiver.accept(expandedArtifact);
+        for (Map.Entry<TreeFileArtifact, FileArtifactValue> entry :
+            treeValue.getChildValues().entrySet()) {
+          receiver.accept(entry.getKey(), entry.getValue());
         }
       } else {
-        receiver.accept(artifact);
+        FileArtifactValue metadata =
+            checkNotNull(
+                importantInputMap.getInputMetadata(artifact),
+                "missing metadata for artifact: %s",
+                artifact);
+        receiver.accept(artifact, metadata);
       }
-    }
-  }
-
-  private void visitFileset(
-      Artifact filesetArtifact,
-      ArtifactReceiver receiver,
-      RelativeSymlinkBehaviorWithoutError relativeSymlinkBehavior) {
-    ImmutableList<FilesetOutputSymlink> links = expandedFilesets.get(filesetArtifact);
-    FilesetManifest filesetManifest =
-        FilesetManifest.constructFilesetManifestWithoutError(
-            links, PathFragment.EMPTY_FRAGMENT, relativeSymlinkBehavior);
-
-    for (Map.Entry<PathFragment, String> mapping : filesetManifest.getEntries().entrySet()) {
-      String targetFile = mapping.getValue();
-      PathFragment locationInFileset = mapping.getKey();
-      receiver.acceptFilesetMapping(
-          filesetArtifact, locationInFileset, execRoot.getRelative(targetFile));
     }
   }
 
   /** A function that accepts an {@link Artifact}. */
   public interface ArtifactReceiver {
-    void accept(Artifact artifact);
+    void accept(Artifact artifact, FileArtifactValue metadata);
 
-    void acceptFilesetMapping(Artifact fileset, PathFragment relName, Path targetFile);
+    void acceptFilesetMapping(Artifact fileset, FilesetOutputSymlink link);
   }
 
   /** A factory for {@link ArtifactPathResolver}. */
   public interface PathResolverFactory {
-    ArtifactPathResolver createPathResolverForArtifactValues(
-        ActionInputMap actionInputMap,
-        Map<Artifact, ImmutableCollection<? extends Artifact>> expandedArtifacts,
-        Map<Artifact, ImmutableList<FilesetOutputSymlink>> filesets,
-        String workspaceName);
-
-    boolean shouldCreatePathResolverForArtifactValues();
+    ArtifactPathResolver createPathResolverForArtifactValues(ActionInputMap actionInputMap);
   }
 }

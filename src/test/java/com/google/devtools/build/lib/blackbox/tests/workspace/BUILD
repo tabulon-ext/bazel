@@ -44,13 +44,10 @@ java_test(
         "RepoWithRuleWritingTextGenerator.java",
         "WorkspaceTestUtils.java",
     ],
-    tags = ["black_box_test"],
-    deps = common_deps + [
-        "//src/main/java/com/google/devtools/build/lib/bazel/repository",
-        "//src/main/java/com/google/devtools/build/lib/vfs",
-        "//src/test/java/com/google/devtools/build/lib/vfs/util",
-        "//src/test/java/com/google/devtools/build/lib/events:testutil",
+    tags = [
+        "black_box_test",
     ],
+    deps = common_deps,
 )
 
 java_test(
@@ -64,10 +61,9 @@ java_test(
     ],
     tags = ["black_box_test"],
     deps = common_deps + [
-        "//src/main/java/com/google/devtools/build/lib/bazel/repository",
         "//src/main/java/com/google/devtools/build/lib/vfs",
-        "//src/test/java/com/google/devtools/build/lib/vfs/util",
         "//src/test/java/com/google/devtools/build/lib/events:testutil",
+        "//src/test/java/com/google/devtools/build/lib/vfs/util",
     ],
 )
 
@@ -80,10 +76,9 @@ java_test(
     ],
     tags = ["black_box_test"],
     deps = common_deps + [
-        "//src/main/java/com/google/devtools/build/lib/bazel/repository",
         "//src/main/java/com/google/devtools/build/lib/vfs",
-        "//src/test/java/com/google/devtools/build/lib/vfs/util",
         "//src/test/java/com/google/devtools/build/lib/events:testutil",
+        "//src/test/java/com/google/devtools/build/lib/vfs/util",
     ],
 )
 

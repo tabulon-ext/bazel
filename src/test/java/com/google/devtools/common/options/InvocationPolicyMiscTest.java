@@ -15,6 +15,7 @@ package com.google.devtools.common.options;
 
 import static com.google.common.truth.Truth.assertThat;
 
+import com.google.common.collect.ImmutableList;
 import com.google.devtools.build.lib.runtime.proto.InvocationPolicyOuterClass.InvocationPolicy;
 import com.google.devtools.build.lib.runtime.proto.InvocationPolicyOuterClass.SetValue.Behavior;
 import org.junit.Test;
@@ -43,7 +44,7 @@ public class InvocationPolicyMiscTest extends InvocationPolicyEnforcerTestBase {
         .getUseDefaultBuilder();
     InvocationPolicyEnforcer enforcer = createOptionsPolicyEnforcer(invocationPolicyBuilder);
 
-    enforcer.enforce(parser, BUILD_COMMAND);
+    enforcer.enforce(parser, BUILD_COMMAND, ImmutableList.builder());
 
     assertThat(parser.getWarnings())
         .containsExactly(
@@ -66,7 +67,7 @@ public class InvocationPolicyMiscTest extends InvocationPolicyEnforcerTestBase {
         .addFlagValue(TEST_DEPRECATED_POLICY_VALUE);
     InvocationPolicyEnforcer enforcer = createOptionsPolicyEnforcer(invocationPolicyBuilder);
 
-    enforcer.enforce(parser, BUILD_COMMAND);
+    enforcer.enforce(parser, BUILD_COMMAND, ImmutableList.builder());
 
     assertThat(parser.getWarnings())
         .containsExactly(
@@ -86,7 +87,7 @@ public class InvocationPolicyMiscTest extends InvocationPolicyEnforcerTestBase {
         .getUseDefaultBuilder();
     InvocationPolicyEnforcer enforcer = createOptionsPolicyEnforcer(invocationPolicyBuilder);
 
-    enforcer.enforce(parser, BUILD_COMMAND);
+    enforcer.enforce(parser, BUILD_COMMAND, ImmutableList.builder());
 
     assertThat(parser.getWarnings()).isEmpty();
   }
@@ -104,8 +105,52 @@ public class InvocationPolicyMiscTest extends InvocationPolicyEnforcerTestBase {
         .addFlagValue(TEST_DEPRECATED_POLICY_VALUE);
     InvocationPolicyEnforcer enforcer = createOptionsPolicyEnforcer(invocationPolicyBuilder);
 
-    enforcer.enforce(parser, BUILD_COMMAND);
+    enforcer.enforce(parser, BUILD_COMMAND, ImmutableList.builder());
 
     assertThat(parser.getWarnings()).isEmpty();
+  }
+
+  @Test
+  public void testFlagPolicy_oldNameAndNewName_oldNameLast() throws Exception {
+    InvocationPolicy.Builder invocationPolicyBuilder = InvocationPolicy.newBuilder();
+    invocationPolicyBuilder
+        .addFlagPoliciesBuilder()
+        .setFlagName("test_new_and_old_name")
+        .getSetValueBuilder()
+        .setBehavior(Behavior.FINAL_VALUE_IGNORE_OVERRIDES)
+        .addFlagValue("new_value");
+    invocationPolicyBuilder
+        .addFlagPoliciesBuilder()
+        .setFlagName("test_old_name")
+        .getSetValueBuilder()
+        .setBehavior(Behavior.FINAL_VALUE_IGNORE_OVERRIDES)
+        .addFlagValue("old_value");
+    InvocationPolicyEnforcer enforcer = createOptionsPolicyEnforcer(invocationPolicyBuilder);
+
+    enforcer.enforce(parser, BUILD_COMMAND, ImmutableList.builder());
+
+    assertThat(getTestOptions().getTestNewAndOldName()).isEqualTo("old_value");
+  }
+
+  @Test
+  public void testFlagPolicy_oldNameAndNewName_newNameLast() throws Exception {
+    InvocationPolicy.Builder invocationPolicyBuilder = InvocationPolicy.newBuilder();
+    invocationPolicyBuilder
+        .addFlagPoliciesBuilder()
+        .setFlagName("test_old_name")
+        .getSetValueBuilder()
+        .setBehavior(Behavior.FINAL_VALUE_IGNORE_OVERRIDES)
+        .addFlagValue("old_value");
+    invocationPolicyBuilder
+        .addFlagPoliciesBuilder()
+        .setFlagName("test_new_and_old_name")
+        .getSetValueBuilder()
+        .setBehavior(Behavior.FINAL_VALUE_IGNORE_OVERRIDES)
+        .addFlagValue("new_value");
+    InvocationPolicyEnforcer enforcer = createOptionsPolicyEnforcer(invocationPolicyBuilder);
+
+    enforcer.enforce(parser, BUILD_COMMAND, ImmutableList.builder());
+
+    assertThat(getTestOptions().getTestNewAndOldName()).isEqualTo("new_value");
   }
 }

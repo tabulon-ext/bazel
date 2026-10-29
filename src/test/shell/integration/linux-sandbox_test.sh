@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright 2015 The Bazel Authors. All rights reserved.
 #
@@ -52,6 +52,82 @@ function test_execvp_error_message_contains_path() {
   $linux_sandbox $SANDBOX_DEFAULT_OPTS -- /does/not/exist --hello world &> $TEST_log || code=$?
   expect_log "\"execvp(/does/not/exist, 0x[[:alnum:]]*)\": No such file or directory"
 }
+
+function test_execvp_error_message_missing_interpreter() {
+  local bad_script="$SANDBOX_DIR/bad_script.sh"
+  cat > "$bad_script" <<'EOF'
+#!/nonexistent/interpreter/foo
+echo "should not run"
+EOF
+  chmod +x "$bad_script"
+
+  $linux_sandbox $SANDBOX_DEFAULT_OPTS -- "$bad_script" &> $TEST_log || code=$?
+  expect_log "file exists, but interpreter '/nonexistent/interpreter/foo' does not exist in sandbox"
+}
+
+function test_execvp_error_message_shebang_with_leading_whitespace() {
+  local bad_script="$SANDBOX_DIR/leading_whitespace.sh"
+  cat > "$bad_script" <<'EOF'
+#!   /nonexistent/interpreter/whitespace
+echo "should not run"
+EOF
+  chmod +x "$bad_script"
+
+  $linux_sandbox $SANDBOX_DEFAULT_OPTS -- "$bad_script" &> $TEST_log || code=$?
+  expect_log "file exists, but interpreter '/nonexistent/interpreter/whitespace' does not exist in sandbox"
+}
+
+function test_execvp_successful_script_execution() {
+  local good_script="$SANDBOX_DIR/good_script.sh"
+  cat > "$good_script" <<'EOF'
+#!/bin/sh
+echo "script executed successfully"
+EOF
+  chmod +x "$good_script"
+
+  $linux_sandbox $SANDBOX_DEFAULT_OPTS -- "$good_script" &> $TEST_log || fail "Expected script to execute successfully"
+  expect_log "script executed successfully"
+  expect_not_log "does not exist in sandbox"
+}
+
+function test_execvp_error_message_shebang_with_args() {
+  local bad_script="$SANDBOX_DIR/args_script.sh"
+  cat > "$bad_script" <<'EOF'
+#!/nonexistent/interpreter/bar -x --arg
+echo "should not run"
+EOF
+  chmod +x "$bad_script"
+
+  $linux_sandbox $SANDBOX_DEFAULT_OPTS -- "$bad_script" &> $TEST_log || code=$?
+  expect_log "file exists, but interpreter '/nonexistent/interpreter/bar' does not exist in sandbox"
+}
+
+function test_execvp_error_message_shebang_with_escaped_space() {
+  local bad_script="$SANDBOX_DIR/escaped_space.sh"
+  cat > "$bad_script" <<'EOF'
+#!/home/Foo\ Bar/goo/interpreter.exe
+echo "should not run"
+EOF
+  chmod +x "$bad_script"
+
+  $linux_sandbox $SANDBOX_DEFAULT_OPTS -- "$bad_script" &> $TEST_log || code=$?
+  expect_log "file exists, but interpreter '/home/Foo\\\' does not exist in sandbox"
+}
+
+function test_execvp_error_message_shebang_not_a_directory() {
+  local dummy_file="$SANDBOX_DIR/dummy_file"
+  touch "$dummy_file"
+  local bad_script="$SANDBOX_DIR/not_a_dir.sh"
+  cat > "$bad_script" <<EOF
+#!$dummy_file/foo
+echo "should not run"
+EOF
+  chmod +x "$bad_script"
+
+  $linux_sandbox $SANDBOX_DEFAULT_OPTS -- "$bad_script" &> $TEST_log || code=$?
+  expect_log "file exists, but interpreter '$dummy_file/foo' does not exist in sandbox"
+}
+
 
 function test_default_user_is_current_user() {
   $linux_sandbox $SANDBOX_DEFAULT_OPTS -- /usr/bin/id &> $TEST_log || fail
@@ -159,8 +235,19 @@ function test_sigint_sends_sigterm() {
 
 function test_debug_logging() {
   touch ${TEST_TMPDIR}/testfile
-  $linux_sandbox $SANDBOX_DEFAULT_OPTS -D -- /bin/true &> $TEST_log || code=$?
-  expect_log "child exited normally with code 0"
+  $linux_sandbox $SANDBOX_DEFAULT_OPTS -D /tmp/debug -- /bin/true &> $TEST_log || code=$?
+  assert_contains "child exited normally with code 0" /tmp/debug
+}
+
+function test_debug_logging_does_not_pollute_stdout_nor_stderr() {
+  $linux_sandbox $SANDBOX_DEFAULT_OPTS -D /tmp/debug -l $OUT -L $ERR -- /bin/bash -c "echo out; echo err >&2" &> $TEST_log || code=$?
+  assert_equals "out" "$(cat $OUT)"
+  assert_equals "err" "$(cat $ERR)"
+}
+
+function test_debug_logging_does_not_leak_descriptor() {
+  $linux_sandbox $SANDBOX_DEFAULT_OPTS -D /tmp/debug -- /bin/bash -c "ls /proc/\$\$/fd | tr '\n' ' '; echo ." &> $TEST_log || fail
+  expect_log "0 1 2 ."
 }
 
 function test_mount_additional_paths_success() {
@@ -171,25 +258,25 @@ function test_mount_additional_paths_success() {
   touch ${MOUNT_TARGET_ROOT}/sandboxed_testfile
 
   touch /tmp/sandboxed_testfile
-  $linux_sandbox $SANDBOX_DEFAULT_OPTS -D \
+  $linux_sandbox $SANDBOX_DEFAULT_OPTS -D /tmp/debug \
     -M ${TEST_TMPDIR}/foo -m ${MOUNT_TARGET_ROOT}/foo \
     -M ${TEST_TMPDIR}/bar \
     -M ${TEST_TMPDIR}/testfile -m ${MOUNT_TARGET_ROOT}/sandboxed_testfile \
     -- /bin/true &> $TEST_log || code=$?
   # mount a directory to a customized path inside the sandbox
-  expect_log "bind mount: ${TEST_TMPDIR}/foo -> ${MOUNT_TARGET_ROOT}/foo\$"
+  assert_contains "bind mount: ${TEST_TMPDIR}/foo -> ${MOUNT_TARGET_ROOT}/foo\$" /tmp/debug
   # mount a directory to the same path inside the sanxbox
-  expect_log "bind mount: ${TEST_TMPDIR}/bar -> ${TEST_TMPDIR}/bar\$"
+  assert_contains "bind mount: ${TEST_TMPDIR}/bar -> ${TEST_TMPDIR}/bar\$" /tmp/debug
   # mount a file to a customized path inside the sandbox
-  expect_log "bind mount: ${TEST_TMPDIR}/testfile -> ${MOUNT_TARGET_ROOT}/sandboxed_testfile\$"
-  expect_log "child exited normally with code 0"
+  assert_contains "bind mount: ${TEST_TMPDIR}/testfile -> ${MOUNT_TARGET_ROOT}/sandboxed_testfile\$" /tmp/debug
+  assert_contains "child exited normally with code 0" /tmp/debug
   rm -rf ${MOUNT_TARGET_ROOT}/foo
   rm -rf ${MOUNT_TARGET_ROOT}/sandboxed_testfile
 }
 
 function test_mount_additional_paths_relative_path() {
   touch ${TEST_TMPDIR}/testfile
-  $linux_sandbox $SANDBOX_DEFAULT_OPTS -D \
+  $linux_sandbox $SANDBOX_DEFAULT_OPTS -D /tmp/debug \
     -M ${TEST_TMPDIR}/testfile -m tmp/sandboxed_testfile \
     -- /bin/true &> $TEST_log || code=$?
   # mount a directory to a customized path inside the sandbox
@@ -199,7 +286,7 @@ function test_mount_additional_paths_relative_path() {
 function test_mount_additional_paths_leading_m() {
   mkdir -p ${TEST_TMPDIR}/foo
   touch ${TEST_TMPDIR}/testfile
-  $linux_sandbox $SANDBOX_DEFAULT_OPTS -D \
+  $linux_sandbox $SANDBOX_DEFAULT_OPTS -D /tmp/debug \
     -m /tmp/foo \
     -M ${TEST_TMPDIR}/testfile -m /tmp/sandboxed_testfile \
     -- /bin/true &> $TEST_log || code=$?
@@ -211,7 +298,7 @@ function test_mount_additional_paths_m_not_preceeded_by_M() {
   mkdir -p ${TEST_TMPDIR}/foo
   mkdir -p ${TEST_TMPDIR}/bar
   touch ${TEST_TMPDIR}/testfile
-  $linux_sandbox $SANDBOX_DEFAULT_OPTS -D \
+  $linux_sandbox $SANDBOX_DEFAULT_OPTS -D /tmp/debug \
     -M ${TEST_TMPDIR}/testfile -m /tmp/sandboxed_testfile \
     -m /tmp/foo \
     -M ${TEST_TMPDIR}/bar \
@@ -224,7 +311,7 @@ function test_mount_additional_paths_other_flag_between_M_m_pair() {
   mkdir -p ${TEST_TMPDIR}/bar
   touch ${TEST_TMPDIR}/testfile
   $linux_sandbox $SANDBOX_DEFAULT_OPTS \
-    -M ${TEST_TMPDIR}/testfile -D -m /tmp/sandboxed_testfile \
+    -M ${TEST_TMPDIR}/testfile -D /tmp/debug -m /tmp/sandboxed_testfile \
     -M ${TEST_TMPDIR}/bar \
     -- /bin/true &> $TEST_log || code=$?
   # mount a directory to a customized path inside the sandbox
@@ -235,15 +322,15 @@ function test_mount_additional_paths_multiple_sources_mount_to_one_target() {
   mkdir -p ${TEST_TMPDIR}/foo
   mkdir -p ${TEST_TMPDIR}/bar
   mkdir -p ${MOUNT_TARGET_ROOT}/foo
-  $linux_sandbox $SANDBOX_DEFAULT_OPTS -D \
+  $linux_sandbox $SANDBOX_DEFAULT_OPTS -D /tmp/debug \
     -M ${TEST_TMPDIR}/foo -m ${MOUNT_TARGET_ROOT}/foo \
     -M ${TEST_TMPDIR}/bar -m ${MOUNT_TARGET_ROOT}/foo \
     -- /bin/true &> $TEST_log || code=$?
   # mount a directory to a customized path inside the sandbox
-  expect_log "bind mount: ${TEST_TMPDIR}/foo -> ${MOUNT_TARGET_ROOT}/foo\$"
+  assert_contains "bind mount: ${TEST_TMPDIR}/foo -> ${MOUNT_TARGET_ROOT}/foo\$" /tmp/debug
   # mount a new source directory to the same target, which will overwrite the previous source path
-  expect_log "bind mount: ${TEST_TMPDIR}/bar -> ${MOUNT_TARGET_ROOT}/foo\$"
-  expect_log "child exited normally with code 0"
+  assert_contains "bind mount: ${TEST_TMPDIR}/bar -> ${MOUNT_TARGET_ROOT}/foo\$" /tmp/debug
+  assert_contains "child exited normally with code 0" /tmp/debug
   rm -rf ${MOUNT_TARGET_ROOT}/foo
 }
 
@@ -386,8 +473,184 @@ function test_child_ignores_sigterm_and_sigalrm_no_kill_delay() {
   assert_equals 137 "$code" # SIGNAL_BASE + SIGTERM = 128 + 9
 }
 
+# Tests that using cgroups v1 with linux_sandbox.cc works, if it's available
+function test_cgroups1_memory_limit() {
+  if ! grep -E '^cgroup +[^ ]+ +cgroup +.*memory.*' /proc/mounts; then
+    echo "No cgroup memory controller mounted, skipping test"
+    return 0
+  fi
+  memmount=$(grep -E '^cgroup +[^ ]+ +cgroup +.*memory.*' /proc/mounts | cut -d' ' -f2)
+  if ! grep -E '^[0-9]*:[^:]*memory[^:]*:' /proc/self/cgroup &>/dev/null; then
+    echo "Does not use cgroups v1, skipping test"
+    return 0
+  fi
+  memsubdir=$(grep -E '^[0-9]*:[^:]*memory[^:]*:' /proc/self/cgroup | cut -d: -f3)
+  memdir="$memmount$memsubdir"
+  if [[ ! -w "$memdir" ]]; then
+    echo "Cgroups v1 directory not writable, skipping test"
+    return 0
+  fi
+  cat >${TEST_TMPDIR}/run_sandbox_with_cgroups.sh <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# Runs the sandbox with appropriate cgroups setup
+cgroups_self=$memdir
+cgroups_parent=\$( dirname "\$cgroups_self" )
+cgroups_base=$memdir/blaze_test
+mkdir -p "\$cgroups_base" || ( echo "Error creating \$cgroups_base"; exit 1 )
+echo \$1 > "\$cgroups_base/memory.limit_in_bytes" \
+  || ( echo "Error setting \$1 memory limit"; exit 1 )
+cat "\$cgroups_base/memory.limit_in_bytes"
+$linux_sandbox $SANDBOX_DEFAULT_OPTS -M "\$cgroups_base" -w "\$cgroups_base" -C "\$cgroups_base" \
+  -- /bin/echo hi there
+EOF
+  chmod +x ${TEST_TMPDIR}/run_sandbox_with_cgroups.sh
+
+  ${TEST_TMPDIR}/run_sandbox_with_cgroups.sh 1000000 &>$TEST_log \
+    || fail "Expected sandbox run to succeed"
+
+  expect_log "hi there"
+
+  ${TEST_TMPDIR}/run_sandbox_with_cgroups.sh 1000 &> $TEST_log \
+  && fail "Expected sandbox run to fail"
+
+  expect_not_log "hi there"
+}
+
+# Tests that using cgruops v2 with linux_sandbox.cc works, if it's available
+function test_cgroups2_memory_limit() {
+  if ! grep '^0::' /proc/self/cgroup &>/dev/null; then
+    echo "Not using cgroups v2, skipping test"
+    return 0
+  fi
+  if ! XDG_RUNTIME_DIR=/run/user/$( id -u ) systemd-run --user --scope true; then
+    echo "Not able to use systemd, skipping test"
+    return 0
+  fi
+  cat >${TEST_TMPDIR}/run_sandbox_with_cgroups.sh <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# Runs the sandbox with appropriate cgroups setup
+cgroups_self=/sys/fs/cgroup\$( cut -d: -f3- /proc/self/cgroup)
+cgroups_parent=\$( dirname "\$cgroups_self" )
+cgroups_base="\$cgroups_parent"/blaze_test
+mkdir -p "\$cgroups_base" || ( echo "Error creating \$cgroups_base"; exit 1 )
+if ! grep memory "\$cgroups_parent/cgroup.controllers" &>/dev/null ; then
+  echo memory >"\$cgroups_parent/cgroup.subtree_control" \
+    || ( echo "Error setting subtree control"; exit 1 )
+fi
+echo \$1 > "\$cgroups_base/memory.max" \
+  || ( echo "Error setting \$1 memory limit"; exit 1 )
+$linux_sandbox $SANDBOX_DEFAULT_OPTS -C "\$cgroups_base" \
+  -- /bin/echo hi there
+EOF
+  chmod +x ${TEST_TMPDIR}/run_sandbox_with_cgroups.sh
+
+  XDG_RUNTIME_DIR=/run/user/$( id -u ) systemd-run --user --scope \
+    ${TEST_TMPDIR}/run_sandbox_with_cgroups.sh 1000000 &>$TEST_log \
+    || fail "Expected sandbox run to succeed"
+
+  expect_log "hi there"
+
+  XDG_RUNTIME_DIR=/run/user/$( id -u ) systemd-run --user --scope \
+    ${TEST_TMPDIR}/run_sandbox_with_cgroups.sh 1000 &> $TEST_log \
+     && fail "Expected sandbox run to fail"
+
+  expect_not_log "hi there"
+}
+
+function test_cgroups_v2_peak_memory_mock() {
+  local local_tmp="$(mktemp -d "${OUT_DIR}/test_cgroups_v2_peak_memory_mockXXXX")"
+  local stats_out_path="${local_tmp}/statsfile"
+  local stats_out_decoded_path="${local_tmp}/statsfile.decoded"
+
+  # Create a mock cgroup directory
+  local mock_cgroup_dir="${local_tmp}/mock_cgroup"
+  mkdir -p "${mock_cgroup_dir}"
+
+  # Write a mock peak memory value (40MB = 41943040 bytes)
+  echo "41943040" > "${mock_cgroup_dir}/memory.peak"
+
+  # Run sandbox pointing to the mock cgroup directory
+  local code=0
+  "${linux_sandbox}" \
+      -W "${SANDBOX_DIR}" \
+      -S "${stats_out_path}" \
+      -C "${mock_cgroup_dir}" \
+      -- /bin/true \
+      &> "${TEST_log}" || code="$?"
+
+  assert_equals 0 "${code}"
+
+  if ! [[ -e "${stats_out_path}" ]]; then
+    fail "Stats file not found: '${stats_out_path}'"
+  fi
+
+  # Decode stats
+  "${protoc_compiler}" --proto_path="${STATS_PROTO_DIR}" \
+      --decode tools.protos.ExecutionStatistics execution_statistics.proto \
+      < "${stats_out_path}" > "${stats_out_decoded_path}"
+
+  if ! [[ -e "${stats_out_decoded_path}" ]]; then
+    fail "Decoded stats file not found: '${stats_out_decoded_path}'"
+  fi
+
+  # Assert maxrss is reported and matches the mock value (40MB = 40960 KB)
+  local maxrss=0
+  if grep -q maxrss "${stats_out_decoded_path}"; then
+    maxrss="$(grep maxrss "${stats_out_decoded_path}" | cut -f2 -d':' | tr -dc '0-9')"
+  fi
+
+  assert_equals 40960 "${maxrss}"
+}
+
+function test_cgroups_v1_peak_memory_mock() {
+  local local_tmp="$(mktemp -d "${OUT_DIR}/test_cgroups_v1_peak_memory_mockXXXX")"
+  local stats_out_path="${local_tmp}/statsfile"
+  local stats_out_decoded_path="${local_tmp}/statsfile.decoded"
+
+  # Create a mock cgroup directory
+  local mock_cgroup_dir="${local_tmp}/mock_cgroup"
+  mkdir -p "${mock_cgroup_dir}"
+
+  # Write a mock peak memory value (40MB = 41943040 bytes)
+  echo "41943040" > "${mock_cgroup_dir}/memory.max_usage_in_bytes"
+
+  # Run sandbox pointing to the mock cgroup directory
+  local code=0
+  "${linux_sandbox}" \
+      -W "${SANDBOX_DIR}" \
+      -S "${stats_out_path}" \
+      -C "${mock_cgroup_dir}" \
+      -- /bin/true \
+      &> "${TEST_log}" || code="$?"
+
+  assert_equals 0 "${code}"
+
+  if ! [[ -e "${stats_out_path}" ]]; then
+    fail "Stats file not found: '${stats_out_path}'"
+  fi
+
+  # Decode stats
+  "${protoc_compiler}" --proto_path="${STATS_PROTO_DIR}" \
+      --decode tools.protos.ExecutionStatistics execution_statistics.proto \
+      < "${stats_out_path}" > "${stats_out_decoded_path}"
+
+  if ! [[ -e "${stats_out_decoded_path}" ]]; then
+    fail "Decoded stats file not found: '${stats_out_decoded_path}'"
+  fi
+
+  # Assert maxrss is reported and matches the mock value (40MB = 40960 KB)
+  local maxrss=0
+  if grep -q maxrss "${stats_out_decoded_path}"; then
+    maxrss="$(grep maxrss "${stats_out_decoded_path}" | cut -f2 -d':' | tr -dc '0-9')"
+  fi
+
+  assert_equals 40960 "${maxrss}"
+}
+
 # The test shouldn't fail if the environment doesn't support running it.
-[[ "$(uname -s)" = Linux ]] || exit 0
+is_linux || exit 0
 check_sandbox_allowed || exit 0
 
 run_suite "linux-sandbox"

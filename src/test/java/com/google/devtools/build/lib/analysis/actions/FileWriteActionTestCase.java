@@ -32,13 +32,13 @@ import com.google.devtools.build.lib.actions.ThreadStateReceiver;
 import com.google.devtools.build.lib.analysis.util.ActionTester;
 import com.google.devtools.build.lib.analysis.util.BuildViewTestCase;
 import com.google.devtools.build.lib.events.StoredEventHandler;
-import com.google.devtools.build.lib.exec.BinTools;
 import com.google.devtools.build.lib.exec.util.TestExecutorBuilder;
 import com.google.devtools.build.lib.util.io.FileOutErr;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.SyscallCache;
 import java.util.Collection;
+import java.util.HashSet;
 import org.junit.Before;
 
 /** Test cases for {@link FileWriteAction}. */
@@ -54,7 +54,7 @@ public abstract class FileWriteActionTestCase extends BuildViewTestCase {
   public final void createAction() throws Exception {
     outputArtifact = getBinArtifactWithNoOwner("destination.txt");
     output = outputArtifact.getPath();
-    FileSystemUtils.createDirectoryAndParents(output.getParentDirectory());
+    output.getParentDirectory().createDirectoryAndParents();
     action = createAction(NULL_ACTION_OWNER, outputArtifact, "Hello World", false);
   }
 
@@ -63,24 +63,20 @@ public abstract class FileWriteActionTestCase extends BuildViewTestCase {
 
   @Before
   public final void createExecutorAndContext() throws Exception {
-    BinTools binTools = BinTools.forUnitTesting(directories, analysisMock.getEmbeddedTools());
-    executor = new TestExecutorBuilder(fileSystem, directories, binTools).build();
+    executor = new TestExecutorBuilder(fileSystem, directories).build();
     context =
         new ActionExecutionContext(
             executor,
-            /*actionInputFileCache=*/ null,
+            /* inputMetadataProvider= */ null,
             ActionInputPrefetcher.NONE,
             actionKeyContext,
-            /*metadataHandler=*/ null,
-            /*rewindingEnabled=*/ false,
+            /* outputMetadataStore= */ null,
+            /* rewindingEnabled= */ false,
             LostInputsCheck.NONE,
             new FileOutErr(),
             new StoredEventHandler(),
-            /*clientEnv=*/ ImmutableMap.of(),
-            /*topLevelFilesets=*/ ImmutableMap.of(),
-            /*artifactExpander=*/ null,
-            /*actionFileSystem=*/ null,
-            /*skyframeDepsResult=*/ null,
+            /* clientEnv= */ ImmutableMap.of(),
+            /* actionFileSystem= */ null,
             DiscoveredModulesPruner.DEFAULT,
             SyscallCache.NO_CACHE,
             ThreadStateReceiver.NULL_INSTANCE);
@@ -93,14 +89,14 @@ public abstract class FileWriteActionTestCase extends BuildViewTestCase {
 
   protected void checkDestinationArtifactIsOutput() {
     Collection<Artifact> outputs = action.getOutputs();
-    assertThat(Sets.newHashSet(outputs)).isEqualTo(Sets.newHashSet(outputArtifact));
+    assertThat(new HashSet<>(outputs)).isEqualTo(Sets.newHashSet(outputArtifact));
     assertThat(action.getPrimaryOutput()).isEqualTo(outputArtifact);
   }
 
   protected void checkCanWriteNonExecutableFile() throws Exception {
     ActionResult actionResult = action.execute(context);
     assertThat(actionResult.spawnResults()).isEmpty();
-    String content = new String(FileSystemUtils.readContentAsLatin1(output));
+    String content = FileSystemUtils.readContentAsLatin1(output);
     assertThat(content).isEqualTo("Hello World");
     assertThat(output.isExecutable()).isFalse();
   }
@@ -111,7 +107,7 @@ public abstract class FileWriteActionTestCase extends BuildViewTestCase {
     Action action = createAction(NULL_ACTION_OWNER, outputArtifact, "echo 'Hello World'", true);
     ActionResult actionResult = action.execute(context);
     assertThat(actionResult.spawnResults()).isEmpty();
-    String content = new String(FileSystemUtils.readContentAsLatin1(output));
+    String content = FileSystemUtils.readContentAsLatin1(output);
     assertThat(content).isEqualTo("echo 'Hello World'");
     assertThat(output.isExecutable()).isTrue();
   }

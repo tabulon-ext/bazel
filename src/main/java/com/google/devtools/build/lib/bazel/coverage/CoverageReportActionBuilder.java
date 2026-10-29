@@ -14,37 +14,42 @@
 
 package com.google.devtools.build.lib.bazel.coverage;
 
-import com.google.common.base.Joiner;
+import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.collect.ImmutableList.toImmutableList;
+
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.actions.AbstractAction;
 import com.google.devtools.build.lib.actions.Action;
-import com.google.devtools.build.lib.actions.ActionEnvironment;
 import com.google.devtools.build.lib.actions.ActionExecutionContext;
 import com.google.devtools.build.lib.actions.ActionExecutionException;
 import com.google.devtools.build.lib.actions.ActionKeyContext;
 import com.google.devtools.build.lib.actions.ActionOwner;
 import com.google.devtools.build.lib.actions.ActionResult;
 import com.google.devtools.build.lib.actions.Artifact;
-import com.google.devtools.build.lib.actions.Artifact.ArtifactExpander;
 import com.google.devtools.build.lib.actions.ArtifactFactory;
 import com.google.devtools.build.lib.actions.ArtifactOwner;
 import com.google.devtools.build.lib.actions.ArtifactRoot;
 import com.google.devtools.build.lib.actions.BaseSpawn;
+import com.google.devtools.build.lib.actions.EnvironmentalExecException;
 import com.google.devtools.build.lib.actions.ExecException;
+import com.google.devtools.build.lib.actions.ImportantOutputHandler;
+import com.google.devtools.build.lib.actions.ImportantOutputHandler.ImportantOutputException;
+import com.google.devtools.build.lib.actions.InputMetadataProvider;
 import com.google.devtools.build.lib.actions.NotifyOnActionCacheHit;
 import com.google.devtools.build.lib.actions.ResourceSet;
-import com.google.devtools.build.lib.actions.RunfilesSupplier;
+import com.google.devtools.build.lib.actions.ResourceSetOrBuilder;
 import com.google.devtools.build.lib.actions.Spawn;
 import com.google.devtools.build.lib.actions.SpawnResult;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
 import com.google.devtools.build.lib.analysis.ConfiguredTarget;
 import com.google.devtools.build.lib.analysis.FilesToRunProvider;
+import com.google.devtools.build.lib.analysis.IncompatiblePlatformProvider;
 import com.google.devtools.build.lib.analysis.RunfilesSupport;
-import com.google.devtools.build.lib.analysis.actions.Compression;
-import com.google.devtools.build.lib.analysis.actions.FileWriteAction;
+import com.google.devtools.build.lib.analysis.actions.LazyWritePathsFileAction;
 import com.google.devtools.build.lib.analysis.test.CoverageReportActionFactory.CoverageReportActionsWrapper;
+import com.google.devtools.build.lib.analysis.test.InstrumentedFilesInfo;
 import com.google.devtools.build.lib.analysis.test.TestProvider;
 import com.google.devtools.build.lib.analysis.test.TestProvider.TestParams;
 import com.google.devtools.build.lib.analysis.test.TestRunnerAction;
@@ -55,11 +60,11 @@ import com.google.devtools.build.lib.concurrent.ThreadSafety.Immutable;
 import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.events.EventHandler;
 import com.google.devtools.build.lib.exec.SpawnStrategyResolver;
+import com.google.devtools.build.lib.profiler.GoogleAutoProfilerUtils;
+import com.google.devtools.build.lib.profiler.ProfilerTask;
 import com.google.devtools.build.lib.util.Fingerprint;
-import com.google.devtools.build.lib.vfs.PathFragment;
-import java.util.ArrayList;
+import com.google.devtools.build.lib.vfs.Path;
 import java.util.Collection;
-import java.util.List;
 import javax.annotation.Nullable;
 
 /**
@@ -76,7 +81,7 @@ import javax.annotation.Nullable;
  * <p>The coverage report generation can have two phases, though they both run in the same action.
  * The source code of the coverage report tool {@code lcov_merger} is in the {@code
  * testing/coverage/lcov_merger} directory. The deployed binaries used by Blaze are under {@code
- * tools/coverage}.
+ * tools/test}.
  *
  * <p>The first phase is merging the individual coverage files into a single report file. The
  * location of this file is reported by Blaze. This phase always happens if the {@code
@@ -91,9 +96,7 @@ import javax.annotation.Nullable;
 public final class CoverageReportActionBuilder {
 
   private static final ResourceSet LOCAL_RESOURCES =
-      ResourceSet.createWithRamCpu(/* memoryMb= */ 750, /* cpuUsage= */ 1);
-
-  private static final ActionOwner ACTION_OWNER = ActionOwner.SYSTEM_ACTION_OWNER;
+      ResourceSet.createWithRamCpu(/* memoryMb= */ 750, /* cpu= */ 1);
 
   // SpawnActions can't be used because they need the AnalysisEnvironment and this action is
   // created specially at the very end of the analysis phase when we don't have it anymore.
@@ -101,53 +104,62 @@ public final class CoverageReportActionBuilder {
   private static final class CoverageReportAction extends AbstractAction
       implements NotifyOnActionCacheHit {
     private final ImmutableList<String> command;
-    private final boolean remotable;
     private final String locationMessage;
-    private final RunfilesSupplier runfilesSupplier;
 
     CoverageReportAction(
         ActionOwner owner,
         NestedSet<Artifact> inputs,
         ImmutableSet<Artifact> outputs,
         ImmutableList<String> command,
-        String locationMessage,
-        boolean remotable,
-        RunfilesSupplier runfilesSupplier) {
-      super(
-          owner,
-          /*tools = */ NestedSetBuilder.emptySet(Order.STABLE_ORDER),
-          inputs,
-          runfilesSupplier,
-          outputs,
-          ActionEnvironment.EMPTY);
+        String locationMessage) {
+      super(owner, inputs, outputs);
       this.command = command;
-      this.remotable = remotable;
       this.locationMessage = locationMessage;
-      this.runfilesSupplier = runfilesSupplier;
     }
 
     @Override
-    public ActionResult execute(ActionExecutionContext actionExecutionContext)
+    public ActionResult execute(ActionExecutionContext ctx)
         throws ActionExecutionException, InterruptedException {
+      // The resources are fixed because this action borrows an arbitrary tested target's
+      // ActionOwner, which describes the test resource usage rather than that of a coverage report
+      // generation.
+      Spawn spawn =
+          new BaseSpawn(
+              command,
+              ImmutableMap.of(),
+              ImmutableMap.of(),
+              this,
+              ResourceSetOrBuilder.ignoringOverrides(LOCAL_RESOURCES));
       try {
-        ImmutableMap<String, String> executionInfo = remotable
-            ? ImmutableMap.<String, String>of()
-            : ImmutableMap.<String, String>of("local", "");
-        Spawn spawn = new BaseSpawn(
-            command,
-            ImmutableMap.<String, String>of(),
-            executionInfo,
-            runfilesSupplier,
-            this,
-            LOCAL_RESOURCES);
-        List<SpawnResult> spawnResults =
-            actionExecutionContext
-                .getContext(SpawnStrategyResolver.class)
-                .exec(spawn, actionExecutionContext);
-        actionExecutionContext.getEventHandler().handle(Event.info(locationMessage));
+        ImmutableList<SpawnResult> spawnResults =
+            ctx.getContext(SpawnStrategyResolver.class).exec(spawn, ctx);
+        informImportantOutputHandler(ctx);
+        ctx.getEventHandler().handle(Event.info(locationMessage));
         return ActionResult.create(spawnResults);
       } catch (ExecException e) {
         throw ActionExecutionException.fromExecException(e, this);
+      }
+    }
+
+    private void informImportantOutputHandler(ActionExecutionContext ctx)
+        throws EnvironmentalExecException, InterruptedException {
+      var importantOutputHandler = ctx.getContext(ImportantOutputHandler.class);
+      if (importantOutputHandler == null) {
+        return;
+      }
+
+      ImmutableList<Path> coverageReportOutputs =
+          getOutputs().stream()
+              .map(o -> ctx.getPathResolver().toPath(o))
+              .collect(toImmutableList());
+      try (var ignored =
+          GoogleAutoProfilerUtils.profiledAndLogged(
+              "Informing important output handler of coverage report",
+              ProfilerTask.INFO,
+              ImportantOutputHandler.LOG_THRESHOLD)) {
+        importantOutputHandler.processTestOutputs(coverageReportOutputs);
+      } catch (ImportantOutputException e) {
+        throw new EnvironmentalExecException(e, e.getFailureDetail());
       }
     }
 
@@ -164,7 +176,7 @@ public final class CoverageReportActionBuilder {
     @Override
     protected void computeKey(
         ActionKeyContext actionKeyContext,
-        @Nullable ArtifactExpander artifactExpander,
+        @Nullable InputMetadataProvider inputMetadataProvider,
         Fingerprint fp) {
       fp.addStrings(command);
     }
@@ -176,53 +188,108 @@ public final class CoverageReportActionBuilder {
     }
   }
 
-  public CoverageReportActionBuilder() {
-  }
+  public CoverageReportActionBuilder() {}
 
   /** Returns the coverage report action. May return null in case of an error. */
   @Nullable
   public CoverageReportActionsWrapper createCoverageActionsWrapper(
       EventHandler reporter,
       BlazeDirectories directories,
+      Collection<ConfiguredTarget> configuredTargets,
       Collection<ConfiguredTarget> targetsToTest,
-      NestedSet<Artifact> baselineCoverageArtifacts,
       ArtifactFactory factory,
       ActionKeyContext actionKeyContext,
       ArtifactOwner artifactOwner,
       String workspaceName,
-      ArgsFunc argsFunction,
-      LocationFunc locationFunc,
-      boolean htmlReport)
+      CoverageHelper coverageHelper,
+      Artifact htmlReport)
       throws InterruptedException {
-
     if (targetsToTest == null || targetsToTest.isEmpty()) {
       return null;
     }
-    ImmutableList.Builder<Artifact> builder = ImmutableList.<Artifact>builder();
+    NestedSetBuilder<Artifact> builder = NestedSetBuilder.stableOrder();
     FilesToRunProvider reportGenerator = null;
+    ActionOwner actionOwner = null;
     for (ConfiguredTarget target : targetsToTest) {
+      // Skip incompatible tests.
+      if (target.get(IncompatiblePlatformProvider.PROVIDER) != null) {
+        continue;
+      }
       TestParams testParams = target.getProvider(TestProvider.class).getTestParams();
+      FilesToRunProvider generator = testParams.getCoverageReportGenerator();
+      if (generator == null) {
+        continue;
+      }
       builder.addAll(testParams.getCoverageArtifacts());
-      if (reportGenerator == null) {
-        reportGenerator = testParams.getCoverageReportGenerator();
+      ActionOwner candidateOwner = testParams.getActionOwnerForCoverage();
+      if (candidateOwner == null) {
+        continue;
+      }
+      // Use the first test with coverage enabled as the owner of the coverage report actions. This
+      // relies on targetsToTest having a deterministic order.
+      if (actionOwner == null) {
+        reportGenerator = generator;
+        actionOwner = candidateOwner;
       }
     }
-    builder.addAll(baselineCoverageArtifacts.toList());
-
-    ImmutableList<Artifact> coverageArtifacts = builder.build();
+    // If all tests are incompatible, there's nothing to do.
+    if (reportGenerator == null) {
+      return null;
+    }
+    checkNotNull(actionOwner);
+    NestedSet<Artifact> baselineCoverageArtifacts = getBaselineCoverageArtifacts(configuredTargets);
+    NestedSet<Artifact> coverageArtifacts =
+        builder.addTransitive(baselineCoverageArtifacts).build();
     if (!coverageArtifacts.isEmpty()) {
-      PathFragment coverageDir = TestRunnerAction.COVERAGE_TMP_ROOT;
-      Artifact lcovArtifact = factory.getDerivedArtifact(
-          coverageDir.getRelative("lcov_files.tmp"),
-          directories.getBuildDataDirectory(workspaceName),
-          artifactOwner);
-      Action lcovFileAction = generateLcovFileWriteAction(lcovArtifact, coverageArtifacts);
-      Action coverageReportAction = generateCoverageReportAction(
-          CoverageArgs.create(directories, coverageArtifacts, lcovArtifact, factory, artifactOwner,
-              reportGenerator, workspaceName, htmlReport),
-          argsFunction, locationFunc);
+      Artifact baselineLcovArtifact =
+          factory.getDerivedArtifact(
+              TestRunnerAction.COVERAGE_TMP_ROOT.getRelative("baseline_lcov_files.tmp"),
+              directories.getBuildDataDirectory(workspaceName),
+              artifactOwner);
+      Action baselineLcovFileAction =
+          generateLcovFileWriteAction(baselineLcovArtifact, baselineCoverageArtifacts, actionOwner);
+      Action baselineReportAction =
+          generateCoverageReportAction(
+              new CoverageArgs(
+                  directories,
+                  baselineCoverageArtifacts,
+                  baselineLcovArtifact,
+                  factory,
+                  artifactOwner,
+                  reportGenerator,
+                  workspaceName,
+                  /* htmlReport= */ null,
+                  actionOwner),
+              coverageHelper,
+              configuredTargets,
+              "_baseline_report.dat");
+      Artifact coverageLcovArtifact =
+          factory.getDerivedArtifact(
+              TestRunnerAction.COVERAGE_TMP_ROOT.getRelative("coverage_lcov_files.tmp"),
+              directories.getBuildDataDirectory(workspaceName),
+              artifactOwner);
+      Action coverageLcovFileAction =
+          generateLcovFileWriteAction(coverageLcovArtifact, coverageArtifacts, actionOwner);
+      Action coverageReportAction =
+          generateCoverageReportAction(
+              new CoverageArgs(
+                  directories,
+                  coverageArtifacts,
+                  coverageLcovArtifact,
+                  factory,
+                  artifactOwner,
+                  reportGenerator,
+                  workspaceName,
+                  htmlReport,
+                  actionOwner),
+              coverageHelper,
+              configuredTargets,
+              "_coverage_report.dat");
       return new CoverageReportActionsWrapper(
-          lcovFileAction, coverageReportAction, actionKeyContext);
+          baselineReportAction,
+          coverageReportAction,
+          ImmutableList.of(baselineLcovFileAction, coverageLcovFileAction),
+          actionKeyContext);
     } else {
       reporter.handle(
           Event.error("Cannot generate coverage report - no coverage information was collected"));
@@ -230,64 +297,81 @@ public final class CoverageReportActionBuilder {
     }
   }
 
-  private FileWriteAction generateLcovFileWriteAction(
-      Artifact lcovArtifact, ImmutableList<Artifact> coverageArtifacts) {
-    List<String> filepaths = new ArrayList<>(coverageArtifacts.size());
-    for (Artifact artifact : coverageArtifacts) {
-      filepaths.add(artifact.getExecPathString());
+  private static NestedSet<Artifact> getBaselineCoverageArtifacts(
+      Collection<ConfiguredTarget> configuredTargets) {
+    var baselineCoverageArtifacts = NestedSetBuilder.<Artifact>stableOrder();
+    for (ConfiguredTarget target : configuredTargets) {
+      InstrumentedFilesInfo provider = target.get(InstrumentedFilesInfo.STARLARK_CONSTRUCTOR);
+      if (provider != null) {
+        baselineCoverageArtifacts.addTransitive(provider.getBaselineCoverageArtifacts());
+      }
     }
-    return FileWriteAction.create(
-        ACTION_OWNER,
+    return baselineCoverageArtifacts.build();
+  }
+
+  private static LazyWritePathsFileAction generateLcovFileWriteAction(
+      Artifact lcovArtifact, NestedSet<Artifact> coverageArtifacts, ActionOwner actionOwner) {
+    return new LazyWritePathsFileAction(
+        actionOwner,
         lcovArtifact,
-        Joiner.on('\n').join(filepaths),
-        /*makeExecutable=*/ false,
-        Compression.DISALLOW);
+        coverageArtifacts,
+        /* filesToIgnore= */ ImmutableSet.of(),
+        /* includeDerivedArtifacts= */ true);
   }
 
-  /**
-   * Computes the arguments passed to the coverage report generator.
-   */
-  @FunctionalInterface
-  public interface ArgsFunc {
-    ImmutableList<String> apply(CoverageArgs args);
+  /** A helper interface for product-specific coverage support. */
+  public interface CoverageHelper {
+    /** Returns the arguments for the coverage report generator action. */
+    ImmutableList<String> getArgs(CoverageArgs args, Artifact lcovOutput);
+
+    /** Returns a message describing the location of the coverage report. */
+    String getLocationMessage(CoverageArgs args, Artifact lcovOutput);
+
+    /** Returns additional inputs for the coverage report action. */
+    default NestedSet<Artifact> getInstrumentedFiles(
+        CoverageArgs args, Collection<ConfiguredTarget> configuredTargets) {
+      return NestedSetBuilder.emptySet(Order.STABLE_ORDER);
+    }
   }
 
-  /**
-   * Computes the location message for the {@link CoverageReportAction}.
-   */
-  @FunctionalInterface
-  public interface LocationFunc {
-    String apply(CoverageArgs args);
-  }
-
-  private CoverageReportAction generateCoverageReportAction(
+  private static CoverageReportAction generateCoverageReportAction(
       CoverageArgs args,
-      ArgsFunc argsFunc,
-      LocationFunc locationFunc) {
+      CoverageHelper coverageHelper,
+      Collection<ConfiguredTarget> configuredTargets,
+      String basename) {
     ArtifactRoot root = args.directories().getBuildDataDirectory(args.workspaceName());
-    PathFragment coverageDir = TestRunnerAction.COVERAGE_TMP_ROOT;
-    Artifact lcovOutput = args.factory().getDerivedArtifact(
-        coverageDir.getRelative("_coverage_report.dat"), root, args.artifactOwner());
+    Artifact lcovOutput =
+        args.factory()
+            .getDerivedArtifact(
+                TestRunnerAction.COVERAGE_TMP_ROOT.getRelative(basename),
+                root,
+                args.artifactOwner());
     Artifact reportGeneratorExec = args.reportGenerator().getExecutable();
     RunfilesSupport runfilesSupport = args.reportGenerator().getRunfilesSupport();
-    args = CoverageArgs.createCopyWithCoverageDirAndLcovOutput(args, coverageDir, lcovOutput);
-    ImmutableList<String> actionArgs = argsFunc.apply(args);
+    Artifact runfilesTree =
+        runfilesSupport != null ? runfilesSupport.getRunfilesTreeArtifact() : null;
+    ImmutableList<String> actionArgs = coverageHelper.getArgs(args, lcovOutput);
 
     NestedSetBuilder<Artifact> inputsBuilder =
         NestedSetBuilder.<Artifact>stableOrder()
-            .addAll(args.coverageArtifacts())
+            .addTransitive(args.coverageArtifacts())
             .add(reportGeneratorExec)
             .add(args.lcovArtifact());
-    if (runfilesSupport != null) {
-      inputsBuilder.add(runfilesSupport.getRunfilesMiddleman());
+    if (runfilesTree != null) {
+      inputsBuilder.add(runfilesTree);
+    }
+
+    ImmutableSet.Builder<Artifact> outputsBuilder =
+        ImmutableSet.<Artifact>builder().add(lcovOutput);
+    if (args.htmlReport() != null) {
+      outputsBuilder.add(args.htmlReport());
+      inputsBuilder.addTransitive(coverageHelper.getInstrumentedFiles(args, configuredTargets));
     }
     return new CoverageReportAction(
-        ACTION_OWNER,
+        args.actionOwner(),
         inputsBuilder.build(),
-        ImmutableSet.of(lcovOutput),
+        outputsBuilder.build(),
         actionArgs,
-        locationFunc.apply(args),
-        !args.htmlReport(),
-        args.reportGenerator().getRunfilesSupplier());
+        coverageHelper.getLocationMessage(args, lcovOutput));
   }
 }

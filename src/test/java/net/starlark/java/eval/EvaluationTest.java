@@ -16,6 +16,7 @@ package net.starlark.java.eval;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -32,6 +33,13 @@ import org.junit.runners.JUnit4;
 public final class EvaluationTest {
 
   private final EvaluationTestCase ev = new EvaluationTestCase();
+
+  @Test
+  public void testDefaultStarlarkSemanticsAndDefaultFileOptionsConsistent() {
+    assertThat(StarlarkSemantics.DEFAULT.getDefaultFileOptions()).isEqualTo(FileOptions.DEFAULT);
+    assertThat(StarlarkSemantics.DEFAULT.updateFileOptions(FileOptions.builder()).build())
+        .isEqualTo(FileOptions.DEFAULT);
+  }
 
   @Test
   public void testExecutionStopsAtFirstError() throws Exception {
@@ -104,9 +112,9 @@ public final class EvaluationTest {
     }
 
     @Override
-    public Object fastcall(StarlarkThread thread, Object[] positional, Object[] named) {
+    public Object call(StarlarkThread thread, Tuple args, Dict<String, Object> kwargs) {
       callCount++;
-      if (positional.length > 0 && Starlark.truth(positional[0])) {
+      if (!args.isEmpty() && Starlark.truth(args.get(0))) {
         Thread.currentThread().interrupt();
       }
       return Starlark.NONE;
@@ -120,7 +128,7 @@ public final class EvaluationTest {
     Module module =
         Module.withPredeclared(StarlarkSemantics.DEFAULT, ImmutableMap.of("interrupt", interrupt));
     try (Mutability mu = Mutability.create("test")) {
-      StarlarkThread thread = new StarlarkThread(mu, StarlarkSemantics.DEFAULT);
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
       thread.setPrintHandler((_thread, msg) -> printEvents.add(msg));
       Starlark.execFile(input, FileOptions.DEFAULT, module, thread);
     } finally {
@@ -132,7 +140,7 @@ public final class EvaluationTest {
   @Test
   public void testExecutionSteps() throws Exception {
     Mutability mu = Mutability.create("test");
-    StarlarkThread thread = new StarlarkThread(mu, StarlarkSemantics.DEFAULT);
+    StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
     ParserInput input = ParserInput.fromLines("squares = [x*x for x in range(n)]");
 
     class C {
@@ -228,10 +236,10 @@ public final class EvaluationTest {
           }
 
           @Override
-          public StarlarkInt fastcall(StarlarkThread thread, Object[] positional, Object[] named)
+          public StarlarkInt call(StarlarkThread thread, Tuple args, Dict<String, Object> kwargs)
               throws EvalException {
             StarlarkInt sum = StarlarkInt.of(0);
-            for (Object arg : positional) {
+            for (Object arg : args) {
               sum = StarlarkInt.add(sum, (StarlarkInt) arg);
             }
             return sum;
@@ -628,7 +636,7 @@ public final class EvaluationTest {
     Object obj =
         new StarlarkValue() {
           @Override
-          public void repr(Printer printer) {
+          public void repr(Printer printer, StarlarkSemantics semantics) {
             printer.append("<str marker>");
           }
         };
@@ -654,7 +662,7 @@ public final class EvaluationTest {
     Object obj =
         new StarlarkValue() {
           @Override
-          public void repr(Printer printer) {
+          public void repr(Printer printer, StarlarkSemantics semantics) {
             printer.append("<str marker>");
           }
         };
@@ -711,7 +719,7 @@ public final class EvaluationTest {
             "x = [1, 2, 'foo', 4] + [1, 2, \"%s%d\" % ('foo', 1)]");
     Module module = Module.create();
     try (Mutability mu = Mutability.create("test")) {
-      StarlarkThread thread = new StarlarkThread(mu, StarlarkSemantics.DEFAULT);
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
       Starlark.execFile(input, FileOptions.DEFAULT, module, thread);
     }
     assertThat(module.getGlobal("x"))
@@ -734,9 +742,10 @@ public final class EvaluationTest {
         ParserInput.fromString("x = 1", "a.bzl"),
         FileOptions.DEFAULT,
         a,
-        new StarlarkThread(Mutability.create(), StarlarkSemantics.DEFAULT));
+        StarlarkThread.createTransient(Mutability.create(), StarlarkSemantics.DEFAULT));
 
-    StarlarkThread bThread = new StarlarkThread(Mutability.create(), StarlarkSemantics.DEFAULT);
+    StarlarkThread bThread =
+        StarlarkThread.createTransient(Mutability.create(), StarlarkSemantics.DEFAULT);
     bThread.setLoader(
         module -> {
           assertThat(module).isEqualTo("a.bzl");
@@ -746,22 +755,44 @@ public final class EvaluationTest {
     Starlark.execFile(
         ParserInput.fromString("load('a.bzl', 'x')", "b.bzl"), FileOptions.DEFAULT, b, bThread);
 
-    StarlarkThread cThread = new StarlarkThread(Mutability.create(), StarlarkSemantics.DEFAULT);
+    StarlarkThread cThread =
+        StarlarkThread.createTransient(Mutability.create(), StarlarkSemantics.DEFAULT);
     cThread.setLoader(
         module -> {
           assertThat(module).isEqualTo("b.bzl");
           return b;
         });
-    EvalException ex =
+    SyntaxError.Exception cEx =
+        assertThrows(
+            SyntaxError.Exception.class,
+            () ->
+                Starlark.execFile(
+                    ParserInput.fromString("load('b.bzl', 'x')", "c.bzl"),
+                    Module.create(),
+                    cThread));
+    assertThat(cEx).hasMessageThat().contains("module 'b.bzl' does not contain symbol 'x'");
+
+    StarlarkThread dThread =
+        StarlarkThread.createTransient(
+            Mutability.create(),
+            // Disable static type checking to verify that the error is also caught at eval-time
+            StarlarkSemantics.builder()
+                .setBool(StarlarkSemantics.EXPERIMENTAL_STARLARK_STATIC_TYPE_CHECKING, false)
+                .build());
+    dThread.setLoader(
+        module -> {
+          assertThat(module).isEqualTo("b.bzl");
+          return b;
+        });
+    EvalException dEx =
         assertThrows(
             EvalException.class,
             () ->
                 Starlark.execFile(
                     ParserInput.fromString("load('b.bzl', 'x')", "c.bzl"),
-                    FileOptions.DEFAULT,
                     Module.create(),
-                    cThread));
-    assertThat(ex).hasMessageThat().contains("file 'b.bzl' does not contain symbol 'x'");
+                    dThread));
+    assertThat(dEx).hasMessageThat().contains("file 'b.bzl' does not contain symbol 'x'");
   }
 
   @Test
@@ -778,10 +809,281 @@ public final class EvaluationTest {
     ParserInput input = ParserInput.fromLines("load('m1', 'x'); x = 'two'");
     Module m2 = Module.create();
     try (Mutability mu = Mutability.create("test")) {
-      StarlarkThread thread = new StarlarkThread(mu, StarlarkSemantics.DEFAULT);
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
       thread.setLoader((name) -> m1);
       Starlark.execFile(input, options, m2, thread);
     }
     assertThat(m2.getGlobal("x")).isEqualTo("two");
+  }
+
+  @Test
+  public void moduleWithDocString() throws Exception {
+    Module module = Module.create();
+    assertThat(module.getDocumentation()).isNull();
+    ParserInput input =
+        ParserInput.fromLines(
+            "\"\"\"",
+            "Module doc header", //
+            "",
+            "Module doc details",
+            "\"\"\"",
+            "",
+            "\"\"\"Not module doc\"\"\"",
+            "x = \"Not module doc\"",
+            "def foo():",
+            "  \"\"\"Not module doc\"\"\"",
+            "  pass");
+    try (Mutability mu = Mutability.create("test")) {
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
+      Starlark.execFile(input, FileOptions.DEFAULT, module, thread);
+    }
+    assertThat(module.getDocumentation()).isEqualTo("Module doc header\n\nModule doc details");
+  }
+
+  @Test
+  public void moduleWithoutDocString() throws Exception {
+    Module module = Module.create();
+    ParserInput input =
+        ParserInput.fromLines(
+            "x = \"Not module doc\"", //
+            "\"\"\"Not module doc\"\"\"",
+            "def foo():",
+            "  \"\"\"Not module doc\"\"\"",
+            "  pass");
+    try (Mutability mu = Mutability.create("test")) {
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
+      Starlark.execFile(input, FileOptions.DEFAULT, module, thread);
+    }
+    assertThat(module.getDocumentation()).isNull();
+  }
+
+  @Test
+  public void moduleWithMultiplePrograms_usesFirstNonNullDocString() throws Exception {
+    Module module = Module.create();
+    assertThat(module.getDocumentation()).isNull();
+    ParserInput inputWithoutModuleDocstring = ParserInput.fromLines("x = \"Not a module doc\"");
+    ParserInput inputWithModuleDocstring1 =
+        ParserInput.fromLines(
+            "\"\"\"First non-null module doc\"\"\"", //
+            "y = \"foo\"");
+    ParserInput inputWithModuleDocstring2 =
+        ParserInput.fromLines(
+            "\"\"\"Second non-null module doc\"\"\"", //
+            "z = \"bar\"");
+    try (Mutability mu = Mutability.create("test")) {
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
+      Starlark.execFile(inputWithoutModuleDocstring, FileOptions.DEFAULT, module, thread);
+      Starlark.execFile(inputWithModuleDocstring1, FileOptions.DEFAULT, module, thread);
+      Starlark.execFile(inputWithModuleDocstring2, FileOptions.DEFAULT, module, thread);
+    }
+    assertThat(module.getDocumentation()).isEqualTo("First non-null module doc");
+  }
+
+  @Test
+  public void moduleWithPresetDocstring() throws Exception {
+    Module module = Module.create();
+    module.setDocumentation("preset docstring");
+    assertThat(module.getDocumentation()).isEqualTo("preset docstring");
+    ParserInput input =
+        ParserInput.fromLines(
+            "\"\"\"Module doc from file\"\"\"", //
+            "x = \"foo\"");
+    try (Mutability mu = Mutability.create("test")) {
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
+      Starlark.execFile(input, FileOptions.DEFAULT, module, thread);
+    }
+    assertThat(module.getDocumentation()).isEqualTo("preset docstring");
+  }
+
+  @Test
+  public void typeAliasStatement_evalsAsNoop_iffTypeResolverDisabled() throws Exception {
+    StarlarkSemantics semanticsWithoutTypeResolver =
+        StarlarkSemantics.builder()
+            .setBool(StarlarkSemantics.EXPERIMENTAL_STARLARK_STATIC_TYPE_CHECKING, false)
+            .build();
+
+    ev.new Scenario(semanticsWithoutTypeResolver).setUp("type X = int").testLookup("X", null);
+    ev.new Scenario(semanticsWithoutTypeResolver)
+        .setUp("Y = 'foo'; type Y = bool")
+        .testLookup("Y", "foo");
+
+    StarlarkSemantics semanticsWithTypeResolver =
+        StarlarkSemantics.builder()
+            .setBool(StarlarkSemantics.EXPERIMENTAL_STARLARK_STATIC_TYPE_CHECKING, true)
+            .build();
+
+    ev.new Scenario(semanticsWithTypeResolver)
+        .setUp("type X = int")
+        .testIsInstanceOf("X", TypeConstructorValue.class);
+    ev.new Scenario(semanticsWithTypeResolver)
+        .testIfErrorContains("'Y' redeclared at top level", "Y = 'foo'; type Y = bool");
+  }
+
+  @Test
+  public void varStatement_evalsAsNoop() throws Exception {
+    ev.setFileOptions(FileOptions.builder().allowTypeSyntax(true).build());
+    ev.new Scenario().setUp("X : int").testLookup("X", null);
+  }
+
+  @Test
+  public void varStatement_canLeaveToplevelSymbolcUninitialized() throws Exception {
+    ev.setFileOptions(FileOptions.builder().allowTypeSyntax(true).build());
+    ev.new Scenario()
+        .setUp(
+            """
+            X : int
+            def f():
+                print(X)
+            """)
+        .testIfErrorContains("global variable 'X' is referenced before assignment", "f()");
+  }
+
+  @Test
+  public void castExpression_evalsAsIdentity() throws Exception {
+    // The dynamic behavior of `cast` (disregarding type checking) is to return its value unchanged.
+    ev.setFileOptions(FileOptions.builder().allowTypeSyntax(true).build());
+    ev.new Scenario()
+        .setUp(
+            """
+            x = cast(list, [1])
+            y = cast(int, "this is not an int")
+            z = cast(dict[str, str], 42)
+            """)
+        .testEval("x", "[1]")
+        .testEval("y", "\"this is not an int\"")
+        .testEval("z", "42");
+  }
+
+  // TODO(b/350661266): resolve types in isinstance().
+  @Test
+  public void isinstanceExpression_notYetSupported() throws Exception {
+    ev.setFileOptions(FileOptions.builder().allowTypeSyntax(true).build());
+    ev.new Scenario().testIfExactError("isinstance() is not yet supported", "isinstance(x, list)");
+  }
+
+  @Test
+  public void testForLoopOverSequences() throws Exception {
+    StarlarkList<String> singletonImm = StarlarkList.immutableOf("only");
+    StarlarkList<String> regularImm = StarlarkList.immutableOf("a", "b", "c");
+    StarlarkList<String> lazyImm = StarlarkList.lazyImmutable(() -> ImmutableList.of("x", "y"));
+    ev.new Scenario()
+        .update("singleton_imm", singletonImm)
+        .update("regular_imm", regularImm)
+        .update("lazy_imm", lazyImm)
+        .setUp(
+            """
+            def collect(seq):
+                out = []
+                for item in seq:
+                    if item == "skip" or item == 1:
+                        continue
+                    if item == "stop" or item == 3:
+                        break
+                    out.append(item)
+                return out
+
+            def first(seq):
+                for item in seq:
+                    return item
+                return "empty"
+
+            def pairs(outer, inner):
+                out = []
+                for o in outer:
+                    for i in inner:
+                        if i == "stop":
+                            break
+                        out.append(o + i)
+                return out
+            """)
+        .testEval("collect([])", "[]")
+        .testEval("collect(())", "[]")
+        .testEval("collect(range(0))", "[]")
+        .testEval("collect(singleton_imm)", "['only']")
+        .testEval("collect(('single',))", "['single']")
+        .testEval("collect(range(1))", "[0]")
+        .testEval("collect(regular_imm)", "['a', 'b', 'c']")
+        .testEval("collect(('t1', 'skip', 't2', 'stop', 't3'))", "['t1', 't2']")
+        .testEval("collect(['l1', 'skip', 'l2', 'stop', 'l3'])", "['l1', 'l2']")
+        .testEval("collect(lazy_imm)", "['x', 'y']")
+        .testEval("collect(range(5))", "[0, 2]")
+        .testEval("collect({'k1': 1, 'k2': 2})", "['k1', 'k2']")
+        .testEval("first([])", "'empty'")
+        .testEval("first(())", "'empty'")
+        .testEval("first(range(0))", "'empty'")
+        .testEval("first(['f1', 'f2'])", "'f1'")
+        .testEval("first(('t1', 't2'))", "'t1'")
+        .testEval("first(range(5, 7))", "5")
+        .testEval("pairs(['a', 'b'], ['1', 'stop', '2'])", "['a1', 'b1']")
+        .testEval("pairs(('a', 'b'), ('1', 'stop', '2'))", "['a1', 'b1']");
+  }
+
+  @Test
+  public void testForLoopIterationLock() throws Exception {
+    ev.new Scenario()
+        .setUp(
+            """
+            def iter_mutable_with_spare_capacity():
+                xs = [1, 2]
+                xs.append(3)  # capacity > size
+                out = []
+                for x in xs:
+                    if x == 2:
+                        break
+                    out.append(x)
+                xs.append(4)  # verify iterator lock was released after break
+                return (out, xs)
+
+            def mutate_during_for():
+                xs = [1, 2]
+                xs.append(3)
+                for x in xs:
+                    xs.append(x)
+            """)
+        .testEval("iter_mutable_with_spare_capacity()", "([1], [1, 2, 3, 4])")
+        .testIfErrorContains(
+            "list value is temporarily immutable due to active for-loop iteration",
+            "mutate_during_for()");
+  }
+
+  @Test
+  public void testForLoopOverListAbortedOnInterrupt() throws Exception {
+    ParserInput input =
+        ParserInput.fromLines(
+            "def f():",
+            "  xs = list(range(100))",
+            "  for i in xs:",
+            "    interrupt(i == 5)",
+            "f()");
+    InterruptFunction interrupt = new InterruptFunction();
+    assertThrows(
+        InterruptedException.class, () -> execWithInterrupt(input, interrupt, new ArrayList<>()));
+
+    assertThat(interrupt.callCount).isEqualTo(6);
+  }
+
+  @Test
+  public void testPostAssignHookOnlyForToplevelStatements() throws Exception {
+    List<String> assignedNames = new ArrayList<>();
+    // The resolver rejects top-level if- and for- statements, so nested blocks can only appear
+    // inside functions, whose assignments must not be exported.
+    ParserInput input =
+        ParserInput.fromLines(
+            "a = 1",
+            "def fn():",
+            "  if True:",
+            "    b = 2",
+            "  for c in [3]:",
+            "    d = c",
+            "  e = 4",
+            "fn()",
+            "f = 5");
+    Module module = Module.create();
+    try (Mutability mu = Mutability.create("test")) {
+      StarlarkThread thread = StarlarkThread.createTransient(mu, StarlarkSemantics.DEFAULT);
+      thread.setPostAssignHook((name, loc, val) -> assignedNames.add(name));
+      Starlark.execFile(input, FileOptions.DEFAULT, module, thread);
+    }
+    assertThat(assignedNames).containsExactly("a", "f").inOrder();
   }
 }

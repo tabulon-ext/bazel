@@ -1,13 +1,14 @@
-load("@rules_java//java:defs.bzl", "java_library")
+load("@rules_java//java:defs.bzl", "java_library", "java_test")
 
 package(
-    default_visibility = ["//src:__subpackages__"],
+    default_applicable_licenses = ["//:license"],
+    default_visibility = ["//src/test/java/com/google/devtools/build/lib/query2:__pkg__"],
 )
 
 filegroup(
     name = "srcs",
     srcs = glob(["*"]),
-    visibility = ["//src:__subpackages__"],
+    visibility = ["//src/test/java/com/google/devtools/build/lib/query2:__pkg__"],
 )
 
 java_library(
@@ -15,29 +16,33 @@ java_library(
     testonly = 1,
     srcs = ["ActionGraphQueryHelper.java"],
     deps = [
+        "//src/main/java/com/google/devtools/build/lib/analysis:analysis_core",
         "//src/main/java/com/google/devtools/build/lib/analysis:configured_target_value",
+        "//src/main/java/com/google/devtools/build/lib/analysis/config:build_configuration",
+        "//src/main/java/com/google/devtools/build/lib/packages:label_printer",
         "//src/main/java/com/google/devtools/build/lib/query2",
         "//src/main/java/com/google/devtools/build/lib/query2/engine",
+        "//src/main/java/com/google/devtools/build/lib/skyframe:aspect_key_creator",
         "//src/main/java/com/google/devtools/build/skyframe",
-        "//src/main/java/com/google/devtools/build/skyframe:skyframe-objects",
         "//src/test/java/com/google/devtools/build/lib/query2/testutil",
-        "//third_party:guava",
+        "//third_party/java/guava:collect",
     ],
 )
 
-java_library(
-    name = "action_graph_query_test",
-    testonly = 1,
+java_test(
+    name = "ActionGraphQueryTest",
+    size = "medium",
     srcs = ["ActionGraphQueryTest.java"],
+    shard_count = 6,
     deps = [
         ":action_graph_query_helper",
-        "//src/main/java/com/google/devtools/build/lib/analysis:config/build_configuration",
         "//src/main/java/com/google/devtools/build/lib/analysis:configured_target_value",
+        "//src/main/java/com/google/devtools/build/lib/analysis/config:build_configuration",
         "//src/main/java/com/google/devtools/build/lib/query2",
         "//src/main/java/com/google/devtools/build/lib/query2/engine",
         "//src/test/java/com/google/devtools/build/lib/query2/testutil",
-        "//third_party:guava",
-        "//third_party:junit4",
-        "//third_party:truth",
+        "//third_party/java/guava:collect",
+        "//third_party/java/junit",
+        "//third_party/java/truth",
     ],
 )

@@ -1,4 +1,7 @@
-load("//tools/python:private/defs.bzl", "py_library", "py_test")
+load("@bazel_pip_dev_deps//:requirements.bzl", "requirement")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+load("@rules_shell//shell:sh_library.bzl", "sh_library")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -8,7 +11,7 @@ filegroup(
     visibility = ["//src:__pkg__"],
 )
 
-filegroup(
+sh_library(
     name = "test-deps",
     testonly = 1,
     srcs = ["//src:bazel"],
@@ -22,15 +25,26 @@ py_library(
     name = "test_base",
     testonly = 1,
     srcs = ["test_base.py"],
-    data = [":test-deps"],
+    data = [
+        ":test-deps",
+        "//src/test/tools/bzlmod:MODULE.bazel.lock",
+    ],
     visibility = [
+        "//scripts/ctexplain:__pkg__",
         "//src/test/py/bazel:__pkg__",
         "//third_party/def_parser:__pkg__",
-        "//tools/android:__pkg__",
-        "//tools/build_rules:__pkg__",
-        "//tools/ctexplain:__pkg__",
-        "//tools/python:__pkg__",
     ],
+    deps = [
+        "//third_party/py/abseil",
+        requirement("bazel-runfiles"),
+    ],
+)
+
+py_test(
+    name = "action_stdout_test",
+    size = "medium",
+    srcs = ["action_stdout_test.py"],
+    deps = [":test_base"],
 )
 
 py_test(
@@ -42,14 +56,14 @@ py_test(
 
 py_test(
     name = "cc_import_test",
-    size = "medium",
+    size = "large",
     srcs = ["cc_import_test.py"],
     deps = [":test_base"],
 )
 
 py_test(
     name = "py_test",
-    size = "medium",
+    size = "large",
     srcs = ["py_test.py"],
     deps = [":test_base"],
 )
@@ -70,7 +84,7 @@ py_test(
 
 py_test(
     name = "bazel_external_repository_test",
-    size = "medium",
+    size = "large",
     srcs = ["bazel_external_repository_test.py"],
     data = glob(["testdata/bazel_external_repository_test/**"]),
     tags = [
@@ -78,7 +92,6 @@ py_test(
     ],
     deps = [
         ":test_base",
-        "//third_party/py/six",
     ],
 )
 
@@ -93,9 +106,10 @@ py_test(
         "//src/conditions:windows": "bazel_windows_test.py",
         "//conditions:default": "empty_test.py",
     }),
+    shard_count = 3,
     deps = select({
         "//src/conditions:windows": [":test_base"],
-        "//conditions:default": [],
+        "//conditions:default": ["//third_party/py/abseil"],
     }),
 )
 
@@ -112,7 +126,7 @@ py_test(
     }),
     deps = select({
         "//src/conditions:windows": [":test_base"],
-        "//conditions:default": [],
+        "//conditions:default": ["//third_party/py/abseil"],
     }),
 )
 
@@ -127,15 +141,17 @@ py_test(
         "//src/conditions:windows": "windows_remote_test.py",
         "//conditions:default": "empty_test.py",
     }),
+    # TODO - ilist@: fix the setup of rules_shell for this test
+    tags = ["manual"],
     deps = select({
         "//src/conditions:windows": [":test_base"],
-        "//conditions:default": [],
+        "//conditions:default": ["//third_party/py/abseil"],
     }),
 )
 
 py_test(
     name = "launcher_test",
-    size = "medium",
+    size = "large",
     srcs = ["launcher_test.py"],
     deps = [":test_base"],
 )
@@ -145,9 +161,11 @@ py_test(
     timeout = "long",
     srcs = ["runfiles_test.py"],
     data = glob(["testdata/runfiles_test/**"]),
+    tags = [
+        "requires-network",
+    ],
     deps = [
         ":test_base",
-        "//third_party/py/six",
     ],
 )
 
@@ -159,6 +177,7 @@ py_test(
     tags = [
         # Windows does not support sandboxing yet.
         "no_windows",
+        "requires-network",
     ],
     deps = [":test_base"],
 )
@@ -176,7 +195,7 @@ py_test(
     }),
     deps = select({
         "//src/conditions:windows": [":test_base"],
-        "//conditions:default": [],
+        "//conditions:default": ["//third_party/py/abseil"],
     }),
 )
 
@@ -198,8 +217,8 @@ py_test(
     }),
     data = select({
         "//src/conditions:windows": [
-            ":printargs",
             "native_test.bzl",
+            ":printargs",
         ],
         "//conditions:default": [],
     }),
@@ -209,7 +228,7 @@ py_test(
     }),
     deps = select({
         "//src/conditions:windows": [":test_base"],
-        "//conditions:default": [],
+        "//conditions:default": ["//third_party/py/abseil"],
     }),
 )
 
@@ -233,13 +252,6 @@ py_test(
 )
 
 py_test(
-    name = "action_replay_test",
-    size = "medium",
-    srcs = ["action_replay_test.py"],
-    deps = [":test_base"],
-)
-
-py_test(
     name = "genrule_test",
     size = "medium",
     srcs = ["genrule_test.py"],
@@ -247,8 +259,9 @@ py_test(
 )
 
 py_test(
-    name = "bazel_workspace_test",
-    srcs = ["bazel_workspace_test.py"],
+    name = "bazel_tools_proto_test",
+    size = "medium",
+    srcs = ["bazel_tools_proto_test.py"],
     deps = [":test_base"],
 )
 
@@ -260,9 +273,201 @@ py_library(
 py_test(
     name = "bazel_module_test",
     size = "large",
+    timeout = "eternal",
     srcs = ["bzlmod/bazel_module_test.py"],
+    tags = [
+        "requires-network",
+    ],
     deps = [
         ":bzlmod_test_utils",
         ":test_base",
+    ],
+)
+
+py_test(
+    name = "bazel_lockfile_test",
+    size = "large",
+    srcs = ["bzlmod/bazel_lockfile_test.py"],
+    shard_count = 5,
+    tags = [
+        "requires-network",
+    ],
+    deps = [
+        ":bzlmod_test_utils",
+        ":test_base",
+    ],
+)
+
+py_test(
+    name = "bazel_fetch_test",
+    size = "medium",
+    srcs = ["bzlmod/bazel_fetch_test.py"],
+    data = ["//tools/build_defs/repo:mock_srcs"],
+    shard_count = 5,
+    tags = [
+        "requires-network",
+    ],
+    deps = [
+        ":bzlmod_test_utils",
+        ":test_base",
+    ],
+)
+
+py_test(
+    name = "bazel_vendor_test",
+    size = "large",
+    srcs = ["bzlmod/bazel_vendor_test.py"],
+    data = [
+        "//src:MODULE.tools",
+        "//tools:BUILD.tools",
+        "//tools:build_defs.bzl",
+        "//tools/build_defs/repo:mock_srcs",
+    ],
+    shard_count = 5,
+    tags = [
+        "requires-network",
+    ],
+    deps = [
+        ":bzlmod_test_utils",
+        ":test_base",
+    ],
+)
+
+py_test(
+    name = "bazel_overrides_test",
+    size = "large",
+    srcs = ["bzlmod/bazel_overrides_test.py"],
+    shard_count = 4,
+    tags = [
+        "requires-network",
+    ],
+    deps = [
+        ":bzlmod_test_utils",
+        ":test_base",
+    ],
+)
+
+py_test(
+    name = "bazel_repo_mapping_test",
+    size = "large",
+    srcs = ["bzlmod/bazel_repo_mapping_test.py"],
+    tags = [
+        "requires-network",
+    ],
+    deps = [
+        ":bzlmod_test_utils",
+        ":test_base",
+    ],
+)
+
+py_test(
+    name = "bazel_yanked_versions_test",
+    size = "large",
+    srcs = ["bzlmod/bazel_yanked_versions_test.py"],
+    tags = [
+        "requires-network",
+    ],
+    deps = [
+        ":bzlmod_test_utils",
+        ":test_base",
+    ],
+)
+
+py_test(
+    name = "options_test",
+    srcs = ["options_test.py"],
+    deps = [":test_base"],
+)
+
+py_test(
+    name = "bzlmod_query_test",
+    size = "large",
+    srcs = ["bzlmod/bzlmod_query_test.py"],
+    tags = [
+        "requires-network",
+    ],
+    deps = [
+        ":bzlmod_test_utils",
+        ":test_base",
+    ],
+)
+
+py_test(
+    name = "mod_command_test",
+    size = "large",
+    srcs = ["bzlmod/mod_command_test.py"],
+    shard_count = 8,
+    tags = [
+        "requires-network",
+    ],
+    deps = [
+        ":bzlmod_test_utils",
+        ":test_base",
+    ],
+)
+
+py_test(
+    name = "repo_contents_cache_test",
+    size = "large",
+    srcs = ["bzlmod/repo_contents_cache_test.py"],
+    shard_count = 4,
+    tags = ["requires-network"],
+    deps = [
+        ":bzlmod_test_utils",
+        ":test_base",
+    ],
+)
+
+py_library(
+    name = "remote_repo_contents_cache_test_base",
+    testonly = 1,
+    srcs = ["bzlmod/remote_repo_contents_cache_test_base.py"],
+    deps = [":test_base"],
+)
+
+py_test(
+    name = "remote_repo_contents_cache_test",
+    size = "large",
+    srcs = ["bzlmod/remote_repo_contents_cache_test.py"],
+    shard_count = 2,
+    tags = ["requires-network"],
+    deps = [":remote_repo_contents_cache_test_base"],
+)
+
+py_test(
+    name = "remote_repo_contents_cache_rewinding_test",
+    size = "large",
+    srcs = ["bzlmod/remote_repo_contents_cache_rewinding_test.py"],
+    tags = ["requires-network"],
+    deps = [":remote_repo_contents_cache_test_base"],
+)
+
+py_test(
+    name = "bzlmod_credentials_test",
+    size = "large",
+    srcs = ["bzlmod/bzlmod_credentials_test.py"],
+    tags = [
+        "no_windows",  # test uses a Python script as a credential helper
+        "requires-network",
+    ],
+    deps = [
+        ":bzlmod_test_utils",
+        ":test_base",
+    ],
+)
+
+py_test(
+    name = "external_repo_completion_test",
+    size = "large",
+    srcs = ["bzlmod/external_repo_completion_test.py"],
+    data = ["//scripts:bash_completion"],
+    tags = [
+        "no_windows",  # //scripts:bash_completion does not build on Windows
+        "requires-network",
+    ],
+    deps = [
+        ":bzlmod_test_utils",
+        ":test_base",
+        requirement("bazel-runfiles"),
     ],
 )

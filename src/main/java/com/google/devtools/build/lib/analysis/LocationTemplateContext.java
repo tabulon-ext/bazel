@@ -50,20 +50,21 @@ final class LocationTemplateContext implements TemplateContext {
   private final ImmutableMap<String, LocationFunction> functions;
   private final RepositoryMapping repositoryMapping;
   private final boolean windowsPath;
+  private final String workspaceRunfilesDirectory;
 
   private LocationTemplateContext(
       TemplateContext delegate,
       Label root,
       Supplier<Map<Label, Collection<Artifact>>> locationMap,
       boolean execPaths,
-      boolean legacyExternalRunfiles,
       RepositoryMapping repositoryMapping,
-      boolean windowsPath) {
+      boolean windowsPath,
+      String workspaceRunfilesDirectory) {
     this.delegate = delegate;
-    this.functions =
-        LocationExpander.allLocationFunctions(root, locationMap, execPaths, legacyExternalRunfiles);
+    this.functions = LocationExpander.allLocationFunctions(root, locationMap, execPaths);
     this.repositoryMapping = repositoryMapping;
     this.windowsPath = windowsPath;
+    this.workspaceRunfilesDirectory = workspaceRunfilesDirectory;
   }
 
   public LocationTemplateContext(
@@ -81,9 +82,9 @@ final class LocationTemplateContext implements TemplateContext {
         Suppliers.memoize(
             () -> LocationExpander.buildLocationMap(ruleContext, labelMap, allowData, collectSrcs)),
         execPaths,
-        ruleContext.getConfiguration().legacyExternalRunfiles(),
-        ruleContext.getRule().getPackage().getRepositoryMapping(),
-        windowsPath);
+        ruleContext.getRule().getPackageMetadata().repositoryMapping(),
+        windowsPath,
+        ruleContext.getWorkspaceName());
   }
 
   @Override
@@ -108,7 +109,7 @@ final class LocationTemplateContext implements TemplateContext {
     try {
       LocationFunction f = functions.get(name);
       if (f != null) {
-        return f.apply(param, repositoryMapping);
+        return f.apply(param, repositoryMapping, workspaceRunfilesDirectory);
       }
     } catch (IllegalStateException e) {
       throw new ExpansionException(e.getMessage(), e);

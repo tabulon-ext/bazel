@@ -1,24 +1,21 @@
 load("@rules_java//java:defs.bzl", "java_library")
 
 package(
-    default_visibility = ["//src:__subpackages__"],
+    default_applicable_licenses = ["//:license"],
+    default_visibility = ["//src/main/java/com/google/devtools/build/lib:build_lib"],
 )
-
-licenses(["notice"])
 
 filegroup(
     name = "srcs",
     srcs = glob(["*"]),
-    visibility = ["//src:__subpackages__"],
+    visibility = ["//src/main/java/com/google/devtools/build/lib/remote:__pkg__"],
 )
 
 java_library(
     name = "zstd",
     srcs = glob(["*.java"]),
     deps = [
-        "//third_party:apache_commons_compress",
-        "//third_party:guava",
-        "//third_party/protobuf:protobuf_java",
-        "@zstd-jni",
+        "//third_party/java/guava:base",
+        "//third_party/java/zstd_jni",
     ],
 )

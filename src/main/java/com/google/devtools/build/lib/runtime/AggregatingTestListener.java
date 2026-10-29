@@ -14,6 +14,8 @@
 
 package com.google.devtools.build.lib.runtime;
 
+import static com.google.common.base.Preconditions.checkNotNull;
+
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableSet;
@@ -21,24 +23,24 @@ import com.google.common.collect.Sets;
 import com.google.common.eventbus.AllowConcurrentEvents;
 import com.google.common.eventbus.EventBus;
 import com.google.common.eventbus.Subscribe;
-import com.google.devtools.build.lib.actions.ActionOwner;
 import com.google.devtools.build.lib.analysis.AliasProvider;
 import com.google.devtools.build.lib.analysis.AnalysisFailureEvent;
 import com.google.devtools.build.lib.analysis.ConfiguredTarget;
 import com.google.devtools.build.lib.analysis.TargetCompleteEvent;
 import com.google.devtools.build.lib.analysis.test.TestResult;
+import com.google.devtools.build.lib.analysis.test.TestRunnerAction;
 import com.google.devtools.build.lib.buildtool.BuildResult;
 import com.google.devtools.build.lib.buildtool.buildevent.BuildCompleteEvent;
 import com.google.devtools.build.lib.buildtool.buildevent.BuildInterruptedEvent;
 import com.google.devtools.build.lib.buildtool.buildevent.TestFilteringCompleteEvent;
 import com.google.devtools.build.lib.concurrent.ThreadSafety;
 import com.google.devtools.build.lib.exec.ExecutionOptions;
-import com.google.devtools.build.lib.runtime.TerminalTestResultNotifier.TestSummaryOptions;
 import com.google.devtools.build.lib.runtime.TestResultAggregator.AggregationPolicy;
 import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
 import com.google.devtools.build.lib.server.FailureDetails.TestCommand;
 import com.google.devtools.build.lib.server.FailureDetails.TestCommand.Code;
 import com.google.devtools.build.lib.skyframe.ConfiguredTargetKey;
+import com.google.devtools.build.lib.skyframe.TopLevelStatusEvents.TestAnalyzedEvent;
 import com.google.devtools.build.lib.util.DetailedExitCode;
 import com.google.devtools.build.lib.util.DetailedExitCode.DetailedExitCodeComparator;
 import com.google.devtools.build.lib.view.test.TestStatus.BlazeTestStatus;
@@ -80,8 +82,10 @@ public final class AggregatingTestListener {
   }
 
   /**
-   * Populates the test summary map as soon as test filtering is complete.
-   * This is the earliest at which the final set of targets to test is known.
+   * Populates the test summary map as soon as test filtering is complete. This is the earliest at
+   * which the final set of targets to test is known.
+   *
+   * <p>This is used in the non-Skymeld case.
    */
   @Subscribe
   @AllowConcurrentEvents
@@ -89,11 +93,12 @@ public final class AggregatingTestListener {
     AggregationPolicy policy =
         new AggregationPolicy(
             eventBus,
-            executionOptions.testCheckUpToDate,
-            summaryOptions.testVerboseTimeoutWarnings);
+            executionOptions.getTestCheckUpToDate(),
+            summaryOptions.getTestVerboseTimeoutWarnings());
     // Add all target runs to the map, assuming 1:1 status artifact <-> result.
     for (ConfiguredTarget target : event.getTestTargets()) {
       if (AliasProvider.isAlias(target)) {
+        // It is safe to skip aliases because the actual target will be in event.getTestTargets().
         continue;
       }
       TestResultAggregator aggregator =
@@ -109,19 +114,50 @@ public final class AggregatingTestListener {
   }
 
   /**
-   * Records a new test run result and incrementally updates the target status.
-   * This event is sent upon completion of executed test runs.
+   * Creates the {@link TestResultAggregator} for the analyzed test target.
+   *
+   * <p>Since the event is fired from within a SkyFunction, it is possible to receive duplicate
+   * events. In case of duplication, simply return without creating any new aggregator.
+   *
+   * <p>This is used in the Skymeld case.
+   */
+  @Subscribe
+  @AllowConcurrentEvents
+  public void populateTest(TestAnalyzedEvent event) {
+    ConfiguredTarget target = event.configuredTarget();
+    // Even if target is an alias, we still need to ensure that there's an aggregator present.
+    // Nothing guarantees that the actual target's TestAnalyzedEvent is posted before the alias
+    // completes the test (b/419325593). Using computeIfAbsent ensures that we have a single
+    // aggregator, as this method can be called concurrently for an alias and its actual target.
+    aggregators.computeIfAbsent(
+        asKey(target),
+        k ->
+            new TestResultAggregator(
+                target.getActual(), // In case target is an alias.
+                event.buildConfigurationValue(),
+                new AggregationPolicy(
+                    eventBus,
+                    executionOptions.getTestCheckUpToDate(),
+                    summaryOptions.getTestVerboseTimeoutWarnings()),
+                event.isSkipped()));
+  }
+
+  /**
+   * Records a new test run result and incrementally updates the target status. This event is sent
+   * upon completion of executed test runs.
    */
   @Subscribe
   @AllowConcurrentEvents
   public void testEvent(TestResult result) {
-    ActionOwner testOwner = result.getTestAction().getOwner();
-    ConfiguredTargetKey configuredTargetKey =
+    TestRunnerAction testAction = result.getTestAction();
+    ConfiguredTargetKey key =
         ConfiguredTargetKey.builder()
-            .setLabel(testOwner.getLabel())
-            .setConfiguration(result.getTestAction().getConfiguration())
+            .setLabel(testAction.getOwner().getLabel())
+            .setConfiguration(testAction.getConfiguration())
             .build();
-    aggregators.get(configuredTargetKey).testEvent(result);
+    TestResultAggregator aggregator =
+        checkNotNull(aggregators.get(key), "Missing aggregator for %s", key);
+    aggregator.testEvent(result);
   }
 
   private void targetFailure(ConfiguredTargetKey configuredTargetKey) {
@@ -229,7 +265,9 @@ public final class AggregatingTestListener {
     DetailedExitCode systemFailure = null;
     for (ConfiguredTarget testTarget : testTargets) {
       ConfiguredTargetKey key = asKey(testTarget);
-      TestResultAggregator aggregator = aggregators.get(key);
+      TestResultAggregator aggregator =
+          Preconditions.checkNotNull(
+              aggregators.get(key), "Missing aggregator (key=%s, testTarget=%s)", key, testTarget);
       TestSummary summary;
       if (AliasProvider.isAlias(testTarget)) {
         TestSummary.Builder summaryBuilder = TestSummary.newBuilder(testTarget);
@@ -303,7 +341,7 @@ public final class AggregatingTestListener {
   private static ConfiguredTargetKey asKey(ConfiguredTarget target) {
     return ConfiguredTargetKey.builder()
         .setLabel(target.getLabel())
-        .setConfigurationKey(target.getConfigurationKey())
+        .setConfigurationKey(target.getActual().getConfigurationKey())
         .build();
   }
 }

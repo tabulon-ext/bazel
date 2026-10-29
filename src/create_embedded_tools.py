@@ -6,7 +6,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#    http:#www.apache.org/licenses/LICENSE-2.0
+#    http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -28,32 +28,33 @@ from src.create_embedded_tools_lib import copy_zip_to_zip
 from src.create_embedded_tools_lib import is_executable
 
 output_paths = [
+    ('*MODULE.tools', lambda x: 'MODULE.bazel'),
     ('*tools/jdk/BUILD.tools', lambda x: 'tools/jdk/BUILD'),
-    ('*tools/build_defs/repo/BUILD.repo',
-     lambda x: 'tools/build_defs/repo/BUILD'),
-    ('*tools/j2objc/BUILD.tools', lambda x: 'tools/j2objc/BUILD'),
-    ('*tools/platforms/BUILD.tools', lambda x: 'platforms/BUILD'),
+    (
+        '*tools/build_defs/repo/BUILD.repo',
+        lambda x: 'tools/build_defs/repo/BUILD',
+    ),
+    (
+        '*tools/build_defs/build_info/BUILD.tools',
+        lambda x: 'tools/build_defs/build_info/BUILD',
+    ),
+    (
+        '*tools/build_defs/build_info/templates/BUILD.tools',
+        lambda x: 'tools/build_defs/build_info/templates/BUILD',
+    ),
     ('*tools/platforms/*', lambda x: 'platforms/' + os.path.basename(x)),
     ('*tools/cpp/BUILD.tools', lambda x: 'tools/cpp/BUILD'),
-    ('*tools/cpp/runfiles/generated_*',
-     lambda x: 'tools/cpp/runfiles/' + os.path.basename(x)[len('generated_'):]),
-    ('*BUILD.java_langtools', lambda x: 'third_party/java/jdk/langtools/BUILD'),
     ('*launcher.exe', lambda x: 'tools/launcher/launcher.exe'),
+    ('*launcher_maker.exe', lambda x: 'tools/launcher/launcher_maker.exe'),
     ('*def_parser.exe', lambda x: 'tools/def_parser/def_parser.exe'),
     ('*zipper.exe', lambda x: 'tools/zip/zipper/zipper.exe'),
     ('*zipper', lambda x: 'tools/zip/zipper/zipper'),
-    ('*xcode*make_hashed_objlist.py',
-     lambda x: 'tools/objc/make_hashed_objlist.py'),
-    ('*xcode*xcode-locator', lambda x: 'tools/objc/xcode-locator'),
-    ('*src/tools/xcode/*', lambda x: 'tools/objc/' + os.path.basename(x)),
-    # --experimental_sibling_repository_layout=false
     ('*external/openjdk_*/file/*.tar.gz', lambda x: 'jdk.tar.gz'),
     ('*external/openjdk_*/file/*.zip', lambda x: 'jdk.zip'),
-    # --experimental_sibling_repository_layout=true
-    ('*openjdk_*/file/*.tar.gz', lambda x: 'jdk.tar.gz'),
-    ('*openjdk_*/file/*.zip', lambda x: 'jdk.zip'),
     ('*src/minimal_jdk.tar.gz', lambda x: 'jdk.tar.gz'),
     ('*src/minimal_jdk.zip', lambda x: 'jdk.zip'),
+    ('*src/allmodules_jdk.tar.gz', lambda x: 'jdk.tar.gz'),
+    ('*src/allmodules_jdk.zip', lambda x: 'jdk.zip'),
     ('*.bzl.tools', lambda x: x[:-6]),
     ('*', lambda x: re.sub(r'^.*bazel-out/[^/]*/bin/', '', x, count=1)),
 ]
@@ -122,10 +123,6 @@ def main():
   # Adding contextlib.closing to be python 2.6 (for centos 6.7) compatible
   with contextlib.closing(
       zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED)) as output_zip:
-    zipinfo = zipfile.ZipInfo('WORKSPACE', (1980, 1, 1, 0, 0, 0))
-    zipinfo.external_attr = 0o644 << 16
-    output_zip.writestr(zipinfo, 'workspace(name = "bazel_tools")\n')
-
     # By sorting the file list, the resulting ZIP file will be reproducible and
     # deterministic.
     for archive_file, input_file in sorted(input_files.items()):

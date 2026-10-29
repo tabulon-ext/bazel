@@ -34,10 +34,15 @@ public final class PackagePathInfoItem extends InfoItem {
   }
 
   @Override
+  public boolean requiresWorkspace() {
+    return true;
+  }
+
+  @Override
   public byte[] get(
       Supplier<BuildConfigurationValue> configurationSupplier, CommandEnvironment env) {
     checkNotNull(commandOptions);
     PackageOptions packageOptions = commandOptions.getOptions(PackageOptions.class);
-    return print(Joiner.on(":").join(packageOptions.packagePath));
+    return print(Joiner.on(":").join(packageOptions.getPackagePath()));
   }
 }

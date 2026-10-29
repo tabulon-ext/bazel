@@ -19,6 +19,9 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.flogger.GoogleLogger;
 import com.google.devtools.build.lib.bugreport.BugReporter;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -46,8 +49,7 @@ public class ThreadUtils {
       MAP_WITH_ARRAY_LIST_VALUES_COLLECTOR =
           Collectors.groupingBy(StackTraceAndState::new, toCollection(ArrayList::new));
 
-  private ThreadUtils() {
-  }
+  private ThreadUtils() {}
 
   /** Write a thread dump to the blaze.INFO log if interrupt took too long. */
   public static synchronized void warnAboutSlowInterrupt(
@@ -56,7 +58,7 @@ public class ThreadUtils {
   }
 
   @VisibleForTesting
-  static synchronized void warnAboutSlowInterrupt(
+  public static synchronized void warnAboutSlowInterrupt(
       @Nullable String slowInterruptMessageSuffix, BugReporter bugReporter) {
     logger.atWarning().log("Interrupt took too long. Dumping thread state.");
     AtomicReference<StackTraceAndState> firstTrace = new AtomicReference<>();
@@ -74,10 +76,7 @@ public class ThreadUtils {
               // AbstractQueueVisitor#reallyAwaitTermination) but unless there's a bug, there should
               // still be another thread waiting for interrupt somewhere.
               if (firstTrace.get() == null
-                  && (!stackTraceAndState.trace[0].getClassName().endsWith("misc.Unsafe")
-                      || !stackTraceAndState.trace[0].getMethodName().equals("park"))
-                  && (!stackTraceAndState.trace[0].getClassName().endsWith("java.lang.Object")
-                      || !stackTraceAndState.trace[0].getMethodName().equals("wait"))) {
+                  && !isInterruptibleWaitingOrParked(stackTraceAndState.trace)) {
                 firstTrace.compareAndSet(null, stackTraceAndState);
               }
               logger.atWarning().log(
@@ -87,14 +86,54 @@ public class ThreadUtils {
                   makeString(stackTraceAndState.trace));
             });
 
+    try {
+      logger.atWarning().log("Dumping additional thread state using ThreadDumper:");
+
+      var out = new ByteArrayOutputStream();
+      ThreadDumper.dumpThreads(out);
+
+      var in = new ByteArrayInputStream(out.toByteArray());
+      var analyzedThreadDump = new ThreadDumpAnalyzer().analyze(in);
+
+      for (var line : analyzedThreadDump.otherLines()) {
+        logger.atWarning().log("%s", line);
+      }
+      for (var stackTrace : analyzedThreadDump.groupedStackTraces()) {
+        logger.atWarning().log("%s", stackTrace);
+      }
+
+    } catch (IOException e) {
+      logger.atWarning().withCause(e).log("Failed to dump threads with ThreadDumper.");
+    }
+
     SlowInterruptInnerException inner =
         new SlowInterruptInnerException(
             Joiner.on(' ')
                 .skipNulls()
                 .join("(Wrapper exception for longest stack trace)", slowInterruptMessageSuffix));
-    inner.setStackTrace(firstTrace.get().trace);
+    StackTraceAndState longestTrace = firstTrace.get();
+    if (longestTrace != null) {
+      inner.setStackTrace(longestTrace.trace);
+    } else {
+      inner.setStackTrace(new StackTraceElement[0]);
+    }
     SlowInterruptException ex = new SlowInterruptException(inner);
     bugReporter.sendBugReport(ex);
+  }
+
+  private static boolean isInterruptibleWaitingOrParked(StackTraceElement[] trace) {
+    if (trace.length == 0) {
+      return false;
+    }
+    StackTraceElement top = trace[0];
+    if (top.getClassName().endsWith("misc.Unsafe") && top.getMethodName().equals("park")) {
+      return true;
+    }
+    if (top.getClassName().endsWith("java.lang.Object")
+        && (top.getMethodName().equals("wait") || top.getMethodName().equals("wait0"))) {
+      return true;
+    }
+    return false;
   }
 
   private static final class SlowInterruptException extends RuntimeException {
@@ -122,10 +161,9 @@ public class ThreadUtils {
       if (obj == this) {
         return true;
       }
-      if (!(obj instanceof StackTraceAndState)) {
+      if (!(obj instanceof StackTraceAndState that)) {
         return false;
       }
-      StackTraceAndState that = (StackTraceAndState) obj;
       return Arrays.equals(this.trace, that.trace) && this.state.equals(that.state);
     }
 

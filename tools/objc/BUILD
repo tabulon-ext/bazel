@@ -1,3 +1,6 @@
+load("@apple_support//xcode:xcode_config.bzl", "xcode_config")
+load("@rules_cc//cc:objc_library.bzl", "objc_library")
+
 package(default_visibility = ["//visibility:public"])
 
 # Files which shouldn't be publicly visible and dependencies of all objc_* or ios_* rules shouldn't be in this package.
@@ -8,28 +11,8 @@ filegroup(
     srcs = glob(["**"]),
 )
 
-sh_binary(
-    name = "xcrunwrapper",
-    srcs = [":xcrunwrapper.sh"],
-)
-
-filegroup(
-    name = "gcov",
-    srcs = [":gcov_stub"],
-)
-
-filegroup(
-    name = "mcov",
-    srcs = [":mcov_stub"],
-)
-
 xcode_config(
     name = "host_xcodes",
-)
-
-filegroup(
-    name = "j2objc_dead_code_pruner",
-    srcs = ["j2objc_dead_code_pruner.py"],
 )
 
 objc_library(
@@ -37,4 +20,6 @@ objc_library(
     srcs = [
         "objc_dummy.mm",
     ],
+    target_compatible_with = ["@platforms//os:macos"],
+    alwayslink = False,
 )

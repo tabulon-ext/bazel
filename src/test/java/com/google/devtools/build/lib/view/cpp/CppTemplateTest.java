@@ -15,12 +15,15 @@
 package com.google.devtools.build.lib.view.cpp;
 
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.common.truth.Truth.assertWithMessage;
 import static org.junit.Assert.assertThrows;
 
 import com.google.devtools.build.lib.actions.BuildFailedException;
 import com.google.devtools.build.lib.buildtool.util.BuildIntegrationTestCase;
+import com.google.devtools.build.lib.events.EventKind;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.Path;
+import com.google.devtools.build.skyframe.ValueWithMetadata;
 import com.google.testing.junit.testparameterinjector.TestParameter;
 import com.google.testing.junit.testparameterinjector.TestParameterInjector;
 import java.io.IOException;
@@ -45,9 +48,17 @@ public class CppTemplateTest extends BuildIntegrationTestCase {
         "tree = rule(implementation = _impl)");
     write(
         "tree/BUILD",
-        "load(':tree.bzl', 'tree')",
-        "tree(name = 'lib')",
-        "cc_library(name = 'cc', srcs = [':lib'])");
+        """
+        load("@rules_cc//cc:cc_library.bzl", "cc_library")
+        load(":tree.bzl", "tree")
+
+        tree(name = "lib")
+
+        cc_library(
+            name = "cc",
+            srcs = [":lib"],
+        )
+        """);
     addOptions("--keep_going=" + keepGoing);
     // In addition to testing the specific functionality of erroring out when there is an irrelevant
     // file in the tree, this test also checks that error messages are properly cached in Skyframe.
@@ -62,7 +73,6 @@ public class CppTemplateTest extends BuildIntegrationTestCase {
               "tree/BUILD:[0-9]+:[0-9]+: Compiling all C\\+\\+ files in tree/dir failed: Artifact"
                   + " '.*/tree/dir/other.file' expanded from the directory artifact '.*/tree/dir'"
                   + " is neither header nor source file"));
-      events.clear();
     }
   }
 
@@ -80,22 +90,32 @@ public class CppTemplateTest extends BuildIntegrationTestCase {
   public void badActionName() throws Exception {
     write(
         "tree/tree.bzl",
-        "def _impl(ctx):",
-        "  dir = ctx.actions.declare_directory('dir')",
-        "  ctx.actions.run_shell(outputs = [dir], command = 'touch %s/file.cc' % (dir.path))",
-        "  return [DefaultInfo(files = depset([dir]))]",
-        "",
-        "tree = rule(implementation = _impl)");
+        """
+        def _impl(ctx):
+            dir = ctx.actions.declare_directory("dir")
+            ctx.actions.run_shell(outputs = [dir], command = "touch %s/file.cc" % (dir.path))
+            return [DefaultInfo(files = depset([dir]))]
+
+        tree = rule(implementation = _impl)
+        """);
     write(
         "tree/BUILD",
-        "load(':tree.bzl', 'tree')",
-        "tree(name = 'lib')",
-        "cc_library(name = 'cc', srcs = [':lib'])");
+        """
+        load("@rules_cc//cc:cc_library.bzl", "cc_library")
+        load(":tree.bzl", "tree")
+
+        tree(name = "lib")
+
+        cc_library(
+            name = "cc",
+            srcs = [":lib"],
+        )
+        """);
     // Hack up the workspace to make *.cc files not associated to any C++ action name. Should never
     // happen in practice.
     actionNamesBzl =
         getWorkspace().getRelative("third_party/bazel_rules/rules_cc/cc/action_names.bzl");
-    String oldContents = new String(FileSystemUtils.readContentAsLatin1(actionNamesBzl));
+    String oldContents = FileSystemUtils.readContentAsLatin1(actionNamesBzl);
     // Don't overwrite the user's source tree on a local test run when this is a symlink.
     assertThat(actionNamesBzl.delete()).isTrue();
     String originalActionName = "CPP_COMPILE_ACTION_NAME = \"c++-compile\"";
@@ -103,12 +123,54 @@ public class CppTemplateTest extends BuildIntegrationTestCase {
     FileSystemUtils.writeContentAsLatin1(
         actionNamesBzl,
         oldContents.replace(originalActionName, "CPP_COMPILE_ACTION_NAME = \"c++++++-compile\""));
-    String writtenContents = new String(FileSystemUtils.readContentAsLatin1(actionNamesBzl));
+    String writtenContents = FileSystemUtils.readContentAsLatin1(actionNamesBzl);
     assertThat(writtenContents).contains("\"c++++++-compile\"");
     assertThrows(BuildFailedException.class, () -> buildTarget("//tree:cc"));
     events.assertContainsError(
         Pattern.compile(
             "tree/BUILD:[0-9]+:[0-9]+: Compiling all C\\+\\+ files in tree/dir failed: Expected"
                 + " action_config for 'c\\+\\+-compile' to be configured"));
+  }
+
+  @Test
+  public void warningNotPersisted() throws Exception {
+    write(
+        "tree/tree.bzl",
+        """
+        def _impl(ctx):
+            dir = ctx.actions.declare_directory("dir")
+            ctx.actions.run_shell(outputs = [dir], command = "touch %s/file.cc" % (dir.path))
+            return [DefaultInfo(files = depset([dir]))]
+
+        tree = rule(implementation = _impl)
+        """);
+    write(
+        "tree/BUILD",
+        """
+        load(":tree.bzl", "tree")
+
+        tree(
+            name = "lib",
+            deprecation = "This is a warning",
+        )
+        """);
+    write(
+        "cc/BUILD",
+        "load('@rules_cc//cc:cc_library.bzl', 'cc_library')",
+        "cc_library(name = 'cc', srcs = ['//tree:lib'])");
+    buildTarget("//cc:cc");
+    assertContainsEvent(EventKind.WARNING, "This is a warning");
+    getSkyframeExecutor()
+        .getEvaluator()
+        .getDoneValues()
+        .forEach(
+            (k, v) ->
+                assertWithMessage("Node %s warnings", k)
+                    .that(ValueWithMetadata.getEvents(v).toList())
+                    .isEmpty());
+
+    // Warning is not replayed on a no-op incremental build.
+    buildTarget("//cc:cc");
+    assertDoesNotContainEvent("This is a warning");
   }
 }

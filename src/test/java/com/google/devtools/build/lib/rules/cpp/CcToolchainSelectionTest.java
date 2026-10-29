@@ -16,12 +16,12 @@ package com.google.devtools.build.lib.rules.cpp;
 
 import static com.google.common.truth.Truth.assertThat;
 
-import com.google.common.collect.ImmutableMap;
 import com.google.devtools.build.lib.analysis.ConfiguredTarget;
 import com.google.devtools.build.lib.analysis.platform.ToolchainInfo;
 import com.google.devtools.build.lib.analysis.util.BuildViewTestCase;
 import com.google.devtools.build.lib.analysis.util.ScratchAttributeWriter;
 import com.google.devtools.build.lib.cmdline.Label;
+import com.google.devtools.build.lib.packages.Info;
 import com.google.devtools.build.lib.packages.util.MockPlatformSupport;
 import com.google.devtools.build.lib.testutil.TestConstants;
 import org.junit.Before;
@@ -45,36 +45,40 @@ public class CcToolchainSelectionTest extends BuildViewTestCase {
   @Test
   public void testResolvedCcToolchain() throws Exception {
     useConfiguration(
-        "--incompatible_enable_cc_toolchain_resolution",
         "--experimental_platforms=//mock_platform:mock-k8-platform",
         "--extra_toolchains=//mock_platform:toolchain_cc-compiler-k8");
     ConfiguredTarget target =
-        ScratchAttributeWriter.fromLabelString(this, "cc_library", "//lib")
+        ScratchAttributeWriter.fromLabelString(
+                this,
+                "load('@rules_cc//cc:cc_library.bzl', 'cc_library')",
+                "cc_library",
+                "//lib")
             .setList("srcs", "a.cc")
             .write();
     ToolchainInfo toolchainInfo =
-        getRuleContext(target)
-            .getToolchainContext()
-            .forToolchainType(Label.parseAbsolute(CPP_TOOLCHAIN_TYPE, ImmutableMap.of()));
-    CcToolchainProvider toolchain = (CcToolchainProvider) toolchainInfo.getValue("cc");
+        getRuleContext(target).getToolchainInfo(Label.parseCanonical(CPP_TOOLCHAIN_TYPE));
+    CcToolchainProvider toolchain = CcToolchainProvider.wrap((Info) toolchainInfo.getValue("cc"));
+
     assertThat(toolchain.getToolchainIdentifier()).endsWith("k8");
   }
 
   @Test
   public void testToolchainSelectionWithPlatforms() throws Exception {
     useConfiguration(
-        "--incompatible_enable_cc_toolchain_resolution",
         "--experimental_platforms=//mock_platform:mock-k8-platform",
         "--extra_toolchains=//mock_platform:toolchain_cc-compiler-k8");
     ConfiguredTarget target =
-        ScratchAttributeWriter.fromLabelString(this, "cc_library", "//lib")
+        ScratchAttributeWriter.fromLabelString(
+                this,
+                "load('@rules_cc//cc:cc_library.bzl', 'cc_library')",
+                "cc_library",
+                "//lib")
             .setList("srcs", "a.cc")
             .write();
     ToolchainInfo toolchainInfo =
-        getRuleContext(target)
-            .getToolchainContext()
-            .forToolchainType(Label.parseAbsolute(CPP_TOOLCHAIN_TYPE, ImmutableMap.of()));
-    CcToolchainProvider toolchain = (CcToolchainProvider) toolchainInfo.getValue("cc");
+        getRuleContext(target).getToolchainInfo(Label.parseCanonical(CPP_TOOLCHAIN_TYPE));
+    CcToolchainProvider toolchain = CcToolchainProvider.wrap((Info) toolchainInfo.getValue("cc"));
+    ;
     assertThat(toolchain.getToolchainIdentifier()).endsWith("k8");
   }
 
@@ -101,9 +105,9 @@ public class CcToolchainSelectionTest extends BuildViewTestCase {
         "   all_files = ':dummy_filegroup',",
         ")",
         "filegroup(name = 'dummy_filegroup')");
+    mockToolsConfig.append("mock_platform/BUILD", "platform(name = 'mock-piii-platform')");
 
     useConfiguration(
-        "--incompatible_enable_cc_toolchain_resolution",
         "--experimental_platforms=//mock_platform:mock-piii-platform",
         "--extra_toolchains=//incomplete_toolchain:incomplete_toolchain_cc-compiler-piii");
 

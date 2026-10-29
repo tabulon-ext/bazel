@@ -34,7 +34,7 @@
 MappedFile::MappedFile()
     : mapped_start_(nullptr), mapped_end_(nullptr), fd_(-1) {}
 
-bool MappedFile::Open(const std::string& path) {
+bool MappedFile::Open(const std::string& path, bool populate) {
   if (is_open()) {
     diag_errx(1, "%s:%d: This instance is already open", __FILE__, __LINE__);
   }
@@ -44,10 +44,20 @@ bool MappedFile::Open(const std::string& path) {
   }
   // Map the file, even if it is empty (in which case allocate 1 byte to it).
   struct stat st;
-  if (fstat(fd_, &st) ||
-      (mapped_start_ = static_cast<unsigned char *>(
-           mmap(nullptr, st.st_size ? st.st_size : 1, PROT_READ, MAP_PRIVATE,
-                fd_, 0))) == MAP_FAILED) {
+
+  int flags = MAP_PRIVATE;
+
+  // If we know we'll need the whole file, prepopulate to avoid page faults
+  // later. This improves runtime: b/460101200#comment73
+#ifdef MAP_POPULATE
+  if (populate) {
+    flags |= MAP_POPULATE;
+  }
+#endif
+
+  if (fstat(fd_, &st) || (mapped_start_ = static_cast<unsigned char*>(
+                              mmap(nullptr, st.st_size ? st.st_size : 1,
+                                   PROT_READ, flags, fd_, 0))) == MAP_FAILED) {
     if (S_ISDIR(st.st_mode)) {
       diag_warn("%s:%d: %s is a directory", __FILE__, __LINE__, path.c_str());
     } else {

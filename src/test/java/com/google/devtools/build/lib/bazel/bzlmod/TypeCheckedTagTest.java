@@ -26,12 +26,13 @@ import static org.junit.Assert.assertThrows;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.devtools.build.lib.cmdline.Label;
+import com.google.devtools.build.lib.cmdline.PackageIdentifier;
 import com.google.devtools.build.lib.packages.Attribute.AllowedValueSet;
 import com.google.devtools.build.lib.packages.BuildType;
-import com.google.devtools.build.lib.packages.BuildType.LabelConversionContext;
+import com.google.devtools.build.lib.packages.LabelConverter;
 import com.google.devtools.build.lib.packages.Type;
+import com.google.devtools.build.lib.packages.Types;
 import com.google.devtools.build.lib.util.FileTypeSet;
-import java.util.HashMap;
 import net.starlark.java.eval.Dict;
 import net.starlark.java.eval.Mutability;
 import net.starlark.java.eval.Starlark;
@@ -53,7 +54,7 @@ public class TypeCheckedTagTest {
         StarlarkSemantics.DEFAULT,
         structure,
         fieldName,
-        /*defaultValue=*/ null);
+        /* defaultValue= */ null);
   }
 
   @Test
@@ -61,10 +62,14 @@ public class TypeCheckedTagTest {
     TypeCheckedTag typeCheckedTag =
         TypeCheckedTag.create(
             createTagClass(attr("foo", Type.INTEGER).build()),
-            buildTag("tag_name").addAttr("foo", StarlarkInt.of(3)).build(),
-            /*labelConversionContext=*/ null);
+            buildTag("tag_name").addAttr("foo", StarlarkInt.of(3)).setDevDependency().build(),
+            /* labelConverter= */ null,
+            "root module",
+            /* moduleIndex= */ 0,
+            /* tagIndex= */ 0);
     assertThat(typeCheckedTag.getFieldNames()).containsExactly("foo");
     assertThat(getattr(typeCheckedTag, "foo")).isEqualTo(StarlarkInt.of(3));
+    assertThat(typeCheckedTag.isDevDependency()).isTrue();
   }
 
   @Test
@@ -77,17 +82,20 @@ public class TypeCheckedTagTest {
                 .addAttr(
                     "foo", StarlarkList.immutableOf(":thing1", "//pkg:thing2", "@repo//pkg:thing3"))
                 .build(),
-            new LabelConversionContext(
-                Label.parseAbsoluteUnchecked("@myrepo//mypkg:defs.bzl"),
-                createRepositoryMapping(createModuleKey("test", "1.0"), "repo", "other_repo"),
-                new HashMap<>()));
+            new LabelConverter(
+                PackageIdentifier.parse("@myrepo//mypkg"),
+                createRepositoryMapping(createModuleKey("test", "1.0"), "repo", "other_repo")),
+            "root module",
+            /* moduleIndex= */ 0,
+            /* tagIndex= */ 0);
     assertThat(typeCheckedTag.getFieldNames()).containsExactly("foo");
     assertThat(getattr(typeCheckedTag, "foo"))
         .isEqualTo(
             StarlarkList.immutableOf(
-                Label.parseAbsoluteUnchecked("@myrepo//mypkg:thing1"),
-                Label.parseAbsoluteUnchecked("@myrepo//pkg:thing2"),
-                Label.parseAbsoluteUnchecked("@other_repo//pkg:thing3")));
+                Label.parseCanonicalUnchecked("@myrepo//mypkg:thing1"),
+                Label.parseCanonicalUnchecked("@myrepo//pkg:thing2"),
+                Label.parseCanonicalUnchecked("@other_repo//pkg:thing3")));
+    assertThat(typeCheckedTag.isDevDependency()).isFalse();
   }
 
   @Test
@@ -96,13 +104,16 @@ public class TypeCheckedTagTest {
         TypeCheckedTag.create(
             createTagClass(
                 attr("foo", BuildType.LABEL).allowedFileTypes(FileTypeSet.ANY_FILE).build()),
-            buildTag("tag_name").build(),
-            new LabelConversionContext(
-                Label.parseAbsoluteUnchecked("@myrepo//mypkg:defs.bzl"),
-                createRepositoryMapping(createModuleKey("test", "1.0"), "repo", "other_repo"),
-                new HashMap<>()));
+            buildTag("tag_name").setDevDependency().build(),
+            new LabelConverter(
+                PackageIdentifier.parse("@myrepo//mypkg"),
+                createRepositoryMapping(createModuleKey("test", "1.0"), "repo", "other_repo")),
+            "root module",
+            /* moduleIndex= */ 0,
+            /* tagIndex= */ 0);
     assertThat(typeCheckedTag.getFieldNames()).containsExactly("foo");
     assertThat(getattr(typeCheckedTag, "foo")).isEqualTo(Starlark.NONE);
+    assertThat(typeCheckedTag.isDevDependency()).isTrue();
   }
 
   @Test
@@ -110,17 +121,21 @@ public class TypeCheckedTagTest {
     TypeCheckedTag typeCheckedTag =
         TypeCheckedTag.create(
             createTagClass(
-                attr("foo", Type.STRING_LIST_DICT)
+                attr("foo", Types.STRING_LIST_DICT)
                     .value(ImmutableMap.of("key", ImmutableList.of("value1", "value2")))
                     .build()),
             buildTag("tag_name").build(),
-            null);
+            null,
+            "root module",
+            /* moduleIndex= */ 0,
+            /* tagIndex= */ 0);
     assertThat(typeCheckedTag.getFieldNames()).containsExactly("foo");
     assertThat(getattr(typeCheckedTag, "foo"))
         .isEqualTo(
             Dict.builder()
                 .put("key", StarlarkList.immutableOf("value1", "value2"))
                 .buildImmutable());
+    assertThat(typeCheckedTag.isDevDependency()).isFalse();
   }
 
   @Test
@@ -130,17 +145,21 @@ public class TypeCheckedTagTest {
             createTagClass(
                 attr("foo", Type.STRING).mandatory().build(),
                 attr("bar", Type.INTEGER).value(StarlarkInt.of(3)).build(),
-                attr("quux", Type.STRING_LIST).build()),
+                attr("quux", Types.STRING_LIST).build()),
             buildTag("tag_name")
                 .addAttr("foo", "fooValue")
                 .addAttr("quux", StarlarkList.immutableOf("quuxValue1", "quuxValue2"))
                 .build(),
-            /*labelConversionContext=*/ null);
+            /* labelConverter= */ null,
+            "root module",
+            /* moduleIndex= */ 0,
+            /* tagIndex= */ 0);
     assertThat(typeCheckedTag.getFieldNames()).containsExactly("foo", "bar", "quux");
     assertThat(getattr(typeCheckedTag, "foo")).isEqualTo("fooValue");
     assertThat(getattr(typeCheckedTag, "bar")).isEqualTo(StarlarkInt.of(3));
     assertThat(getattr(typeCheckedTag, "quux"))
         .isEqualTo(StarlarkList.immutableOf("quuxValue1", "quuxValue2"));
+    assertThat(typeCheckedTag.isDevDependency()).isFalse();
   }
 
   @Test
@@ -152,8 +171,11 @@ public class TypeCheckedTagTest {
                 TypeCheckedTag.create(
                     createTagClass(attr("foo", Type.STRING).mandatory().build()),
                     buildTag("tag_name").build(),
-                    /*labelConversionContext=*/ null));
-    assertThat(e).hasMessageThat().contains("mandatory attribute foo isn't being specified");
+                    /* labelConverter= */ null,
+                    "root module",
+                    /* moduleIndex= */ 0,
+                    /* tagIndex= */ 0));
+    assertThat(e).hasMessageThat().contains("mandatory attribute 'foo' isn't being specified");
   }
 
   @Test
@@ -168,10 +190,14 @@ public class TypeCheckedTagTest {
                             .allowedValues(new AllowedValueSet("yes", "no"))
                             .build()),
                     buildTag("tag_name").addAttr("foo", "maybe").build(),
-                    /*labelConversionContext=*/ null));
+                    /* labelConverter= */ null,
+                    "root module",
+                    /* moduleIndex= */ 0,
+                    /* tagIndex= */ 0));
     assertThat(e)
         .hasMessageThat()
-        .contains("the value for attribute foo has to be one of 'yes' or 'no' instead of 'maybe'");
+        .contains(
+            "the value for attribute 'foo' has to be one of 'yes' or 'no' instead of 'maybe'");
   }
 
   @Test
@@ -183,7 +209,25 @@ public class TypeCheckedTagTest {
                 TypeCheckedTag.create(
                     createTagClass(attr("foo", Type.STRING).build()),
                     buildTag("tag_name").addAttr("bar", "maybe").build(),
-                    /*labelConversionContext=*/ null));
-    assertThat(e).hasMessageThat().contains("unknown attribute bar provided");
+                    /* labelConverter= */ null,
+                    "root module",
+                    /* moduleIndex= */ 0,
+                    /* tagIndex= */ 0));
+    assertThat(e).hasMessageThat().contains("unknown attribute 'bar' provided");
+  }
+
+  @Test
+  public void sortKey() throws Exception {
+    var keyM1T1 = new TypeCheckedTag.SortKey(1, 1);
+    var keyM2T1 = new TypeCheckedTag.SortKey(2, 1);
+    var keyM1T2 = new TypeCheckedTag.SortKey(1, 2);
+    var keyM2T2 = new TypeCheckedTag.SortKey(2, 2);
+
+    assertThat(keyM1T1).isLessThan(keyM2T1);
+    assertThat(keyM2T1).isGreaterThan(keyM1T1);
+    assertThat(keyM1T1).isLessThan(keyM1T2);
+    assertThat(keyM1T2).isGreaterThan(keyM1T1);
+    assertThat(keyM2T1).isLessThan(keyM2T2);
+    assertThat(keyM2T2).isGreaterThan(keyM2T1);
   }
 }

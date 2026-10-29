@@ -1,0 +1,1571 @@
+// Copyright 2022 The Bazel Authors. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+package com.google.devtools.build.lib.remote;
+
+import static com.google.common.collect.Iterables.getOnlyElement;
+import static com.google.common.truth.Truth.assertThat;
+import static com.google.devtools.build.lib.vfs.FileSystemUtils.readContent;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assume.assumeFalse;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Sets;
+import com.google.devtools.build.lib.actions.ActionLookupData;
+import com.google.devtools.build.lib.actions.Artifact;
+import com.google.devtools.build.lib.actions.BuildFailedException;
+import com.google.devtools.build.lib.actions.SpawnResult;
+import com.google.devtools.build.lib.authandtls.credentialhelper.CredentialModule;
+import com.google.devtools.build.lib.dynamic.DynamicExecutionModule;
+import com.google.devtools.build.lib.remote.options.RemoteStartupOptions;
+import com.google.devtools.build.lib.remote.util.IntegrationTestUtils;
+import com.google.devtools.build.lib.remote.util.IntegrationTestUtils.WorkerInstance;
+import com.google.devtools.build.lib.runtime.BlazeModule;
+import com.google.devtools.build.lib.runtime.BlazeRuntime;
+import com.google.devtools.build.lib.runtime.BlockWaitingModule;
+import com.google.devtools.build.lib.runtime.BuildSummaryStatsModule;
+import com.google.devtools.build.lib.server.FailureDetails;
+import com.google.devtools.build.lib.skyframe.rewinding.RewindingTestsHelper;
+import com.google.devtools.build.lib.standalone.StandaloneModule;
+import com.google.devtools.build.lib.testutil.ActionEventRecorder;
+import com.google.devtools.build.lib.util.AbruptExitException;
+import com.google.devtools.build.lib.util.OS;
+import com.google.devtools.build.lib.vfs.FileSystemUtils;
+import com.google.devtools.build.lib.vfs.Path;
+import com.google.devtools.build.lib.vfs.PathFragment;
+import com.google.devtools.build.lib.vfs.Symlinks;
+import com.google.devtools.build.skyframe.SkyKey;
+import com.google.devtools.common.options.OptionsBase;
+import com.google.testing.junit.testparameterinjector.TestParameter;
+import com.google.testing.junit.testparameterinjector.TestParameterInjector;
+import java.io.IOException;
+import java.util.List;
+import java.util.UUID;
+import org.junit.ClassRule;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+
+/** Integration tests for Build without the Bytes. */
+@RunWith(TestParameterInjector.class)
+public class BuildWithoutTheBytesIntegrationTest extends BuildWithoutTheBytesIntegrationTestBase {
+  @ClassRule @Rule public static final WorkerInstance worker = IntegrationTestUtils.createWorker();
+
+  private final RewindingTestsHelper rewindingTestsHelper =
+      new RewindingTestsHelper(this, new ActionEventRecorder());
+
+  private static void assertRewoundActions(List<SkyKey> rewoundKeys, String... expectedLabels) {
+    assertThat(
+            rewoundKeys.stream()
+                .filter(key -> key instanceof ActionLookupData)
+                .map(
+                    key ->
+                        ((ActionLookupData) key)
+                            .getActionLookupKey()
+                            .getLabel()
+                            .getCanonicalForm()))
+        .containsExactlyElementsIn(ImmutableList.copyOf(expectedLabels));
+  }
+
+  @TestParameter public boolean useDiskCache;
+  private Path diskCacheDir;
+
+  @Override
+  protected ImmutableList<Class<? extends OptionsBase>> getStartupOptionClasses() {
+    return ImmutableList.<Class<? extends OptionsBase>>builder()
+        .addAll(super.getStartupOptionClasses())
+        .add(RemoteStartupOptions.class)
+        .build();
+  }
+
+  @Override
+  protected ImmutableList<String> getStartupOptions() {
+    // Some tests require the ability to create symlinks on Windows.
+    return OS.getCurrent() == OS.WINDOWS
+        ? ImmutableList.of("--windows_enable_symlinks")
+        : ImmutableList.of();
+  }
+
+  @Override
+  protected void setupOptions() throws Exception {
+    super.setupOptions();
+
+    addOptions(
+        "--remote_executor=grpc://localhost:" + worker.getPort(),
+        "--remote_download_minimal",
+        "--dynamic_local_strategy=standalone",
+        "--dynamic_remote_strategy=remote");
+
+    if (OS.getCurrent() == OS.WINDOWS) {
+      // Force MSYS `ln -s` to create a (possibly dangling) native symlink or junction.
+      // The default behavior is to require the target path to exist and make a deep copy.
+      addOptions("--action_env=MSYS=winsymlinks:native");
+    }
+
+    if (useDiskCache) {
+      diskCacheDir = getWorkspace().getRelative(UUID.randomUUID().toString());
+      addOptions("--disk_cache=" + diskCacheDir.getPathString());
+    }
+  }
+
+  @Test
+  public void remoteFileWrite_switchToLocalBuild_materializesOutput() throws Exception {
+    writeFileWriteRules();
+    write(
+        "BUILD",
+        """
+        load('//rules:write_file.bzl', 'write_file')
+        write_file(name = 'foo', content = 'hello')
+        """);
+    addOptions("--file_write_strategy=remote");
+    buildTarget("//:foo");
+    assertOutputsDoNotExist("//:foo");
+
+    addOptions(
+        "--file_write_strategy=local", "--remote_executor=", "--remote_cache=", "--disk_cache=");
+    buildTarget("//:foo");
+    assertOnlyOutputContent("//:foo", "foo", "hello");
+  }
+
+  @Test
+  public void remoteFileWrite_withoutCache_isRejected() throws Exception {
+    writeFileWriteRules();
+    write(
+        "BUILD",
+        """
+        load('//rules:write_file.bzl', 'write_file')
+        write_file(name = 'foo', content = 'hello')
+        """);
+    addOptions(
+        "--file_write_strategy=remote", "--remote_executor=", "--remote_cache=", "--disk_cache=");
+
+    var e = assertThrows(AbruptExitException.class, () -> buildTarget("//:foo"));
+
+    assertThat(e).hasMessageThat().contains("FileWriteActionContext");
+    assertThat(e).hasMessageThat().contains("'remote'");
+  }
+
+  @Test
+  public void remoteFileWrite_strategiesAreIndependent(
+      @TestParameter({"expand_template", "write_file"}) String remoteFileWriteRule)
+      throws Exception {
+    writeFileWriteRules();
+    write(
+        "BUILD",
+        """
+        load('//rules:expand_template.bzl', 'expand_template')
+        load('//rules:write_file.bzl', 'write_file')
+        expand_template(name = 'expand_template', content = 'hello')
+        write_file(name = 'write_file', content = 'hello')
+        """);
+    setFileWriteStrategy(remoteFileWriteRule, "remote");
+
+    buildTarget("//:expand_template", "//:write_file");
+
+    for (var fileWriteRule : ImmutableList.of("expand_template", "write_file")) {
+      if (fileWriteRule.equals(remoteFileWriteRule)) {
+        assertOutputsDoNotExist("//:" + fileWriteRule);
+      } else {
+        assertOnlyOutputContent("//:" + fileWriteRule, fileWriteRule, "hello");
+      }
+    }
+  }
+
+  @Test
+  public void remoteFileWrite_readOnlyRemoteCache() throws Exception {
+    writeFileWriteRules();
+    write(
+        "BUILD",
+        """
+        load('//rules:write_file.bzl', 'write_file')
+        write_file(name = 'foo', content = 'hello')
+        """);
+    addOptions("--file_write_strategy=remote");
+
+    // Populate the caches with the contents of the file.
+    buildTarget("//:foo");
+    assertOutputsDoNotExist("//:foo");
+
+    // A read-only remote cache that already has the contents doesn't require a local write.
+    getOutputBase().getRelative("action_cache").deleteTreesBelow();
+    restartServer();
+    addOptions(
+        "--file_write_strategy=remote",
+        "--remote_executor=",
+        "--remote_cache=grpc://localhost:" + worker.getPort(),
+        "--noremote_upload_local_results");
+    buildTarget("//:foo");
+    assertOutputsDoNotExist("//:foo");
+
+    // Without the contents in any cache, they can only be kept off disk if there is a disk cache
+    // to store them in. Otherwise, the file has to be written locally.
+    evictAllBlobs();
+    getOutputBase().getRelative("action_cache").deleteTreesBelow();
+    restartServer();
+    addOptions(
+        "--file_write_strategy=remote",
+        "--remote_executor=",
+        "--remote_cache=grpc://localhost:" + worker.getPort(),
+        "--noremote_upload_local_results");
+    buildTarget("//:foo");
+    if (useDiskCache) {
+      assertOutputsDoNotExist("//:foo");
+    } else {
+      assertOnlyOutputContent("//:foo", "foo", "hello");
+    }
+  }
+
+  @Test
+  public void remoteFileWrite_diskCacheOnly_keepsOutputOffDisk() throws Exception {
+    writeFileWriteRules();
+    write(
+        "BUILD",
+        """
+        load('//rules:write_file.bzl', 'write_file')
+        write_file(name = 'foo', content = 'hello')
+        genrule(
+            name = 'bar',
+            srcs = [':foo'],
+            outs = ['bar.txt'],
+            cmd = 'cat $(location :foo) > $@',
+        )
+        """);
+    addOptions(
+        "--file_write_strategy=remote",
+        "--remote_executor=",
+        "--remote_cache=",
+        "--disk_cache=" + getWorkspace().getRelative(UUID.randomUUID().toString()));
+
+    buildTarget("//:foo");
+    assertOutputsDoNotExist("//:foo");
+
+    // A local consumer fetches the contents from the disk cache.
+    buildTarget("//:bar");
+    assertOnlyOutputContent("//:bar", "bar.txt", "hello");
+  }
+
+  @Override
+  protected void setDownloadToplevel() {
+    addOptions("--remote_download_outputs=toplevel");
+  }
+
+  @Override
+  protected void setDownloadAll() {
+    addOptions("--remote_download_outputs=all");
+  }
+
+  @Override
+  protected void enableActionRewinding() {
+    addOptions(
+        "--rewind_lost_inputs",
+        // Disable build rewinding.
+        "--experimental_remote_cache_eviction_retries=0");
+  }
+
+  @Override
+  protected String getLocalFileWriteStrategyFlag() {
+    return "--file_write_strategy=local";
+  }
+
+  @Override
+  protected String getRemoteFileWriteStrategyFlag() {
+    return "--file_write_strategy=remote";
+  }
+
+  @Override
+  protected String getLocalTemplateExpansionStrategyFlag() {
+    return "--template_expansion_strategy=local";
+  }
+
+  @Override
+  protected String getRemoteTemplateExpansionStrategyFlag() {
+    return "--template_expansion_strategy=remote";
+  }
+
+  @Override
+  protected BlazeRuntime.Builder getRuntimeBuilder() throws Exception {
+    return super.getRuntimeBuilder()
+        .addBlazeModule(new RemoteModule())
+        .addBlazeModule(new BuildSummaryStatsModule())
+        .addBlazeModule(new BlockWaitingModule());
+  }
+
+  @Override
+  protected ImmutableList<BlazeModule> getSpawnModules() {
+    return ImmutableList.<BlazeModule>builder()
+        .addAll(super.getSpawnModules())
+        .add(new StandaloneModule())
+        .add(new CredentialModule())
+        .add(new DynamicExecutionModule())
+        .build();
+  }
+
+  @Override
+  protected void assertOutputEquals(Path path, String expectedContent) throws Exception {
+    assertThat(readContent(path, UTF_8)).isEqualTo(expectedContent);
+  }
+
+  @Override
+  protected void assertOutputContains(String content, String contains) throws Exception {
+    assertThat(content).contains(contains);
+  }
+
+  @Override
+  protected void evictAllBlobs() throws Exception {
+    worker.reset();
+    if (useDiskCache && diskCacheDir != null) {
+      Path casDir = diskCacheDir.getRelative("cas");
+      if (casDir.exists()) {
+        casDir.deleteTreesBelow();
+      }
+      Path acDir = diskCacheDir.getRelative("ac");
+      if (acDir.exists()) {
+        acDir.deleteTreesBelow();
+      }
+    }
+  }
+
+  @Override
+  protected boolean hasAccessToRemoteOutputs() {
+    return true;
+  }
+
+  @Override
+  protected void injectFile(byte[] content) {}
+
+  @Test
+  public void executeRemotely_actionFails_outputsAreAvailableLocallyForDebuggingPurpose()
+      throws Exception {
+    write(
+        "a/BUILD",
+        """
+        genrule(
+            name = "fail",
+            srcs = [],
+            outs = ["fail.txt"],
+            cmd = "echo foo > $@ && exit 1",
+        )
+        """);
+
+    assertThrows(BuildFailedException.class, () -> buildTarget("//a:fail"));
+
+    assertOnlyOutputContent("//a:fail", "fail.txt", "foo\n");
+  }
+
+  @Test
+  public void intermediateOutputsAreInputForInternalActions_prefetchIntermediateOutputs()
+      throws Exception {
+    // Test that a remotely stored output that's an input to a internal action
+    // (ctx.actions.expand_template) is staged lazily for action execution.
+    write(
+        "a/substitute_username.bzl",
+        """
+        def _substitute_username_impl(ctx):
+            ctx.actions.expand_template(
+                template = ctx.file.template,
+                output = ctx.outputs.out,
+                substitutions = {
+                    "{USERNAME}": ctx.attr.username,
+                },
+            )
+
+        substitute_username = rule(
+            implementation = _substitute_username_impl,
+            attrs = {
+                "username": attr.string(mandatory = True),
+                "template": attr.label(
+                    allow_single_file = True,
+                    mandatory = True,
+                ),
+            },
+            outputs = {"out": "%{name}.txt"},
+        )
+        """);
+    write(
+        "a/BUILD",
+        """
+        load(":substitute_username.bzl", "substitute_username")
+
+        genrule(
+            name = "generate-template",
+            srcs = [],
+            outs = ["template.txt"],
+            cmd = 'echo -n "Hello {USERNAME}!" > $@',
+        )
+
+        substitute_username(
+            name = "substitute-buchgr",
+            template = ":generate-template",
+            username = "buchgr",
+        )
+        """);
+
+    buildTarget("//a:substitute-buchgr");
+
+    // The genrule //a:generate-template should run remotely and //a:substitute-buchgr should be a
+    // internal action running locally.
+    events.assertContainsInfo("3 processes: 2 internal, 1 remote");
+    Artifact intermediateOutput = getOnlyElement(getArtifacts("//a:generate-template"));
+    assertThat(intermediateOutput.getPath().exists()).isTrue();
+    assertOnlyOutputContent("//a:substitute-buchgr", "substitute-buchgr.txt", "Hello buchgr!");
+  }
+
+  @Test
+  public void changeOutputMode_notInvalidateActions() throws Exception {
+    write(
+        "a/BUILD",
+        """
+        genrule(
+            name = "foo",
+            srcs = [],
+            outs = ["foo.txt"],
+            cmd = "echo foo > $@",
+        )
+
+        genrule(
+            name = "foobar",
+            srcs = [":foo"],
+            outs = ["foobar.txt"],
+            cmd = "cat $(location :foo) > $@ && echo bar > $@",
+        )
+        """);
+    // Download all outputs with regex so in the next build with ALL mode, the actions are not
+    // invalidated because of missing outputs.
+    addOptions("--remote_download_regex=.*");
+    ActionEventCollector actionEventCollector = new ActionEventCollector();
+    runtimeWrapper.registerSubscriber(actionEventCollector);
+    buildTarget("//a:foobar");
+    // Add the new option here because waitDownloads below will internally create a new command
+    // which will parse the new option.
+    setDownloadAll();
+    waitDownloads();
+    // 3 = workspace status action + //:foo + //:foobar
+    assertThat(actionEventCollector.getNumActionNodesEvaluated()).isEqualTo(3);
+    actionEventCollector.clear();
+
+    buildTarget("//a:foobar");
+
+    // Changing output mode should not invalidate SkyFrame's in-memory caching.
+    assertThat(actionEventCollector.getNumActionNodesEvaluated()).isEqualTo(0);
+    events.assertContainsInfo("0 processes");
+  }
+
+  @Test
+  public void outputSymlinkHandledGracefully() throws Exception {
+    write(
+        "a/defs.bzl",
+        """
+        def _impl(ctx):
+            out = ctx.actions.declare_symlink(ctx.label.name)
+            ctx.actions.run_shell(
+                inputs = [],
+                outputs = [out],
+                command = "ln -s hello $1",
+                arguments = [out.path],
+                use_default_shell_env = True,
+            )
+            return DefaultInfo(files = depset([out]))
+
+        my_rule = rule(
+            implementation = _impl,
+        )
+        """);
+
+    write(
+        "a/BUILD",
+        """
+        load(":defs.bzl", "my_rule")
+
+        my_rule(name = "hello")
+        """);
+
+    buildTarget("//a:hello");
+
+    Path outputPath = getOutputPath("a/hello");
+    assertThat(outputPath.stat(Symlinks.NOFOLLOW).isSymbolicLink()).isTrue();
+  }
+
+  @Test
+  public void replaceOutputDirectoryWithFile() throws Exception {
+    write(
+        "a/defs.bzl",
+        """
+        def _impl(ctx):
+            dir = ctx.actions.declare_directory(ctx.label.name + ".dir")
+            ctx.actions.run_shell(
+                outputs = [dir],
+                command = "touch $1/hello",
+                arguments = [dir.path],
+            )
+            return DefaultInfo(files = depset([dir]))
+
+        my_rule = rule(
+            implementation = _impl,
+        )
+        """);
+    write(
+        "a/BUILD",
+        """
+        load(":defs.bzl", "my_rule")
+
+        my_rule(name = "hello")
+        """);
+
+    setDownloadToplevel();
+    buildTarget("//a:hello");
+
+    // Replace the existing output directory of the package with a file.
+    // A subsequent build should remove this file and replace it with a
+    // directory.
+    Path outputPath = getOutputPath("a");
+    outputPath.deleteTree();
+    FileSystemUtils.writeContent(outputPath, new byte[] {1, 2, 3, 4, 5});
+
+    buildTarget("//a:hello");
+  }
+
+  @Test
+  public void downloadTopLevel_doesNotDownloadUnrequestedOutputGroups() throws Exception {
+    write(
+        "a/defs.bzl",
+        """
+        def _rule_impl(ctx):
+            out = ctx.actions.declare_file(ctx.label.name + ".sh")
+            ctx.actions.run_shell(
+                outputs = [out],
+                command = "echo 'echo Hello World' > {output} && chmod +x {output}".format(output = out.path),
+            )
+            runfiles = ctx.runfiles(
+                transitive_files = depset(
+                    transitive = [target[DefaultInfo].files for target in ctx.attr.data],
+                ),
+            ).merge_all([
+                target[DefaultInfo].default_runfiles for target in ctx.attr.data
+            ])
+            return DefaultInfo(
+                executable = out,
+                runfiles = runfiles,
+            )
+
+        my_rule = rule(
+            implementation = _rule_impl,
+            attrs = {
+                "data": attr.label_list(allow_files = True),
+            },
+            executable = True,
+        )
+
+        def _aspect_impl(target, ctx):
+            out = ctx.actions.declare_file(ctx.label.name + ".sha256")
+            ctx.actions.run_shell(
+                inputs = depset(
+                    transitive = [
+                        target[DefaultInfo].files,
+                        target[DefaultInfo].default_runfiles.files,
+                    ],
+                ),
+                outputs = [out],
+                command = "echo 'hash' > {output}".format(output = out.path),
+            )
+            return [
+                OutputGroupInfo(
+                    my_aspect_out = depset([out]),
+                )
+            ]
+
+        my_aspect = aspect(implementation = _aspect_impl)
+        """);
+
+    write(
+        "a/BUILD",
+        """
+        load(":defs.bzl", "my_rule")
+
+        genrule(
+            name = "gen_data",
+            srcs = [],
+            outs = ["some_data"],
+            cmd = "echo 'data content' > $@",
+        )
+
+        my_rule(
+            name = "hello",
+            data = [":gen_data"],
+        )
+        """);
+
+    setDownloadToplevel();
+    addOptions("--aspects=//a:defs.bzl%my_aspect", "--output_groups=my_aspect_out");
+    buildTarget("//a:hello");
+
+    assertValidOutputFile("a/hello.sha256", "hash\n");
+    assertOutputsDoNotExist("//a:gen_data");
+    assertOutputsDoNotExist("//a:hello");
+  }
+
+  @Test
+  public void leaseExtension() throws Exception {
+    // The lease service is only used when action rewinding is disabled.
+    disableActionRewinding();
+    // Test that Bazel will extend the leases for remote output by sending FindMissingBlobs calls
+    // periodically to remote server. The test assumes remote server will set mtime of referenced
+    // blobs to `now`.
+    write(
+        "BUILD",
+        "genrule(",
+        "  name = 'foo',",
+        "  srcs = [],",
+        "  outs = ['out/foo.txt'],",
+        "  cmd = 'echo -n foo > $@',",
+        ")",
+        "genrule(",
+        "  name = 'foobar',",
+        "  srcs = [':foo'],",
+        "  outs = ['out/foobar.txt'],",
+        // We need the action lasts more than --experimental_remote_cache_ttl so Bazel has the
+        // chance to extend the lease
+        "  cmd = 'sleep 2 && cat $(location :foo) > $@ && echo bar >> $@',",
+        ")");
+    addOptions("--experimental_remote_cache_ttl=1s", "--experimental_remote_cache_lease_extension");
+    var blobPath = getFileSystem().getPath(worker.getCasBlobPath("foo".getBytes(UTF_8)));
+    var mtimes = Sets.newConcurrentHashSet();
+    // Observe the mtime of the blob in background.
+    var thread =
+        new Thread(
+            () -> {
+              while (!Thread.currentThread().isInterrupted()) {
+                try {
+                  mtimes.add(blobPath.getLastModifiedTime());
+                } catch (IOException ignored) {
+                  // Intentionally ignored
+                }
+              }
+            });
+    thread.start();
+
+    buildTarget("//:foobar");
+    waitDownloads();
+
+    thread.interrupt();
+    thread.join();
+    // We should be able to observe more than 1 mtime if the server extends the lease.
+    assertThat(mtimes.size()).isGreaterThan(1);
+  }
+
+  @Test
+  public void actionRewinding_prunedRunfilesInput_recovers() throws Exception {
+    var cacheWorker = IntegrationTestUtils.createWorker("--noaction_cache_integrity_check");
+    try (var ignored = cacheWorker.start()) {
+      addOptions("--remote_executor=grpc://localhost:" + cacheWorker.getPort());
+      enableActionRewinding();
+      write(
+          "a/rules.bzl",
+          """
+          def _tool_impl(ctx):
+              ctx.actions.write(
+                  ctx.outputs.executable,
+                  '#!/bin/sh\\ncat "$1" > "$2"; echo "$3" > "$4"\\n',
+                  is_executable = True,
+              )
+              return [DefaultInfo(
+                  executable = ctx.outputs.executable,
+                  runfiles = ctx.runfiles(files = [ctx.file.data]),
+              )]
+
+          tool = rule(
+              implementation = _tool_impl,
+              attrs = {"data": attr.label(allow_single_file = True)},
+              executable = True,
+          )
+
+          def _prune_impl(ctx):
+              output = ctx.actions.declare_file(ctx.label.name + ".out")
+              unused = ctx.actions.declare_file(ctx.label.name + ".unused")
+              tool = ctx.attr.tool[DefaultInfo].files_to_run
+              ctx.actions.run(
+                  executable = "%s",
+                  tools = [tool],
+                  inputs = [ctx.file.src],
+                  outputs = [output, unused],
+                  arguments = [
+                      tool.executable.path,
+                      ctx.file.src.path,
+                      output.path,
+                      tool.executable.path + ".runfiles",
+                      unused.path,
+                  ],
+                  unused_inputs_list = unused,
+              )
+              return [DefaultInfo(files = depset([output]))]
+
+          prune = rule(
+              implementation = _prune_impl,
+              attrs = {
+                  "src": attr.label(allow_single_file = True),
+                  "tool": attr.label(executable = True, cfg = "exec"),
+              },
+          )
+          """
+              .formatted(
+                  OS.getCurrent() == OS.WINDOWS ? "C:/msys64/usr/bin/bash.exe" : "/bin/bash"));
+      write(
+          "a/BUILD",
+          """
+          load(":rules.bzl", "prune", "tool")
+
+          genrule(
+              name = "foo",
+              outs = ["foo.out"],
+              cmd = "echo -n foo > $@",
+          )
+          genrule(
+              name = "trigger",
+              srcs = [":foo", "trigger.in"],
+              outs = ["trigger.out"],
+              cmd = "cat $(location :foo) $(location trigger.in) > $@",
+          )
+          genrule(
+              name = "data",
+              outs = ["data.out"],
+              cmd = "echo data > $@",
+          )
+          tool(name = "tool", data = ":data")
+          prune(name = "prune", src = ":trigger", tool = ":tool")
+          """);
+      write("a/trigger.in", "before");
+      buildTarget("//a:prune");
+
+      // Rewind :foo before :prune rediscovers its inputs. The previous execution pruned the
+      // runfiles tree, so its metadata is not available while checking :prune's action cache.
+      cacheWorker.evictBlob("foo".getBytes(UTF_8));
+      if (useDiskCache) {
+        addOptions("--disk_cache=" + UUID.randomUUID());
+      }
+      write("a/trigger.in", "after");
+      var rewoundKeys = rewindingTestsHelper.collectOrderedRewoundKeys();
+      setDownloadToplevel();
+      buildTarget("//a:prune");
+
+      assertRewoundActions(rewoundKeys, "//a:foo");
+      assertValidOutputFile("a/prune.out", "fooafter\n");
+    }
+  }
+
+  @Test
+  public void actionRewinding_lostInputWithStaleActionCacheEntry_recovers() throws Exception {
+    // The unverified worker serves cached action results even if the blobs they reference are
+    // missing from the CAS, emulating a remote cache without integrity checks. Rewinding must not
+    // accept such an action result for a rewound action, as it would reinstate the stale metadata
+    // of the lost blob instead of regenerating it.
+    var unverifiedWorker = IntegrationTestUtils.createWorker("--noaction_cache_integrity_check");
+    try (var ignored = unverifiedWorker.start()) {
+      addOptions("--remote_executor=grpc://localhost:" + unverifiedWorker.getPort());
+      enableActionRewinding();
+      write(
+          "a/BUILD",
+          """
+          genrule(
+              name = "foo",
+              srcs = [],
+              outs = ["foo.out"],
+              cmd = "echo -n foo > $@",
+          )
+
+          genrule(
+              name = "bar",
+              srcs = [
+                  ":foo",
+                  "bar.in",
+              ],
+              outs = ["bar.out"],
+              cmd = "cat $(location :foo) $(location bar.in) > $@",
+          )
+          """);
+      write("a/bar.in", "bar");
+
+      buildTarget("//a:bar");
+
+      // Delete the blob backing foo.out from the CAS while keeping all action cache entries.
+      unverifiedWorker.evictBlob("foo".getBytes(UTF_8));
+      if (useDiskCache) {
+        // Prevent the disk cache from restoring the deleted blob.
+        addOptions("--disk_cache=" + UUID.randomUUID());
+      }
+
+      // Invalidate only //a:bar so that its execution discovers the lost input and rewinds //a:foo.
+      write("a/bar.in", "bar2");
+      setDownloadToplevel();
+      buildTarget("//a:bar");
+
+      assertValidOutputFile("a/bar.out", "foobar2\n");
+    }
+  }
+
+  @Test
+  public void actionRewinding_chainedLostInputsWithStaleActionCacheEntries_recovers(
+      @TestParameter boolean actionCacheIntegrityCheck, @TestParameter boolean invocationRetries)
+      throws Exception {
+    // A rewound action that itself observes a lost input must rewind that input's producer too.
+    // Each rewound action must skip its stale cache entry to avoid repeatedly losing the same
+    // input.
+    var chainWorker =
+        IntegrationTestUtils.createWorker(
+            "--action_cache_integrity_check=" + actionCacheIntegrityCheck);
+    try (var ignored = chainWorker.start()) {
+      addOptions("--remote_executor=grpc://localhost:" + chainWorker.getPort());
+      enableActionRewinding();
+      // Action rewinding takes precedence, even if whole-invocation retries are also enabled.
+      addOptions("--experimental_remote_cache_eviction_retries=" + (invocationRetries ? 5 : 0));
+      write(
+          "a/BUILD",
+          """
+          genrule(
+              name = "foo",
+              srcs = [],
+              outs = ["foo.out"],
+              cmd = "echo -n foo > $@",
+          )
+
+          genrule(
+              name = "bar",
+              srcs = [":foo"],
+              outs = ["bar.out"],
+              cmd = "cat $(location :foo) > $@ && echo -n bar >> $@",
+          )
+
+          genrule(
+              name = "baz",
+              srcs = [
+                  ":bar",
+                  "baz.in",
+              ],
+              outs = ["baz.out"],
+              cmd = "cat $(location :bar) $(location baz.in) > $@",
+          )
+          """);
+      write("a/baz.in", "baz");
+
+      buildTarget("//a:baz");
+
+      // Delete the blobs backing foo.out and bar.out from the CAS while keeping all action cache
+      // entries. Rewinding //a:bar to regenerate bar.out then discovers that foo.out is lost too.
+      chainWorker.evictBlob("foo".getBytes(UTF_8));
+      chainWorker.evictBlob("foobar".getBytes(UTF_8));
+      if (useDiskCache) {
+        // Prevent the disk cache from restoring the deleted blobs.
+        addOptions("--disk_cache=" + UUID.randomUUID());
+      }
+
+      // Invalidate only //a:baz so that its execution discovers the lost input and rewinds //a:bar,
+      // which in turn discovers the other lost input and rewinds //a:foo.
+      write("a/baz.in", "baz2");
+      setDownloadToplevel();
+      var rewoundKeys = rewindingTestsHelper.collectOrderedRewoundKeys();
+      buildTarget("//a:baz");
+
+      assertValidOutputFile("a/baz.out", "foobarbaz2\n");
+      // Cache lookup is bypassed for each rewound action. Otherwise //a:baz would discover bar.out
+      // lost again and rewind //a:bar once more.
+      assertRewoundActions(rewoundKeys, "//a:bar", "//a:foo");
+    }
+  }
+
+  @Test
+  public void actionRewinding_cacheOnlyLocalExecution_skipsStaleCacheEntry(
+      @TestParameter boolean uploadLocalResults) throws Exception {
+    // Exercise cache-only local execution after clean(), including recovery without uploads.
+    var unverifiedWorker = IntegrationTestUtils.createWorker("--noaction_cache_integrity_check");
+    try (var ignored = unverifiedWorker.start()) {
+      addOptions(
+          "--remote_executor=", "--remote_cache=grpc://localhost:" + unverifiedWorker.getPort());
+      enableActionRewinding();
+      write(
+          "a/BUILD",
+          """
+          genrule(
+              name = "foo",
+              srcs = [],
+              outs = ["foo.out"],
+              cmd = "echo -n foo > $@",
+          )
+
+          genrule(
+              name = "bar",
+              srcs = [
+                  ":foo.out",
+                  "bar.in",
+              ],
+              outs = ["bar.out"],
+              cmd = "cat $(location :foo.out) $(location bar.in) > $@",
+          )
+          """);
+      write("a/bar.in", "one");
+
+      buildTarget("//a:bar");
+
+      // Delete foo.out locally.
+      clean();
+      // Delete foo.out remotely, but keep the AC for foo.
+      unverifiedWorker.evictBlob("foo".getBytes(UTF_8));
+      // Invalidate //a:bar, so its execution finds foo.out lost and rewinds //a:foo.
+      write("a/bar.in", "two");
+      setDownloadToplevel();
+      if (useDiskCache) {
+        // Prevent the disk cache from restoring the deleted blobs.
+        addOptions("--disk_cache=" + UUID.randomUUID());
+      }
+      addOptions("--remote_upload_local_results=" + uploadLocalResults);
+      var rewoundKeys = rewindingTestsHelper.collectOrderedRewoundKeys();
+
+      buildTarget("//a:bar");
+
+      assertRewoundActions(rewoundKeys, "//a:foo");
+      assertValidOutputFile("a/bar.out", "footwo\n");
+      assertThat(unverifiedWorker.hasCasBlob("foo".getBytes(UTF_8))).isEqualTo(uploadLocalResults);
+    }
+  }
+
+  @Test
+  public void actionRewinding_unrelatedFailure_reusesRepairedCacheEntry() throws Exception {
+    // After rewinding and an unrelated build failure, restoring the lost blob should let the next
+    // build accept the cache entry again.
+    assumeFalse(useDiskCache);
+    var unverifiedWorker = IntegrationTestUtils.createWorker("--noaction_cache_integrity_check");
+    try (var ignored = unverifiedWorker.start()) {
+      addOptions("--remote_executor=grpc://localhost:" + unverifiedWorker.getPort());
+      enableActionRewinding();
+      write(
+          "a/BUILD",
+          """
+          genrule(
+              name = "bar",
+              srcs = [],
+              outs = ["bar.out"],
+              cmd = "echo -n bar > $@",
+          )
+
+          genrule(
+              name = "consumer",
+              srcs = [
+                  ":bar.out",
+                  "consumer.in",
+              ],
+              outs = ["consumer.out"],
+              cmd = "cat $(location :bar.out) $(location consumer.in) > $@",
+          )
+
+          genrule(
+              name = "fail",
+              srcs = [":consumer.out"],
+              outs = ["fail.out"],
+              cmd = "exit 1",
+          )
+          """);
+      write("a/consumer.in", "one");
+
+      buildTarget("//a:consumer");
+
+      // Delete the blob backing bar.out, keeping //a:bar's action cache entry.
+      byte[] barContents = "bar".getBytes(UTF_8);
+      unverifiedWorker.evictBlob(barContents);
+
+      // Invalidate only //a:consumer, so its execution finds bar.out lost and rewinds //a:bar.
+      write("a/consumer.in", "two");
+      setDownloadToplevel();
+      addOptions(
+          "--strategy_regexp=.*=standalone",
+          "--notrack_incremental_state",
+          "--remote_upload_local_results=false");
+      var rewoundKeys = rewindingTestsHelper.collectOrderedRewoundKeys();
+      assertThrows(BuildFailedException.class, () -> buildTarget("//a:fail"));
+      assertRewoundActions(rewoundKeys, "//a:bar");
+
+      // Put the blob back, as another build writing the same output would.
+      Path restoredBlob = getFileSystem().getPath(unverifiedWorker.getCasBlobPath(barContents));
+      restoredBlob.getParentDirectory().createDirectoryAndParents();
+      FileSystemUtils.writeContent(restoredBlob, barContents);
+
+      // Delete the locally regenerated outputs and change //a:consumer's input, so the next build
+      // must re-evaluate and cannot reuse local state, forcing //a:bar's entry to be looked up.
+      getOutputPath("a/bar.out").delete();
+      getOutputPath("a/consumer.out").delete();
+      write("a/consumer.in", "three");
+      ActionEventRecorder actionEventRecorder = new ActionEventRecorder();
+      getRuntimeWrapper().registerSubscriber(actionEventRecorder);
+      buildTarget("//a:consumer");
+      assertThat(
+              actionEventRecorder.getActionResultReceivedEvents().stream()
+                  .filter(
+                      event ->
+                          !event.getActionResult().spawnResults().isEmpty()
+                              && event.getActionResult().spawnResults().stream()
+                                  .allMatch(SpawnResult::isCacheHit))
+                  .map(event -> event.getAction().getOwner().getLabel().getCanonicalForm()))
+          .containsExactly("//a:bar");
+      assertValidOutputFile("a/consumer.out", "barthree\n");
+    }
+  }
+
+  @Test
+  public void actionRewinding_localExecution_bustsStaleCacheEntry(
+      @TestParameter boolean actionCacheIntegrityCheck, @TestParameter boolean uploadLocalResults)
+      throws Exception {
+    // A rewound action that is executed locally rather than remotely must bypass its stale action
+    // result independently of whether that result is served by the cache. A cache that checks the
+    // integrity of action results doesn't serve it at all.
+    var cacheWorker =
+        IntegrationTestUtils.createWorker(
+            "--action_cache_integrity_check=" + actionCacheIntegrityCheck);
+    try (var ignored = cacheWorker.start()) {
+      addOptions("--remote_executor=grpc://localhost:" + cacheWorker.getPort());
+      enableActionRewinding();
+      write(
+          "a/BUILD",
+          """
+          genrule(
+              name = "foo",
+              srcs = [],
+              outs = ["foo.out"],
+              cmd = "echo -n foo > $@",
+          )
+
+          genrule(
+              name = "bar",
+              srcs = [
+                  ":foo.out",
+                  "bar.in",
+              ],
+              outs = ["bar.out"],
+              cmd = "cat $(location :foo.out) $(location bar.in) > $@",
+          )
+          """);
+      write("a/bar.in", "one");
+
+      // Execute remotely without downloading outputs, so that foo.out only exists in the CAS.
+      buildTarget("//a:bar");
+
+      // Delete the blob backing foo.out from the CAS while keeping all action cache entries.
+      cacheWorker.evictBlob("foo".getBytes(UTF_8));
+      if (useDiskCache) {
+        // Prevent the disk cache from restoring the deleted blob.
+        addOptions("--disk_cache=" + UUID.randomUUID());
+      }
+      // Execute locally from now on. Not by unsetting --remote_executor, as that would invalidate
+      // //a:foo and thus have it executed instead of rewound.
+      addOptions(
+          "--strategy_regexp=.*=local", "--remote_upload_local_results=" + uploadLocalResults);
+      // Invalidate only //a:bar so that its execution discovers the lost input and rewinds //a:foo.
+      write("a/bar.in", "two");
+      var rewoundKeys = rewindingTestsHelper.collectOrderedRewoundKeys();
+      buildTarget("//a:bar");
+
+      assertRewoundActions(rewoundKeys, "//a:foo");
+      assertValidOutputFile("a/bar.out", "footwo\n");
+      assertThat(cacheWorker.hasCasBlob("foo".getBytes(UTF_8))).isEqualTo(uploadLocalResults);
+    }
+  }
+
+  @Test
+  public void actionRewinding_localExecution_reuploadsBlobUploadedEarlierInBuild()
+      throws Exception {
+    // A rewound action that is executed locally may regenerate a blob that the same build has
+    // already uploaded before it was evicted. Its upload must not be deduplicated against the
+    // earlier one, or the refreshed action result would still reference a missing blob.
+    // With a disk cache, :bar would fetch foo.out from the copy uploaded by :same instead of
+    // discovering it lost.
+    assumeFalse(useDiskCache);
+    var cacheWorker = IntegrationTestUtils.createWorker("--noaction_cache_integrity_check");
+    try (var ignored = cacheWorker.start()) {
+      addOptions("--remote_executor=grpc://localhost:" + cacheWorker.getPort());
+      enableActionRewinding();
+      byte[] fooContents = "foo".getBytes(UTF_8);
+      write(
+          "a/BUILD",
+          """
+          genrule(
+              name = "foo",
+              srcs = [],
+              outs = ["foo.out"],
+              cmd = "echo -n foo > $@",
+          )
+
+          # Produces the same blob as foo.out.
+          genrule(
+              name = "same",
+              srcs = [],
+              outs = ["same.out"],
+              cmd = "echo -n foo > $@",
+          )
+
+          # Evicts that blob from the CAS after :same has uploaded it.
+          genrule(
+              name = "evict",
+              srcs = [":same.out"],
+              outs = ["evict.out"],
+              cmd = "rm -f '%s' && touch $@",
+              tags = ["no-cache"],
+          )
+
+          genrule(
+              name = "bar",
+              srcs = [
+                  ":foo.out",
+                  ":evict.out",
+              ],
+              outs = ["bar.out"],
+              cmd = "cat $(location :foo.out) > $@",
+          )
+          """
+              .formatted(cacheWorker.getCasBlobPath(fooContents)));
+
+      // Execute remotely without downloading outputs, so that foo.out only exists in the CAS.
+      buildTarget("//a:foo");
+
+      // Delete the blob backing foo.out from the CAS while keeping //a:foo's action cache entry, so
+      // that :same has to upload it again.
+      cacheWorker.evictBlob(fooContents);
+      // Execute locally from now on. Not by unsetting --remote_executor, as that would invalidate
+      // //a:foo and thus have it executed instead of rewound. Upload synchronously so that :evict
+      // only runs after :same has uploaded its output.
+      addOptions("--strategy_regexp=.*=local", "--noremote_cache_async");
+      setDownloadToplevel();
+      var rewoundKeys = rewindingTestsHelper.collectOrderedRewoundKeys();
+      // :bar discovers foo.out lost after :evict has deleted it and rewinds //a:foo, which
+      // regenerates the blob locally.
+      buildTarget("//a:bar");
+
+      assertRewoundActions(rewoundKeys, "//a:foo");
+      assertValidOutputFile("a/bar.out", "foo");
+      assertThat(cacheWorker.hasCasBlob(fooContents)).isTrue();
+    }
+  }
+
+  @Test
+  public void downloadTopLevel_deepSymlinkToFile() throws Exception {
+    setDownloadToplevel();
+    write(
+        "defs.bzl",
+        """
+        def _impl(ctx):
+            file = ctx.actions.declare_file(ctx.label.name + ".file")
+            ctx.actions.run_shell(
+                outputs = [file],
+                command = "echo -n hello > $1",
+                arguments = [file.path],
+            )
+
+            shallow = ctx.actions.declare_file(ctx.label.name + ".shallow")
+            ctx.actions.symlink(output = shallow, target_file = file)
+
+            deep = ctx.actions.declare_file(ctx.label.name + ".deep")
+            ctx.actions.symlink(output = deep, target_file = shallow)
+
+            return DefaultInfo(files = depset([deep]))
+
+        symlink = rule(_impl)
+        """);
+    write("BUILD", "load(':defs.bzl', 'symlink')", "symlink(name = 'foo')");
+
+    buildTarget("//:foo");
+
+    // Materialization skips the intermediate symlink.
+    assertSymlink("foo.deep", getOutputPath("foo.file").asFragment());
+    assertValidOutputFile("foo.deep", "hello");
+  }
+
+  @Test
+  public void downloadTopLevel_deepSymlinkToDirectory() throws Exception {
+    setDownloadToplevel();
+    write(
+        "defs.bzl",
+        """
+        def _impl(ctx):
+            dir = ctx.actions.declare_directory(ctx.label.name + ".dir")
+            ctx.actions.run_shell(
+                outputs = [dir],
+                command = "echo -n hello > $1/file.txt",
+                arguments = [dir.path],
+            )
+
+            shallow = ctx.actions.declare_directory(ctx.label.name + ".shallow")
+            ctx.actions.symlink(output = shallow, target_file = dir)
+
+            deep = ctx.actions.declare_directory(ctx.label.name + ".deep")
+            ctx.actions.symlink(output = deep, target_file = shallow)
+
+            return DefaultInfo(files = depset([deep]))
+
+        symlink = rule(_impl)
+        """);
+    write("BUILD", "load(':defs.bzl', 'symlink')", "symlink(name = 'foo')");
+
+    buildTarget("//:foo");
+
+    // Materialization skips the intermediate symlink.
+    assertSymlink("foo.deep", getOutputPath("foo.dir").asFragment());
+    assertValidOutputFile("foo.deep/file.txt", "hello");
+  }
+
+  @Test
+  public void downloadTopLevel_genruleSymlinkToInput() throws Exception {
+    setDownloadToplevel();
+    write(
+        "BUILD",
+        "genrule(",
+        "  name = 'foo',",
+        "  outs = ['foo'],",
+        "  cmd = 'echo hello > $@',",
+        ")",
+        "genrule(",
+        "  name = 'gen',",
+        "  srcs = ['foo'],",
+        "  outs = ['foo-link'],",
+        "  cmd = 'cd $(RULEDIR) && ln -s foo foo-link',",
+        // In Blaze, heuristic label expansion defaults to True and will cause `foo` to be expanded
+        // into `blaze-out/.../bin/foo` in the genrule command line.
+        "  heuristic_label_expansion = False,",
+        ")");
+
+    buildTarget("//:gen");
+
+    assertSymlink("foo-link", getOutputPath("foo").asFragment());
+    assertValidOutputFile("foo-link", "hello\n");
+
+    // Delete link, re-plant symlink
+    getOutputPath("foo").delete();
+    buildTarget("//:gen");
+
+    assertSymlink("foo-link", getOutputPath("foo").asFragment());
+    assertValidOutputFile("foo-link", "hello\n");
+
+    // Delete target, re-download it
+    getOutputPath("foo").delete();
+
+    buildTarget("//:gen");
+
+    assertSymlink("foo-link", getOutputPath("foo").asFragment());
+    assertValidOutputFile("foo-link", "hello\n");
+  }
+
+  @Test
+  public void downloadTopLevel_genruleSymlinkToOutput() throws Exception {
+    setDownloadToplevel();
+    write(
+        "BUILD",
+        """
+        genrule(
+          name = 'gen',
+          outs = ['foo', 'foo-link'],
+          cmd = 'cd $(RULEDIR) && echo hello > foo && ln -s foo foo-link',
+          # In Blaze, heuristic label expansion defaults to True and will cause `foo` to be expanded
+          # into `blaze-out/.../bin/foo` in the genrule command line.
+          heuristic_label_expansion = False,
+        )
+        """);
+
+    buildTarget("//:gen");
+
+    assertSymlink("foo-link", PathFragment.create("foo"));
+    assertValidOutputFile("foo-link", "hello\n");
+
+    // Delete link, re-plant symlink
+    getOutputPath("foo").delete();
+    buildTarget("//:gen");
+
+    assertSymlink("foo-link", PathFragment.create("foo"));
+    assertValidOutputFile("foo-link", "hello\n");
+
+    // Delete target, re-download it
+    getOutputPath("foo").delete();
+
+    buildTarget("//:gen");
+
+    assertSymlink("foo-link", PathFragment.create("foo"));
+    assertValidOutputFile("foo-link", "hello\n");
+  }
+
+  @Test
+  public void remoteAction_inputTreeWithSymlinks() throws Exception {
+    setDownloadToplevel();
+    write(
+        "tree.bzl",
+        "def _impl(ctx):",
+        "  d = ctx.actions.declare_directory(ctx.label.name)",
+        "  ctx.actions.run_shell(",
+        "    outputs = [d],",
+        "    command = 'mkdir $1/dir && touch $1/file $1/dir/file && ln -s file $1/filesym && ln"
+            + " -s dir $1/dirsym',",
+        "    arguments = [d.path],",
+        "  )",
+        "  return DefaultInfo(files = depset([d]))",
+        "tree = rule(_impl)");
+    write(
+        "BUILD",
+        "load(':tree.bzl', 'tree')",
+        "tree(name = 'tree')",
+        "genrule(name = 'gen', srcs = [':tree'], outs = ['out'], cmd = 'touch $@')");
+
+    // Populate cache
+    buildTarget("//:gen");
+
+    // Delete output, replay from cache
+    getOutputPath("tree").deleteTree();
+    getOutputPath("out").delete();
+    buildTarget("//:gen");
+  }
+
+  @Test
+  public void remoteFilesExpiredBetweenBuilds(@TestParameter boolean actionRewinding)
+      throws Exception {
+    // Arrange: Prepare workspace and populate remote cache
+    write(
+        "a/BUILD",
+        """
+        genrule(
+            name = "foo",
+            srcs = ["foo.in"],
+            outs = ["foo.out"],
+            cmd = "cat $(SRCS) > $@",
+        )
+
+        genrule(
+            name = "bar",
+            srcs = [
+                "foo.out",
+                "bar.in",
+            ],
+            outs = ["bar.out"],
+            cmd = "cat $(SRCS) > $@",
+        )
+        """);
+    write("a/foo.in", "foo");
+    write("a/bar.in", "bar");
+
+    // Populate remote cache
+    buildTarget("//a:bar");
+    assertOutputDoesNotExist("a/foo.out");
+    assertOutputDoesNotExist("a/bar.out");
+    getOutputBase().getRelative("action_cache").deleteTreesBelow();
+    restartServer();
+
+    // Clean build, foo.out isn't downloaded
+    setDownloadToplevel();
+    addOptions("--experimental_remote_cache_ttl=0s");
+    buildTarget("//a:bar");
+    assertOutputDoesNotExist("a/foo.out");
+    assertValidOutputFile("a/bar.out", "foo\nbar\n");
+
+    // Evict blobs from remote cache
+    evictAllBlobs();
+
+    // Act: Do an incremental build.
+    write("a/bar.in", "updated bar");
+    addOptions("--strategy_regexp=.*bar=local");
+    if (actionRewinding) {
+      // The expired input's generating action is rewound within the same build.
+      enableActionRewinding();
+    } else {
+      // The build fails with the exit code that, in a non-integration test setup, would retry
+      // the invocation automatically. Simulate the retry.
+      disableActionRewinding();
+      var e = assertThrows(BuildFailedException.class, () -> buildTarget("//a:bar"));
+      assertThat(e.getDetailedExitCode().getFailureDetail().getSpawn().getCode())
+          .isEqualTo(FailureDetails.Spawn.Code.REMOTE_CACHE_EVICTED);
+    }
+
+    buildTarget("//a:bar");
+    waitDownloads();
+
+    // Assert: target was successfully built
+    assertValidOutputFile("a/bar.out", "foo\nupdated bar\n");
+  }
+
+  @Test
+  public void actionRewinding_lostTree(@TestParameter boolean localExecution) throws Exception {
+    // Verify that a lost tree can be rewound, both the Tree message itself and its children.
+    //
+    // When Bazel processes an ActionResult that it accepts, it fetches any referenced Tree
+    // message, so a lost tree digest is detected and handled at that point.
+    //
+    // Parameterized over local and remote execution because RemoteSpawnRunner and
+    // RemoteSpawnCache handle BulkTransferException from lookupCache differently: only remote
+    // execution failed before this fix. No point in the disk cache parameterization.
+    assumeFalse(useDiskCache);
+    var unverifiedWorker = IntegrationTestUtils.createWorker("--noaction_cache_integrity_check");
+    try (var ignored = unverifiedWorker.start()) {
+      addOptions("--remote_executor=grpc://localhost:" + unverifiedWorker.getPort());
+      setDownloadToplevel();
+      writeOutputDirRule();
+      write("BUILD");
+      write(
+          "a/BUILD",
+          """
+          load("//:output_dir.bzl", "output_dir")
+
+          output_dir(
+              name = "foo.out",
+              content_map = {"file-inside": "hello world"},
+          )
+
+          genrule(
+              name = "bar",
+              srcs = [
+                  "foo.out",
+                  "bar.in",
+              ],
+              outs = ["bar.out"],
+              cmd = "( ls $(location :foo.out); cat $(location :bar.in) ) > $@",
+          )
+          """);
+      write("a/bar.in", "bar");
+
+      buildTarget("//a:bar");
+
+      // Wipe remote CAS, including the tree message describing foo.out, but keep all AC entries.
+      unverifiedWorker.evictAllCasBlobs();
+
+      // Invalidate only //a:bar, so its execution finds foo.out lost and rewinds //a:foo.out.
+      write("a/bar.in", "updated bar");
+      if (localExecution) {
+        addOptions("--strategy_regexp=.*=local");
+      }
+      enableActionRewinding();
+      var rewoundKeys = rewindingTestsHelper.collectOrderedRewoundKeys();
+
+      buildTarget("//a:bar");
+
+      assertRewoundActions(rewoundKeys, "//a:foo.out");
+      assertValidOutputFile("a/bar.out", "file-inside\nupdated bar\n");
+    }
+  }
+
+  @Test
+  public void remoteTreeFilesExpiredBetweenBuilds(@TestParameter boolean actionRewinding)
+      throws Exception {
+    // Arrange: Prepare workspace and populate remote cache
+    write("BUILD");
+    writeOutputDirRule();
+    write(
+        "a/BUILD",
+        """
+        load("//:output_dir.bzl", "output_dir")
+
+        output_dir(
+            name = "foo.out",
+            content_map = {"file-inside": "hello world"},
+        )
+
+        genrule(
+            name = "bar",
+            srcs = [
+                "foo.out",
+                "bar.in",
+            ],
+            outs = ["bar.out"],
+            cmd = "( ls $(location :foo.out); cat $(location :bar.in) ) > $@",
+        )
+        """);
+    write("a/bar.in", "bar");
+
+    // Populate remote cache
+    buildTarget("//a:bar");
+    assertThat(getOutputPath("a/foo.out").getDirectoryEntries()).isEmpty();
+    assertOutputDoesNotExist("a/bar.out");
+    getOutputBase().getRelative("action_cache").deleteTreesBelow();
+    restartServer();
+
+    // Clean build, foo.out isn't downloaded
+    setDownloadToplevel();
+    addOptions("--experimental_remote_cache_ttl=0s");
+    buildTarget("//a:bar");
+    assertOutputDoesNotExist("a/foo.out/file-inside");
+    assertValidOutputFile("a/bar.out", "file-inside\nbar\n");
+
+    // Evict blobs from remote cache
+    evictAllBlobs();
+
+    // Act: Do an incremental build.
+    write("a/bar.in", "updated bar");
+    addOptions("--strategy_regexp=.*bar=local");
+    if (actionRewinding) {
+      // The expired input's generating action is rewound within the same build.
+      enableActionRewinding();
+    } else {
+      // The build fails with the exit code that, in a non-integration test setup, would retry
+      // the invocation automatically. Simulate the retry.
+      disableActionRewinding();
+      var e = assertThrows(BuildFailedException.class, () -> buildTarget("//a:bar"));
+      assertThat(e.getDetailedExitCode().getFailureDetail().getSpawn().getCode())
+          .isEqualTo(FailureDetails.Spawn.Code.REMOTE_CACHE_EVICTED);
+    }
+
+    buildTarget("//a:bar");
+    waitDownloads();
+
+    // Assert: target was successfully built
+    assertValidOutputFile("a/bar.out", "file-inside\nupdated bar\n");
+  }
+
+  @Test
+  public void remoteCacheEvictBlobs_whenDownloadingSymlinkToOutput_rewindsTarget()
+      throws Exception {
+    // Arrange: a symlink to the output of a remote action
+    write(
+        "a/defs.bzl",
+        """
+        def _impl(ctx):
+            out = ctx.actions.declare_file(ctx.label.name)
+            ctx.actions.symlink(output = out, target_file = ctx.file.target)
+            return DefaultInfo(files = depset([out]))
+
+        symlink = rule(_impl, attrs = {"target": attr.label(allow_single_file = True)})
+        """);
+    write(
+        "a/BUILD",
+        """
+        load(":defs.bzl", "symlink")
+
+        genrule(
+            name = "foo",
+            srcs = ["foo.in"],
+            outs = ["foo.out"],
+            cmd = "cat $(SRCS) > $@",
+        )
+
+        symlink(
+            name = "link",
+            target = ":foo.out",
+        )
+        """);
+    write("a/foo.in", "foo");
+
+    // Populate the remote cache without downloading the output
+    setDownloadMinimal();
+    buildTarget("//a:foo");
+    assertOutputDoesNotExist("a/foo.out");
+
+    // Evict blobs from remote cache
+    evictAllBlobs();
+
+    // Act: the symlink action runs locally without reading its input, which is only read when the
+    // symlink is downloaded as a top-level output.
+    setDownloadToplevel();
+    enableActionRewinding();
+    buildTarget("//a:link");
+    waitDownloads();
+
+    // Assert: the generating action of the symlink's target was rewound
+    assertValidOutputFile("a/link", "foo\n");
+  }
+}

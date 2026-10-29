@@ -27,15 +27,19 @@ import net.starlark.java.eval.StarlarkValue;
 
 /** An interface for a set of runfiles. */
 @StarlarkBuiltin(
+    // TODO: #27370 - make capitalization consistent
     name = "runfiles",
+    typeRepr = "Runfiles",
     category = DocCategory.BUILTIN,
     doc =
-        "A container of information regarding a set of files required at runtime execution. This"
-            + " object should be passed via <a href=\"DefaultInfo.html\">DefaultInfo</a> in order"
-            + " to tell the build system about the runfiles needed by the outputs produced by the"
-            + " rule. <p>See <a"
-            + " href=\"https://docs.bazel.build/skylark/rules.html#runfiles\">runfiles"
-            + " guide</a> for details.")
+"""
+A container of information regarding a set of files required at runtime by an executable. This \
+object should be passed via <a href="../providers/DefaultInfo.html"><code>DefaultInfo</code></a> \
+in order to tell the build system about the runfiles needed by the outputs produced by the rule.
+<p>
+    See <a href="https://bazel.build/extending/rules#runfiles">runfiles guide</a> for details. \
+</p>
+""")
 public interface RunfilesApi extends StarlarkValue {
 
   @StarlarkMethod(name = "files", doc = "Returns the set of runfiles as files.", structField = true)
@@ -59,12 +63,14 @@ public interface RunfilesApi extends StarlarkValue {
   @StarlarkMethod(
       name = "merge",
       doc =
-          "Returns a new runfiles object that includes all the contents of this one and the "
-              + "argument."
-              + "<p><i>Note:</i> When you have many runfiles objects to merge, use <a "
-              + "href='#merge_all'><code>merge_all()</code></a> rather than calling <code>merge"
-              + "</code> in a loop. This avoids constructing deep depset structures which can "
-              + "cause build failures.",
+"""
+Returns a new runfiles object that includes all the contents of this one and the argument. \
+<p>
+<i>Note:</i> When you have many runfiles objects to merge, use \
+<a href="#merge_all"><code>merge_all()</code></a> rather than calling <code>merge</code> in a \
+loop. This avoids constructing deep depset structures which can cause build failures. \
+</p>
+""",
       parameters = {
         @Param(
             name = "other",
@@ -78,8 +84,10 @@ public interface RunfilesApi extends StarlarkValue {
   @StarlarkMethod(
       name = "merge_all",
       doc =
-          "Returns a new runfiles object that includes all the contents of this one and of the "
-              + "runfiles objects in the argument.",
+"""
+Returns a new runfiles object that includes all the contents of this one and of the runfiles \
+objects in the argument.
+""",
       parameters = {
         @Param(
             name = "other",

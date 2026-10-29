@@ -17,6 +17,8 @@ package com.google.devtools.build.lib.skyframe;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
+import com.google.devtools.build.lib.bugreport.BugReport;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.cmdline.SignedTargetPattern;
 import com.google.devtools.build.lib.cmdline.SignedTargetPattern.Sign;
@@ -25,10 +27,9 @@ import com.google.devtools.build.lib.cmdline.TargetPattern;
 import com.google.devtools.build.lib.pkgcache.FilteringPolicy;
 import com.google.devtools.build.lib.skyframe.TargetPatternValue.TargetPatternKey;
 import com.google.devtools.build.skyframe.SkyFunction.Environment;
-import com.google.devtools.build.skyframe.SkyKey;
-import com.google.devtools.build.skyframe.ValueOrException;
+import com.google.devtools.build.skyframe.SkyframeLookupResult;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import javax.annotation.Nullable;
 
 /** Utility class to help with evaluating target patterns. */
@@ -40,26 +41,33 @@ public class TargetPatternUtil {
    * Skyframe restart.
    */
   @Nullable
-  public static ImmutableList<Label> expandTargetPatterns(
+  public static ImmutableSet<Label> expandTargetPatterns(
       Environment env, List<SignedTargetPattern> targetPatterns, FilteringPolicy filteringPolicy)
       throws InvalidTargetPatternException, InterruptedException {
 
     if (targetPatterns.isEmpty()) {
-      return ImmutableList.of();
+      return ImmutableSet.of();
     }
 
     Iterable<TargetPatternKey> targetPatternKeys =
         TargetPatternValue.keys(targetPatterns, filteringPolicy);
-    Map<SkyKey, ValueOrException<TargetParsingException>> resolvedPatterns =
-        env.getValuesOrThrow(targetPatternKeys, TargetParsingException.class);
+    SkyframeLookupResult resolvedPatterns = env.getValuesAndExceptions(targetPatternKeys);
     boolean valuesMissing = env.valuesMissing();
-    ImmutableList.Builder<Label> labels = valuesMissing ? null : new ImmutableList.Builder<>();
+    // Use an ArrayList so that we can add and remove results based on negative patterns.
+    List<Label> labels = valuesMissing ? null : new ArrayList<>();
 
     for (TargetPatternKey pattern : targetPatternKeys) {
-      TargetPatternValue value;
       try {
-        value = (TargetPatternValue) resolvedPatterns.get(pattern).get();
-        if (!valuesMissing && value != null) {
+        TargetPatternValue value =
+            (TargetPatternValue) resolvedPatterns.getOrThrow(pattern, TargetParsingException.class);
+        if (valuesMissing || value == null) {
+          continue;
+        }
+        if (pattern.isNegative()) {
+          // Remove from the results.
+          labels.removeAll(value.getTargets().getTargets());
+        } else {
+          // Add to results.
           labels.addAll(value.getTargets().getTargets());
         }
       } catch (TargetParsingException e) {
@@ -67,11 +75,15 @@ public class TargetPatternUtil {
       }
     }
 
-    if (valuesMissing) {
+    if (env.valuesMissing()) {
+      if (valuesMissing != env.valuesMissing()) {
+        BugReport.logUnexpected(
+            "Some value from '%s' was missing, this should never happen", targetPatternKeys);
+      }
       return null;
     }
 
-    return labels.build();
+    return ImmutableSet.copyOf(labels);
   }
 
   // TODO(bazel-team): look into moving this into SignedTargetPattern itself.
@@ -99,8 +111,8 @@ public class TargetPatternUtil {
   // TODO(bazel-team): Consolidate this and TargetParsingException. Just have the latter store the
   //   original unparsed pattern too.
   public static final class InvalidTargetPatternException extends Exception {
-    private String invalidPattern;
-    private TargetParsingException tpe;
+    private final String invalidPattern;
+    private final TargetParsingException tpe;
 
     public InvalidTargetPatternException(String invalidPattern, TargetParsingException tpe) {
       super(tpe);

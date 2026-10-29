@@ -13,8 +13,9 @@
 // limitations under the License.
 package com.google.devtools.build.lib.buildeventstream;
 
-import com.google.common.annotations.VisibleForTesting;
+import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
+import com.google.devtools.build.lib.buildeventservice.BuildEventServiceOptions.BesUploadMode;
 import java.time.Duration;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
@@ -24,14 +25,12 @@ import javax.annotation.concurrent.ThreadSafe;
  *
  * <p>All implementations need to be thread-safe. All methods are expected to return quickly.
  *
- * <p>Notice that this interface does not provide any error handling API. A transport may choose
- * to log interesting errors to the command line and/or abort the whole build.
+ * <p>Notice that this interface does not provide any error handling API. A transport may choose to
+ * log interesting errors to the command line and/or abort the whole build.
  */
 @ThreadSafe
 public interface BuildEventTransport {
-  /**
-   * The name of this transport as can be displayed to a user.
-   */
+  /** The name of this transport as can be displayed to a user. */
   String name();
 
   /**
@@ -74,6 +73,21 @@ public interface BuildEventTransport {
   }
 
   /**
+   * Returns a future that completes when all events enqueued prior to this call have been processed
+   * and dispatched by the transport's queue, and acknowledged by any remote backend to the extent
+   * possible while the stream remains open.
+   *
+   * <p>Unlike {@link #close}, this does not close or half-close the transport; subsequent events
+   * can still be sent after the returned future completes.
+   *
+   * <p>At most one quiescence check is supported. If called more than once, returns the existing
+   * future that was created on the first call.
+   */
+  default ListenableFuture<Void> getQuiescenceFuture() {
+    return Futures.immediateVoidFuture();
+  }
+
+  /**
    * Returns how long a caller should wait for the transport to finish uploading events and closing
    * gracefully. Setting the timeout to {@link Duration#ZERO} means that there's no timeout.
    */
@@ -87,7 +101,14 @@ public interface BuildEventTransport {
    */
   boolean mayBeSlow();
 
-  @VisibleForTesting
+  /** Returns the desired {@link BesUploadMode} for the transport. */
+  BesUploadMode getBesUploadMode();
+
   @Nullable
   BuildEventArtifactUploader getUploader();
+
+  @Nullable
+  default String getInvocationId() {
+    return null;
+  }
 }

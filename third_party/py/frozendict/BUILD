@@ -1,4 +1,4 @@
-load("//tools/python:private/defs.bzl", "py_library")
+load("@bazel_pip_dev_deps//:requirements.bzl", "requirement")
 
 licenses(["notice"])
 
@@ -8,10 +8,8 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
-py_library(
+alias(
     name = "frozendict",
-    srcs = glob(["**/*.py"]),
-    imports = ["."],
-    srcs_version = "PY2AND3",
+    actual = requirement("frozendict"),
     visibility = ["//visibility:public"],
 )

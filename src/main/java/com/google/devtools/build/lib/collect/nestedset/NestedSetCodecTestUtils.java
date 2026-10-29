@@ -88,7 +88,7 @@ public class NestedSetCodecTestUtils {
         .runTests();
   }
 
-  public static ListenableFuture<Void> writeToStoreFuture(
+  public static ListenableFuture<?> writeToStoreFuture(
       NestedSetStore store, NestedSet<?> nestedSet, SerializationContext serializationContext)
       throws IOException, SerializationException {
     return store
@@ -110,9 +110,8 @@ public class NestedSetCodecTestUtils {
   }
 
   private static void verifyStructure(Object lhs, Object rhs) {
-    if (lhs instanceof Object[]) {
+    if (lhs instanceof Object[] lhsArray) {
       assertThat(rhs).isInstanceOf(Object[].class);
-      Object[] lhsArray = (Object[]) lhs;
       Object[] rhsArray = (Object[]) rhs;
       int n = lhsArray.length;
       assertThat(rhsArray).hasLength(n);

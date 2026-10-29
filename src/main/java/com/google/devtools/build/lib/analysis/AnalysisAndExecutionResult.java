@@ -14,53 +14,58 @@
 
 package com.google.devtools.build.lib.analysis;
 
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.ImmutableSortedSet;
 import com.google.devtools.build.lib.actions.Artifact;
-import com.google.devtools.build.lib.analysis.config.BuildConfigurationCollection;
+import com.google.devtools.build.lib.analysis.config.BuildConfigurationValue;
 import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
 import com.google.devtools.build.lib.skyframe.AspectKeyCreator.AspectKey;
+import com.google.devtools.build.lib.util.DetailedExitCode;
 import java.util.Collection;
 import javax.annotation.Nullable;
 
 /**
- * Return value for {@link com.google.devtools.build.lib.buildtool.AnalysisAndExecutionPhaseRunner}.
+ * Return value for {@code com.google.devtools.build.lib.buildtool.AnalysisAndExecutionPhaseRunner}.
  * This is meant to be the drop-in replacement for AnalysisResult later on. This is part of
  * https://github.com/bazelbuild/bazel/issues/14057. Internal: b/147350683.
  */
 public final class AnalysisAndExecutionResult extends AnalysisResult {
+  private final DetailedExitCode executionDetailedExitCode;
 
   AnalysisAndExecutionResult(
-      BuildConfigurationCollection configurations,
+      BuildConfigurationValue configuration,
       ImmutableSet<ConfiguredTarget> targetsToBuild,
       ImmutableMap<AspectKey, ConfiguredAspect> aspects,
-      @Nullable ImmutableList<ConfiguredTarget> targetsToTest,
+      @Nullable ImmutableSet<ConfiguredTarget> targetsToTest,
       ImmutableSet<ConfiguredTarget> targetsToSkip,
-      @Nullable FailureDetail failureDetail,
+      @Nullable FailureDetail analysisFailureDetail,
+      @Nullable DetailedExitCode executionDetailedExitCode,
       ImmutableSet<Artifact> artifactsToBuild,
       ImmutableSet<ConfiguredTarget> parallelTests,
       ImmutableSet<ConfiguredTarget> exclusiveTests,
+      ImmutableSet<ConfiguredTarget> exclusiveIfLocalTests,
       TopLevelArtifactContext topLevelContext,
-      String workspaceName,
-      Collection<TargetAndConfiguration> topLevelTargetsWithConfigs,
-      ImmutableSortedSet<String> nonSymlinkedDirectoriesUnderExecRoot) {
+      Collection<TargetAndConfiguration> topLevelTargetsWithConfigs) {
     super(
-        configurations,
+        configuration,
         targetsToBuild,
         aspects,
         targetsToTest,
         targetsToSkip,
-        failureDetail,
-        /*actionGraph=*/ null,
+        analysisFailureDetail,
+        /* actionGraph= */ null,
         artifactsToBuild,
         parallelTests,
         exclusiveTests,
+        exclusiveIfLocalTests,
         topLevelContext,
-        /*packageRoots=*/ null,
-        workspaceName,
-        topLevelTargetsWithConfigs,
-        nonSymlinkedDirectoriesUnderExecRoot);
+        /* packageRoots= */ null,
+        topLevelTargetsWithConfigs);
+    this.executionDetailedExitCode = executionDetailedExitCode;
+  }
+
+  @Nullable
+  public DetailedExitCode getExecutionDetailedExitCode() {
+    return executionDetailedExitCode;
   }
 }

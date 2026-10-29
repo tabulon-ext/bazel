@@ -20,6 +20,7 @@ import javax.annotation.Nullable;
 import net.starlark.java.annot.StarlarkBuiltin;
 import net.starlark.java.annot.StarlarkMethod;
 import net.starlark.java.eval.EvalException;
+import net.starlark.java.eval.StarlarkSemantics;
 import net.starlark.java.eval.StarlarkValue;
 
 /** The interface for files in Starlark. */
@@ -33,10 +34,11 @@ import net.starlark.java.eval.StarlarkValue;
             + "and cannot be used to directly read or write file contents. Rather, you use it to "
             + "construct the action graph in a rule implementation function by passing it to "
             + "action-creating functions. See the "
-            + "<a href='../rules.$DOC_EXT#files'>Rules page</a> for more information."
+            + "<a href='https://bazel.build/extending/rules#files'>Rules page</a> for more "
+            + "information."
             + "" // curse google-java-format b/145078219
             + "<p>When a <code>File</code> is passed to an <a"
-            + " href='Args.html'><code>Args</code></a> object without using a"
+            + " href='../builtins/Args.html'><code>Args</code></a> object without using a"
             + " <code>map_each</code> function, it is converted to a string by taking the value of"
             + " its <code>path</code> field.")
 public interface FileApi extends StarlarkValue {
@@ -44,10 +46,11 @@ public interface FileApi extends StarlarkValue {
   @StarlarkMethod(
       name = "dirname",
       structField = true,
+      useStarlarkSemantics = true,
       doc =
           "The name of the directory containing this file. It's taken from "
               + "<a href=\"#path\">path</a> and is always relative to the execution directory.")
-  String getDirname();
+  String getDirnameForStarlark(StarlarkSemantics semantics);
 
   @StarlarkMethod(
       name = "basename",
@@ -74,8 +77,9 @@ public interface FileApi extends StarlarkValue {
   @StarlarkMethod(
       name = "root",
       structField = true,
+      useStarlarkSemantics = true,
       doc = "The root beneath which this file resides.")
-  FileRootApi getRoot();
+  FileRootApi getRootForStarlark(StarlarkSemantics semantics);
 
   @StarlarkMethod(
       name = "is_source",
@@ -86,41 +90,64 @@ public interface FileApi extends StarlarkValue {
   @StarlarkMethod(
       name = "is_directory",
       structField = true,
-      doc = "Returns true if this is a directory.")
+      doc =
+          "Returns true if this is a directory. This reflects the type the file was declared as"
+              + " (i.e. ctx.actions.declare_directory), not its type on the filesystem, which might"
+              + " differ.")
   boolean isDirectory();
+
+  @StarlarkMethod(
+      name = "is_symlink",
+      structField = true,
+      doc =
+          "Returns true if this was declared as a symlink. This reflects the type the file was"
+              + " declared as (i.e. ctx.actions.declare_symlink), not its type on the filesystem,"
+              + " which might differ.")
+  boolean isSymlink();
 
   @StarlarkMethod(
       name = "short_path",
       structField = true,
       doc =
-          "The path of this file relative to its root. This excludes the aforementioned "
-              + "<i>root</i>, i.e. configuration-specific fragments of the path. This is also the "
-              + "path under which the file is mapped if it's in the runfiles of a binary.")
+          "The path of this file relative to its root, excluding configuration-specific fragments"
+              + " of the path (the aforementioned <i>root</i>). For files in the main repository,"
+              + " this is the path of the file relative to the repository.<p>For files in external"
+              + " repositories, this path begins with <code>../&lt;repo_name&gt;/</code> (the"
+              + " legacy runfiles path relative to the main repository's runfiles directory)."
+              + " Note that because it starts with <code>../</code>, it cannot simply be joined to"
+              + " <code>RUNFILES_DIR</code>, nor used with runfiles libraries or"
+              + " <code>rlocation</code> without stripping the leading <code>../</code>.")
   String getRunfilesPathString();
 
   @StarlarkMethod(
       name = "path",
       structField = true,
+      useStarlarkSemantics = true,
       doc =
-          "The execution path of this file, relative to the workspace's execution directory. It "
-              + "consists of two parts, an optional first part called the <i>root</i> (see also "
-              + "the <a href=\"root.html\">root</a> module), and the second part which is the "
-              + "<code>short_path</code>. The root may be empty, which it usually is for "
-              + "non-generated files. For generated files it usually contains a "
-              + "configuration-specific path fragment that encodes things like the target CPU "
-              + "architecture that was used while building said file. Use the "
-              + "<code>short_path</code> for the path under which the file is mapped if it's in "
-              + "the runfiles of a binary.")
-  String getExecPathString();
+          "The execution path of this file, relative to the workspace's execution directory. For"
+              + " files in the main repository, it consists of two parts: an optional first part"
+              + " called the <i>root</i> (see also the <a href=\"../builtins/root.html\">root</a>"
+              + " module) and the second part which is the <code>short_path</code>. The root may"
+              + " be empty, which it usually is for non-generated files. For generated files it"
+              + " usually contains a configuration-specific path fragment that encodes things like"
+              + " the target CPU architecture that was used while building said file.<p>Note that"
+              + " for files in external repositories, <code>short_path</code> reflects the runfiles"
+              + " tree path (prefixed with <code>../&lt;repo_name&gt;/</code>) rather than the"
+              + " root-relative execution path (prefixed with"
+              + " <code>external/&lt;repo_name&gt;/</code>), so concatenating"
+              + " <code>File.root.path</code> and <code>File.short_path</code> does not yield"
+              + " <code>File.path</code>.")
+  String getExecPathStringForStarlark(StarlarkSemantics semantics);
 
   @StarlarkMethod(
       name = "tree_relative_path",
       structField = true,
       doc =
-          "The path of this file relative to the root of the ancestor's tree, if the ancestor's "
-              + "<a href=\"#is_directory\">is_directory</a> field is true. <code>tree_relative_path"
-              + "</code> is only available for expanded files of a directory in an action command, "
-              + "i.e. <a href=\"Args.html#add_all\">Args.add_all()</a>. For other types of files, "
-              + "it is an error to access this field.")
+          "The path of this file relative to the root of the ancestor's tree, if the ancestor's <a"
+              + " href=\"#is_directory\">is_directory</a> field is true."
+              + " <code>tree_relative_path</code> is only available for expanded files of a"
+              + " directory in an action command, i.e. <a"
+              + " href=\"../builtins/Args.html#add_all\">Args.add_all()</a>. For other types of"
+              + " files, it is an error to access this field.")
   String getTreeRelativePathString() throws EvalException;
 }

@@ -15,7 +15,6 @@ package com.google.devtools.build.lib.pkgcache;
 
 import static com.google.common.truth.Truth.assertThat;
 
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.actions.ActionKeyContext;
@@ -24,17 +23,19 @@ import com.google.devtools.build.lib.analysis.ConfiguredRuleClassProvider;
 import com.google.devtools.build.lib.analysis.ServerDirectories;
 import com.google.devtools.build.lib.analysis.util.AnalysisMock;
 import com.google.devtools.build.lib.cmdline.PackageIdentifier;
+import com.google.devtools.build.lib.compress.CompressionServiceImpl;
 import com.google.devtools.build.lib.packages.NoSuchPackageException;
 import com.google.devtools.build.lib.packages.Package;
 import com.google.devtools.build.lib.packages.PackageFactory;
 import com.google.devtools.build.lib.packages.semantics.BuildLanguageOptions;
-import com.google.devtools.build.lib.rules.repository.RepositoryDelegatorFunction;
+import com.google.devtools.build.lib.runtime.QuiescingExecutorsImpl;
 import com.google.devtools.build.lib.skyframe.BazelSkyframeExecutorConstants;
-import com.google.devtools.build.lib.skyframe.PrecomputedValue;
+import com.google.devtools.build.lib.skyframe.SequencedSkyframeExecutor;
 import com.google.devtools.build.lib.skyframe.SkyframeExecutor;
 import com.google.devtools.build.lib.testutil.FoundationTestCase;
 import com.google.devtools.build.lib.testutil.ManualClock;
 import com.google.devtools.build.lib.testutil.SkyframeExecutorTestHelper;
+import com.google.devtools.build.lib.testutil.TestConstants;
 import com.google.devtools.build.lib.util.AbruptExitException;
 import com.google.devtools.build.lib.util.io.TimestampGranularityMonitor;
 import com.google.devtools.build.lib.vfs.DigestHashFunction;
@@ -43,10 +44,10 @@ import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.ModifiedFileSet;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.Root;
+import com.google.devtools.build.lib.vfs.SyscallCache;
 import com.google.devtools.build.lib.vfs.inmemoryfs.InMemoryFileSystem;
 import com.google.devtools.common.options.OptionsParser;
 import java.nio.charset.StandardCharsets;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -55,9 +56,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
-/**
- * Tests for package loading.
- */
+/** Tests for package loading. */
 @RunWith(JUnit4.class)
 public class BuildFileModificationTest extends FoundationTestCase {
 
@@ -71,62 +70,63 @@ public class BuildFileModificationTest extends FoundationTestCase {
   }
 
   @Before
-  public final void initializeSkyframeExecutor() {
-    AnalysisMock analysisMock = AnalysisMock.get();
+  public final void initializeSkyframeExecutor() throws Exception {
+    AnalysisMock analysisMock = AnalysisMock.getAnalysisMockWithoutBuiltinModules();
     ConfiguredRuleClassProvider ruleClassProvider = analysisMock.createRuleClassProvider();
     BlazeDirectories directories =
         new BlazeDirectories(
             new ServerDirectories(outputBase, outputBase, outputBase),
             rootDirectory,
-            /* defaultSystemJavabase= */ null,
             analysisMock.getProductName());
     PackageFactory pkgFactory =
         analysisMock
             .getPackageFactoryBuilderForTesting(directories)
             .build(ruleClassProvider, fileSystem);
     skyframeExecutor =
-        BazelSkyframeExecutorConstants.newBazelSkyframeExecutorBuilder()
+        SequencedSkyframeExecutor.newBazelSkyframeExecutorBuilder()
             .setPkgFactory(pkgFactory)
             .setFileSystem(fileSystem)
             .setDirectories(directories)
             .setActionKeyContext(actionKeyContext)
             .setExtraSkyFunctions(analysisMock.getSkyFunctions(directories))
+            .setSyscallCache(SyscallCache.NO_CACHE)
+            .setCompressionService(new CompressionServiceImpl())
             .build();
-    skyframeExecutor.injectExtraPrecomputedValues(
-        ImmutableList.of(
-            PrecomputedValue.injected(
-                RepositoryDelegatorFunction.RESOLVED_FILE_INSTEAD_OF_WORKSPACE, Optional.empty()),
-            PrecomputedValue.injected(RepositoryDelegatorFunction.ENABLE_BZLMOD, false)));
+    skyframeExecutor.injectExtraPrecomputedValues(analysisMock.getPrecomputedValues());
     SkyframeExecutorTestHelper.process(skyframeExecutor);
     OptionsParser parser =
         OptionsParser.builder()
             .optionsClasses(PackageOptions.class, BuildLanguageOptions.class)
             .build();
+    parser.parse(TestConstants.PRODUCT_SPECIFIC_BUILD_LANG_OPTIONS);
     setUpSkyframe(
         parser.getOptions(PackageOptions.class), parser.getOptions(BuildLanguageOptions.class));
   }
 
   private void setUpSkyframe(
-      PackageOptions packageOptions, BuildLanguageOptions buildLanguageOptions) {
+      PackageOptions packageOptions, BuildLanguageOptions buildLanguageOptions) throws Exception {
     PathPackageLocator pkgLocator =
         PathPackageLocator.create(
             null,
-            packageOptions.packagePath,
+            packageOptions.getPackagePath(),
             reporter,
             rootDirectory.asFragment(),
             rootDirectory,
             BazelSkyframeExecutorConstants.BUILD_FILES_BY_PRIORITY);
-    packageOptions.showLoadingProgress = true;
-    packageOptions.globbingThreads = 7;
+    packageOptions.setShowLoadingProgress(true);
+    packageOptions.setGlobbingThreads(7);
     skyframeExecutor.preparePackageLoading(
         pkgLocator,
         packageOptions,
         buildLanguageOptions,
         UUID.randomUUID(),
         ImmutableMap.of(),
+        /* repoEnv= */ ImmutableMap.of(),
+        QuiescingExecutorsImpl.forTesting(),
         new TimestampGranularityMonitor(clock));
     skyframeExecutor.setActionEnv(ImmutableMap.of());
-    skyframeExecutor.setDeletedPackages(ImmutableSet.copyOf(packageOptions.getDeletedPackages()));
+    skyframeExecutor.setDeletedPackages(
+        ImmutableSet.copyOf(packageOptions.getDeletedPackagesOrEmptySet()));
   }
 
   @Override
@@ -141,15 +141,17 @@ public class BuildFileModificationTest extends FoundationTestCase {
 
   private Package getPackage(String packageName)
       throws NoSuchPackageException, InterruptedException {
-    return skyframeExecutor.getPackageManager().getPackage(reporter,
-        PackageIdentifier.createInMainRepo(packageName));
+    return skyframeExecutor
+        .getPackageManager()
+        .getPackage(reporter, PackageIdentifier.createInMainRepo(packageName));
   }
 
   @Test
   public void testCTimeChangeDetectedWithError() throws Exception {
     reporter.removeHandler(failFastHandler);
-    Path build = scratch.file(
-        "a/BUILD", "cc_library(name='a', feet='stinky')".getBytes(StandardCharsets.ISO_8859_1));
+    Path build =
+        scratch.file(
+            "a/BUILD", "filegroup(name='a', feet='stinky')".getBytes(StandardCharsets.ISO_8859_1));
     Package a1 = getPackage("a");
     assertThat(a1.containsErrors()).isTrue();
     assertContainsEvent("//a:a: no such attribute 'feet'");
@@ -157,7 +159,7 @@ public class BuildFileModificationTest extends FoundationTestCase {
     // writeContent updates mtime and ctime. Note that we keep the content length exactly the same.
     clock.advanceMillis(1);
     FileSystemUtils.writeContent(
-        build, "cc_library(name='a', srcs=['a.cc'])".getBytes(StandardCharsets.ISO_8859_1));
+        build, "filegroup(name='a', srcs=['a.cc'])".getBytes(StandardCharsets.ISO_8859_1));
 
     invalidatePackages();
     Package a2 = getPackage("a");
@@ -168,14 +170,15 @@ public class BuildFileModificationTest extends FoundationTestCase {
 
   @Test
   public void testCTimeChangeDetected() throws Exception {
-    Path path = scratch.file(
-        "pkg/BUILD", "cc_library(name = 'foo')\n".getBytes(StandardCharsets.ISO_8859_1));
+    Path path =
+        scratch.file(
+            "pkg/BUILD", "filegroup(name = 'foo')\n".getBytes(StandardCharsets.ISO_8859_1));
     Package oldPkg = getPackage("pkg");
 
     // Note that the content has exactly the same length as before.
     clock.advanceMillis(1);
     FileSystemUtils.writeContent(
-        path, "cc_library(name = 'bar')\n".getBytes(StandardCharsets.ISO_8859_1));
+        path, "filegroup(name = 'bar')\n".getBytes(StandardCharsets.ISO_8859_1));
     assertThat(getPackage("pkg"))
         .isSameInstanceAs(oldPkg); // Change only becomes visible after invalidatePackages.
 
@@ -189,14 +192,15 @@ public class BuildFileModificationTest extends FoundationTestCase {
   @Test
   public void testLengthChangeDetected() throws Exception {
     reporter.removeHandler(failFastHandler);
-    Path build = scratch.file(
-        "a/BUILD", "cc_library(name='a', srcs=['a.cc'])".getBytes(StandardCharsets.ISO_8859_1));
+    Path build =
+        scratch.file(
+            "a/BUILD", "filegroup(name='a', srcs=['a.cc'])".getBytes(StandardCharsets.ISO_8859_1));
     Package a1 = getPackage("a");
     eventCollector.clear();
     // Note that we didn't advance the clock, so ctime/mtime is the same as before.
     // However, the file contents are one byte longer.
     FileSystemUtils.writeContent(
-        build, "cc_library(name='ab', srcs=['a.cc'])".getBytes(StandardCharsets.ISO_8859_1));
+        build, "filegroup(name='ab', srcs=['a.cc'])".getBytes(StandardCharsets.ISO_8859_1));
 
     invalidatePackages();
     Package a2 = getPackage("a");
@@ -206,8 +210,7 @@ public class BuildFileModificationTest extends FoundationTestCase {
 
   @Test
   public void testTouchedBuildFileCausesReloadAfterSync() throws Exception {
-    Path path = scratch.file("pkg/BUILD",
-                             "cc_library(name = 'foo')");
+    Path path = scratch.file("pkg/BUILD", "filegroup(name = 'foo')");
 
     Package oldPkg = getPackage("pkg");
     // Change ctime to 1.

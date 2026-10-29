@@ -25,7 +25,7 @@ public class ActionKeyContext {
       new NestedSetFingerprintCache();
 
   public <T> void addNestedSetToFingerprint(Fingerprint fingerprint, NestedSet<T> nestedSet)
-      throws CommandLineExpansionException, InterruptedException {
+      throws InterruptedException {
     nestedSetFingerprintCache.addNestedSetToFingerprint(fingerprint, nestedSet);
   }
 
@@ -33,6 +33,18 @@ public class ActionKeyContext {
       CommandLineItem.MapFn<? super T> mapFn, Fingerprint fingerprint, NestedSet<T> nestedSet)
       throws CommandLineExpansionException, InterruptedException {
     nestedSetFingerprintCache.addNestedSetToFingerprint(mapFn, fingerprint, nestedSet);
+  }
+
+  public <T> void addNestedSetToFingerprint(
+      CommandLineItem.ExceptionlessMapFn<? super T> mapFn,
+      Fingerprint fingerprint,
+      NestedSet<T> nestedSet) {
+    nestedSetFingerprintCache.addNestedSetToFingerprintExceptionless(mapFn, fingerprint, nestedSet);
+  }
+
+  public static <T> String describeNestedSetFingerprint(
+      CommandLineItem.ExceptionlessMapFn<? super T> mapFn, NestedSet<T> nestedSet) {
+    return NestedSetFingerprintCache.describedNestedSetFingerprint(mapFn, nestedSet);
   }
 
   public void clear() {

@@ -14,25 +14,34 @@
 package com.google.devtools.build.lib.skyframe;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
 import com.google.common.flogger.GoogleLogger;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
 import com.google.devtools.build.lib.analysis.ConfiguredRuleClassProvider.BundledFileSystem;
 import com.google.devtools.build.lib.cmdline.LabelConstants;
+import com.google.devtools.build.lib.cmdline.LabelSyntaxException;
 import com.google.devtools.build.lib.cmdline.RepositoryName;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadCompatible;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;
+import com.google.devtools.build.lib.events.Event;
+import com.google.devtools.build.lib.events.ExtendedEventHandler;
 import com.google.devtools.build.lib.pkgcache.PathPackageLocator;
-import com.google.devtools.build.lib.rules.repository.RepositoryFunction;
-import com.google.devtools.build.lib.util.Pair;
+import com.google.devtools.build.lib.rules.repository.RepositoryDirectoryValue;
 import com.google.devtools.build.lib.util.TestType;
 import com.google.devtools.build.lib.vfs.Path;
+import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.RootedPath;
 import com.google.devtools.build.skyframe.SkyFunction;
+import com.google.devtools.build.skyframe.SkyFunction.Environment;
+import com.google.devtools.build.skyframe.SkyKey;
 import java.io.IOException;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+import javax.annotation.Nullable;
 
 /** Common utilities for dealing with paths outside the package roots. */
 public class ExternalFilesHelper {
@@ -42,46 +51,46 @@ public class ExternalFilesHelper {
   private final ExternalFileAction externalFileAction;
   private final BlazeDirectories directories;
   private final int maxNumExternalFilesToLog;
+  private final Supplier<Path> repoContentsCachePathSupplier;
   private final AtomicInteger numExternalFilesLogged = new AtomicInteger(0);
   private static final int MAX_EXTERNAL_FILES_TO_TRACK = 2500;
 
   // These variables are set to true from multiple threads, but only read in the main thread.
   // So volatility or an AtomicBoolean is not needed.
   private boolean anyOutputFilesSeen = false;
-  private boolean tooManyNonOutputExternalFilesSeen = false;
+  private boolean tooManyExternalOtherFilesSeen = false;
   private boolean anyFilesInExternalReposSeen = false;
 
-  // This is a set of external files that are not in managed directories or
-  // external repositories.
-  private Set<RootedPath> nonOutputExternalFilesSeen = Sets.newConcurrentHashSet();
-  private final ManagedDirectoriesKnowledge managedDirectoriesKnowledge;
+  // This is the set of EXTERNAL_OTHER files.
+  private Set<RootedPath> externalOtherFilesSeen = Sets.newConcurrentHashSet();
 
   private ExternalFilesHelper(
       AtomicReference<PathPackageLocator> pkgLocator,
       ExternalFileAction externalFileAction,
       BlazeDirectories directories,
-      int maxNumExternalFilesToLog,
-      ManagedDirectoriesKnowledge managedDirectoriesKnowledge) {
+      Supplier<Path> repoContentsCachePathSupplier,
+      int maxNumExternalFilesToLog) {
     this.pkgLocator = pkgLocator;
     this.externalFileAction = externalFileAction;
     this.directories = directories;
+    this.repoContentsCachePathSupplier = repoContentsCachePathSupplier;
     this.maxNumExternalFilesToLog = maxNumExternalFilesToLog;
-    this.managedDirectoriesKnowledge = managedDirectoriesKnowledge;
   }
 
   public static ExternalFilesHelper create(
       AtomicReference<PathPackageLocator> pkgLocator,
       ExternalFileAction externalFileAction,
       BlazeDirectories directories,
-      ManagedDirectoriesKnowledge managedDirectoriesKnowledge) {
+      Supplier<Path> repoContentsCachePathSupplier) {
     return TestType.isInTest()
-        ? createForTesting(pkgLocator, externalFileAction, directories, managedDirectoriesKnowledge)
+        ? createForTesting(
+            pkgLocator, externalFileAction, directories, repoContentsCachePathSupplier)
         : new ExternalFilesHelper(
             pkgLocator,
             externalFileAction,
             directories,
-            /*maxNumExternalFilesToLog=*/ 100,
-            managedDirectoriesKnowledge);
+            repoContentsCachePathSupplier,
+            /* maxNumExternalFilesToLog= */ 100);
   }
 
   public static ExternalFilesHelper createForTesting(
@@ -92,23 +101,31 @@ public class ExternalFilesHelper {
         pkgLocator,
         externalFileAction,
         directories,
-        ManagedDirectoriesKnowledge.NO_MANAGED_DIRECTORIES);
+        /* repoContentsCachePathSupplier= */ () -> null);
   }
 
-  private static ExternalFilesHelper createForTesting(
+  public static ExternalFilesHelper createForTesting(
       AtomicReference<PathPackageLocator> pkgLocator,
       ExternalFileAction externalFileAction,
       BlazeDirectories directories,
-      ManagedDirectoriesKnowledge managedDirectoriesKnowledge) {
+      Supplier<Path> repoContentsCachePathSupplier) {
     return new ExternalFilesHelper(
         pkgLocator,
         externalFileAction,
         directories,
+        repoContentsCachePathSupplier,
         // These log lines are mostly spam during unit and integration tests.
-        /*maxNumExternalFilesToLog=*/ 0,
-        managedDirectoriesKnowledge);
+        /* maxNumExternalFilesToLog= */ 0);
   }
 
+  /**
+   * Returns the path of the repo contents cache directory, or {@code null} if the repo contents
+   * cache is disabled. Fetched repos may be materialized as symlinks into this directory.
+   */
+  @Nullable
+  public Path getRepoContentsCachePath() {
+    return repoContentsCachePathSupplier.get();
+  }
 
   /**
    * The action to take when an external path is encountered. See {@link FileType} for the
@@ -125,8 +142,8 @@ public class ExternalFilesHelper {
     DEPEND_ON_EXTERNAL_PKG_FOR_EXTERNAL_REPO_PATHS,
 
     /**
-     * For paths of type {@link FileType#EXTERNAL} or {@link FileType#OUTPUT}, assume the path does
-     * not exist and will never exist.
+     * For paths of type {@link FileType#EXTERNAL_OTHER} or {@link FileType#OUTPUT}, assume the path
+     * does not exist and will never exist.
      */
     ASSUME_NON_EXISTENT_AND_IMMUTABLE_FOR_EXTERNAL_PATHS,
   }
@@ -144,12 +161,6 @@ public class ExternalFilesHelper {
     INTERNAL,
 
     /**
-     * A non {@link #EXTERNAL_REPO} or {@link #EXTERNAL_IN_MANAGED_DIRECTORY} path outside the
-     * package roots about which we may make no other assumptions.
-     */
-    EXTERNAL,
-
-    /**
      * A path in Bazel's output tree that's a proper output of an action (*not* a source file in an
      * external repository). Such files are theoretically mutable, but certain Bazel flags may tell
      * Bazel to assume these paths are immutable.
@@ -159,7 +170,7 @@ public class ExternalFilesHelper {
      * and also note that output files do not normally have corresponding {@link
      * com.google.devtools.build.lib.actions.FileValue} instances (and thus also {@link
      * com.google.devtools.build.lib.actions.FileStateValue} instances) in the Skyframe graph
-     * ({@link ArtifactFunction} only uses {@link com.google.devtools.build.lib.actions.FileValue}s
+     * ({@code ArtifactFunction} only uses {@link com.google.devtools.build.lib.actions.FileValue}s
      * for source files). But {@link com.google.devtools.build.lib.actions.FileStateValue}s for
      * output files can still make their way into the Skyframe graph if e.g. a source file is a
      * symlink to an output file.
@@ -177,39 +188,52 @@ public class ExternalFilesHelper {
     EXTERNAL_REPO,
 
     /**
-     * A path is under one of the managed directories. Managed directories are user-owned
-     * directories, which can be incrementally updated by repository rules, so that the updated
-     * files are visible for the actions in the same build.
+     * The directory containing the repo contents cache entries as well as direct children
+     * corresponding to individual predeclared input hashes. These directories are created by Bazel
+     * but may be deleted when users delete the entire repo contents cache. However, they are always
+     * recreated by Bazel before they are used and/or depended on via Skyframe. They are thus
+     * immutably present from the perspective of Skyframe and don't require invalidation.
      *
-     * <p>Every such path under the managed directory is generated or updated by the execution of
-     * the corresponding repository rule, so these paths should not be cached by Skyframe before the
-     * RepositoryDirectoryValue is computed. {@link ManagedDirectoriesKnowledge}
+     * <p>Note: If these directories ever need to be checked for dirtiness during diffing, they have
+     * to be made non-cacheable according to {@code
+     * DirtinessCheckerUtils.ExternalDirtinessChecker#isCacheableType} so that they are not locked
+     * in as non-existent if they have been removed. This would result in FileValues for files below
+     * them (the actual repo contents, of type EXTERNAL_OTHER) being locked in as non-existent too,
+     * even after a refetch of the repo has added a new cache entry.
      */
-    EXTERNAL_IN_MANAGED_DIRECTORY,
+    REPO_CONTENTS_CACHE_DIRS,
+
+    /**
+     * None of the above. We encounter these paths when outputs, source files or external repos
+     * symlink to files outside aforementioned Bazel-managed directories. For example, C compilation
+     * by the host compiler may depend on /usr/bin/gcc. Bazel makes a best-effort attempt to detect
+     * changes in such files. This type also includes files in repo contents cache entries, which
+     * are created by Bazel but never modified after creation.
+     */
+    EXTERNAL_OTHER,
   }
 
   /**
-   * Thrown by {@link #maybeHandleExternalFile} when an applicable path is processed (see
-   * {@link ExternalFileAction#ASSUME_NON_EXISTENT_AND_IMMUTABLE_FOR_EXTERNAL_PATHS}.
+   * Thrown by {@link #maybeHandleExternalFile} when an applicable path is processed (see {@link
+   * ExternalFileAction#ASSUME_NON_EXISTENT_AND_IMMUTABLE_FOR_EXTERNAL_PATHS}.
    */
-  static class NonexistentImmutableExternalFileException extends Exception {
-  }
+  static class NonexistentImmutableExternalFileException extends Exception {}
 
   static class ExternalFilesKnowledge {
     final boolean anyOutputFilesSeen;
-    final Set<RootedPath> nonOutputExternalFilesSeen;
+    final Set<RootedPath> externalOtherFilesSeen;
     final boolean anyFilesInExternalReposSeen;
-    final boolean tooManyNonOutputExternalFilesSeen;
+    final boolean tooManyExternalOtherFilesSeen;
 
     private ExternalFilesKnowledge(
         boolean anyOutputFilesSeen,
-        Set<RootedPath> nonOutputExternalFilesSeen,
+        Set<RootedPath> externalOtherFilesSeen,
         boolean anyFilesInExternalReposSeen,
-        boolean tooManyNonOutputExternalFilesSeen) {
+        boolean tooManyExternalOtherFilesSeen) {
       this.anyOutputFilesSeen = anyOutputFilesSeen;
-      this.nonOutputExternalFilesSeen = nonOutputExternalFilesSeen;
+      this.externalOtherFilesSeen = externalOtherFilesSeen;
       this.anyFilesInExternalReposSeen = anyFilesInExternalReposSeen;
-      this.tooManyNonOutputExternalFilesSeen = tooManyNonOutputExternalFilesSeen;
+      this.tooManyExternalOtherFilesSeen = tooManyExternalOtherFilesSeen;
     }
   }
 
@@ -217,17 +241,17 @@ public class ExternalFilesHelper {
   ExternalFilesKnowledge getExternalFilesKnowledge() {
     return new ExternalFilesKnowledge(
         anyOutputFilesSeen,
-        nonOutputExternalFilesSeen,
+        externalOtherFilesSeen,
         anyFilesInExternalReposSeen,
-        tooManyNonOutputExternalFilesSeen);
+        tooManyExternalOtherFilesSeen);
   }
 
   @ThreadCompatible
   void setExternalFilesKnowledge(ExternalFilesKnowledge externalFilesKnowledge) {
     anyOutputFilesSeen = externalFilesKnowledge.anyOutputFilesSeen;
-    nonOutputExternalFilesSeen = externalFilesKnowledge.nonOutputExternalFilesSeen;
+    externalOtherFilesSeen = externalFilesKnowledge.externalOtherFilesSeen;
     anyFilesInExternalReposSeen = externalFilesKnowledge.anyFilesInExternalReposSeen;
-    tooManyNonOutputExternalFilesSeen = externalFilesKnowledge.tooManyNonOutputExternalFilesSeen;
+    tooManyExternalOtherFilesSeen = externalFilesKnowledge.tooManyExternalOtherFilesSeen;
   }
 
   ExternalFilesHelper cloneWithFreshExternalFilesKnowledge() {
@@ -235,27 +259,17 @@ public class ExternalFilesHelper {
         pkgLocator,
         externalFileAction,
         directories,
-        maxNumExternalFilesToLog,
-        managedDirectoriesKnowledge);
+        repoContentsCachePathSupplier,
+        maxNumExternalFilesToLog);
   }
 
   public FileType getAndNoteFileType(RootedPath rootedPath) {
-    return getFileTypeAndRepository(rootedPath).getFirst();
-  }
-
-  private Pair<FileType, RepositoryName> getFileTypeAndRepository(RootedPath rootedPath) {
-    RepositoryName repositoryName =
-        managedDirectoriesKnowledge.getOwnerRepository(rootedPath.getRootRelativePath());
-    if (repositoryName != null) {
-      anyFilesInExternalReposSeen = true;
-      return Pair.of(FileType.EXTERNAL_IN_MANAGED_DIRECTORY, repositoryName);
-    }
     FileType fileType = detectFileType(rootedPath);
-    if (FileType.EXTERNAL == fileType) {
-      if (nonOutputExternalFilesSeen.size() >= MAX_EXTERNAL_FILES_TO_TRACK) {
-        tooManyNonOutputExternalFilesSeen = true;
+    if (fileType == FileType.EXTERNAL_OTHER) {
+      if (externalOtherFilesSeen.size() >= MAX_EXTERNAL_FILES_TO_TRACK) {
+        tooManyExternalOtherFilesSeen = true;
       } else {
-        nonOutputExternalFilesSeen.add(rootedPath);
+        externalOtherFilesSeen.add(rootedPath);
       }
     }
     if (FileType.EXTERNAL_REPO == fileType) {
@@ -264,7 +278,7 @@ public class ExternalFilesHelper {
     if (FileType.OUTPUT == fileType) {
       anyOutputFilesSeen = true;
     }
-    return Pair.of(fileType, null);
+    return fileType;
   }
 
   /**
@@ -279,20 +293,29 @@ public class ExternalFilesHelper {
     if (packageLocator.getPathEntries().contains(rootedPath.getRoot())) {
       return FileType.INTERNAL;
     }
+    var repoContentsCachePath = repoContentsCachePathSupplier.get();
+    if (repoContentsCachePath != null
+        && rootedPath.asPath().startsWith(repoContentsCachePath)
+        && !rootedPath.asPath().relativeTo(repoContentsCachePath).isMultiSegment()) {
+      return FileType.REPO_CONTENTS_CACHE_DIRS;
+    }
     // The outputBase may be null if we're not actually running a build.
     Path outputBase = packageLocator.getOutputBase();
     if (outputBase == null) {
-      return FileType.EXTERNAL;
+      return FileType.EXTERNAL_OTHER;
     }
     if (rootedPath.asPath().startsWith(outputBase)) {
       Path externalRepoDir = outputBase.getRelative(LabelConstants.EXTERNAL_REPOSITORY_LOCATION);
       if (rootedPath.asPath().startsWith(externalRepoDir)) {
         return FileType.EXTERNAL_REPO;
-      } else {
-        return FileType.OUTPUT;
       }
+      if (rootedPath.asPath().equals(outputBase.getRelative(LabelConstants.MODULE_LOCKFILE_NAME))) {
+        // The hidden lockfile must reflect writes even when output-file checking is disabled.
+        return FileType.EXTERNAL_OTHER;
+      }
+      return FileType.OUTPUT;
     }
-    return FileType.EXTERNAL;
+    return FileType.EXTERNAL_OTHER;
   }
 
   /**
@@ -305,24 +328,17 @@ public class ExternalFilesHelper {
   @ThreadSafe
   FileType maybeHandleExternalFile(RootedPath rootedPath, SkyFunction.Environment env)
       throws NonexistentImmutableExternalFileException, IOException, InterruptedException {
-    Pair<FileType, RepositoryName> pair = getFileTypeAndRepository(rootedPath);
-
-    FileType fileType = Preconditions.checkNotNull(pair.getFirst());
+    FileType fileType = Preconditions.checkNotNull(getAndNoteFileType(rootedPath));
     switch (fileType) {
-      case EXTERNAL_IN_MANAGED_DIRECTORY:
-        Preconditions.checkState(
-            externalFileAction == ExternalFileAction.DEPEND_ON_EXTERNAL_PKG_FOR_EXTERNAL_REPO_PATHS,
-            externalFileAction);
-        RepositoryFunction.addManagedDirectoryDependencies(pair.getSecond(), env);
-        break;
       case BUNDLED:
       case INTERNAL:
+      case REPO_CONTENTS_CACHE_DIRS:
         break;
-      case EXTERNAL:
+      case EXTERNAL_OTHER:
         if (numExternalFilesLogged.incrementAndGet() < maxNumExternalFilesToLog) {
           logger.atInfo().log("Encountered an external path %s", rootedPath);
         }
-        // fall through
+      // fall through
       case OUTPUT:
         if (externalFileAction
             == ExternalFileAction.ASSUME_NON_EXISTENT_AND_IMMUTABLE_FOR_EXTERNAL_PATHS) {
@@ -333,9 +349,73 @@ public class ExternalFilesHelper {
         Preconditions.checkState(
             externalFileAction == ExternalFileAction.DEPEND_ON_EXTERNAL_PKG_FOR_EXTERNAL_REPO_PATHS,
             externalFileAction);
-        RepositoryFunction.addExternalFilesDependencies(rootedPath, directories, env);
+        addExternalFilesDependencies(rootedPath, env);
         break;
     }
     return fileType;
+  }
+
+  /**
+   * For files that are under $OUTPUT_BASE/external, add a dependency on the corresponding repo so
+   * that if the repo is refetched, the {File,DirectoryListing}StateValue's of files underneath will
+   * be re-evaluated.
+   *
+   * <p>Note that we don't add a dependency on the parent directory at the package root boundary, so
+   * the only transitive dependencies from files inside the package roots to external files are
+   * through symlinks. So the upwards transitive closure of external files is small.
+   */
+  private void addExternalFilesDependencies(RootedPath rootedPath, Environment env)
+      throws InterruptedException {
+    var repositoryName = getExternalRepoName(rootedPath);
+    if (repositoryName != null) {
+      env.getValue(RepositoryDirectoryValue.key(repositoryName));
+    }
+  }
+
+  /**
+   * For a file of type {@link FileType#EXTERNAL_REPO}, returns the name of the external repository
+   * it is in or null if the path is not in a valid external repository.
+   */
+  @Nullable
+  RepositoryName getExternalRepoName(RootedPath rootedPath) {
+    PathFragment repositoryPath = rootedPath.asPath().relativeTo(getExternalDirectory());
+    if (repositoryPath.isEmpty()) {
+      // We are the top of the repository path (<outputBase>/external), not in an actual external
+      // repository path.
+      return null;
+    }
+    try {
+      return RepositoryName.create(repositoryPath.getSegment(0));
+    } catch (LabelSyntaxException ignored) {
+      // The directory of a repository with an invalid name can never exist.
+      return null;
+    }
+  }
+
+  Iterable<SkyKey> getExtraKeysToInvalidate(
+      Map<RepositoryName, RootedPath> dirtyExternalRepos, ExtendedEventHandler eventHandler) {
+    dirtyExternalRepos.forEach(
+        (repoName, file) -> {
+          eventHandler.handle(
+              Event.warn(
+                  """
+                  Repository '%s' will be fetched again since the file '%s' has been modified \
+                  externally. External modifications can lead to incorrect builds.\
+                  """
+                      .formatted(repoName, file.getRootRelativePath())));
+          // Delete the marker file so that invalidating the RepositoryDirectoryValue actually
+          // causes a re-fetch of the repository.
+          try {
+            getExternalDirectory().getRelative(repoName.getMarkerFileName()).delete();
+          } catch (IOException e) {
+            // Any failure to delete the file should also make it non-readable, so we still achieve
+            // our goal of forcing a re-fetch of the repository.
+          }
+        });
+    return Iterables.transform(dirtyExternalRepos.keySet(), RepositoryDirectoryValue::key);
+  }
+
+  private Path getExternalDirectory() {
+    return directories.getOutputBase().getRelative(LabelConstants.EXTERNAL_REPOSITORY_LOCATION);
   }
 }

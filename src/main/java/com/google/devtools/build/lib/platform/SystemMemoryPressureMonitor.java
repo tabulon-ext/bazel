@@ -16,7 +16,6 @@ package com.google.devtools.build.lib.platform;
 
 import com.google.common.flogger.GoogleLogger;
 import com.google.devtools.build.lib.events.Reporter;
-import com.google.devtools.build.lib.jni.JniLoader;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 
@@ -30,20 +29,18 @@ public final class SystemMemoryPressureMonitor {
   @Nullable
   private Reporter reporter;
 
+  private PlatformNativeDepsService service;
+
   public static SystemMemoryPressureMonitor getInstance() {
     return singleton;
   }
 
-  private SystemMemoryPressureMonitor() {
-    JniLoader.loadJni();
-    if (JniLoader.isJniAvailable()) {
-      registerJNI();
-    }
+  private SystemMemoryPressureMonitor() {}
+
+  public void registerJniService(PlatformNativeDepsService service) {
+    this.service = service;
+    service.registerMemoryPressureJni(this::memoryPressureCallback);
   }
-
-  private native void registerJNI();
-
-  private native int systemMemoryPressure();
 
   /** The possible memory pressure levels. */
   public enum Level {
@@ -63,27 +60,23 @@ public final class SystemMemoryPressureMonitor {
 
     /** These constants are mapped to enum in third_party/bazel/src/main/native/unix_jni.h. */
     static Level fromInt(int number) {
-      switch (number) {
-        case 0:
-          return NORMAL;
-        case 1:
-          return WARNING;
-        case 2:
-          return CRITICAL;
-        default:
-          throw new IllegalStateException("Unknown memory pressure level: " + number);
-      }
+      return switch (number) {
+        case 0 -> NORMAL;
+        case 1 -> WARNING;
+        case 2 -> CRITICAL;
+        default -> throw new IllegalStateException("Unknown memory pressure level: " + number);
+      };
     }
   };
 
   /** Return current memory pressure */
   public Level level() {
-    return Level.fromInt(systemMemoryPressure());
+    return Level.fromInt(service.systemMemoryPressure());
   }
 
   public synchronized void setReporter(@Nullable Reporter reporter) {
     this.reporter = reporter;
-    int pressure = systemMemoryPressure();
+    int pressure = service.systemMemoryPressure();
     if (Level.fromInt(pressure) != Level.NORMAL) {
       memoryPressureCallback(pressure);
     }

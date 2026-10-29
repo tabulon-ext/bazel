@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+load("@rules_java//java:java_import.bzl", "java_import")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -42,7 +43,6 @@ java_import(
         "java/netty-transport-native-epoll.jar",
         "java/netty-transport-native-kqueue.jar",
         "java/netty-transport-native-unix-common.jar",
-        "java/netty-transport-sctp.jar",
     ],
 )
 
@@ -50,18 +50,6 @@ java_import(
 java_import(
     name = "gson",
     jars = ["java/gson.jar"],
-)
-
-# libtomcat9-java
-java_import(
-    name = "tomcat_annotations_api",
-    jars = ["java/tomcat9-annotations-api.jar"],
-)
-
-# For bootstrapping java toolcahin
-filegroup(
-    name = "tomcat_annotations_api-jars",
-    srcs = ["java/tomcat9-annotations-api.jar"],
 )
 
 # libjava-allocation-instrumenter-java
@@ -161,12 +149,6 @@ java_import(
 filegroup(
     name = "jsr305-jars",
     srcs = ["java/jsr305.jar"],
-)
-
-# libnetty-tcnative-java
-java_import(
-    name = "netty_tcnative",
-    jars = ["java/netty-tcnative.jar"],
 )
 
 # libjavapoet-java
@@ -451,4 +433,23 @@ java_import(
         "java/hamcrest-core.jar",
         "java/junit4.jar",
     ],
+)
+
+# libreactive-streams-java
+java_import(
+    name = "reactive_streams",
+    jars = ["java/reactive-streams.jar"],
+)
+
+# librx-java
+java_import(
+    name = "rxjava3",
+    jars = ["java/rxjava.jar"],
+    deps = [":reactive_streams"],
+)
+
+# libcaffeine-java
+java_import(
+    name = "caffeine",
+    jars = ["java/caffeine.jar"],
 )

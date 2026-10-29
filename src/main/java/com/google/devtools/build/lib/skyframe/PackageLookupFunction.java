@@ -13,11 +13,11 @@
 // limitations under the License.
 package com.google.devtools.build.lib.skyframe;
 
-import com.google.common.base.Preconditions;
-import com.google.common.base.Verify;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import com.google.devtools.build.lib.actions.FileStateValue;
 import com.google.devtools.build.lib.actions.FileValue;
+import com.google.devtools.build.lib.cmdline.IgnoredSubdirectories.IgnoredReason;
 import com.google.devtools.build.lib.cmdline.LabelConstants;
 import com.google.devtools.build.lib.cmdline.LabelValidator;
 import com.google.devtools.build.lib.cmdline.PackageIdentifier;
@@ -25,15 +25,18 @@ import com.google.devtools.build.lib.io.FileSymlinkException;
 import com.google.devtools.build.lib.io.InconsistentFilesystemException;
 import com.google.devtools.build.lib.packages.BuildFileName;
 import com.google.devtools.build.lib.packages.BuildFileNotFoundException;
-import com.google.devtools.build.lib.packages.ErrorDeterminingRepositoryException;
 import com.google.devtools.build.lib.packages.NoSuchPackageException;
 import com.google.devtools.build.lib.packages.RepositoryFetchException;
-import com.google.devtools.build.lib.packages.semantics.BuildLanguageOptions;
 import com.google.devtools.build.lib.pkgcache.PathPackageLocator;
-import com.google.devtools.build.lib.repository.ExternalPackageHelper;
 import com.google.devtools.build.lib.rules.repository.RepositoryDirectoryValue;
-import com.google.devtools.build.lib.server.FailureDetails;
+import com.google.devtools.build.lib.rules.repository.RepositoryDirectoryValue.Failure;
+import com.google.devtools.build.lib.rules.repository.RepositoryDirectoryValue.Success;
+import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
+import com.google.devtools.build.lib.server.FailureDetails.PackageLoading;
+import com.google.devtools.build.lib.server.FailureDetails.PackageLoading.Code;
+import com.google.devtools.build.lib.skyframe.PackageLookupValue.NoRepositoryPackageLookupValue;
 import com.google.devtools.build.lib.util.DetailedExitCode;
+import com.google.devtools.build.lib.vfs.DetailedIOException;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.Root;
 import com.google.devtools.build.lib.vfs.RootedPath;
@@ -47,32 +50,17 @@ import java.io.IOException;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 import net.starlark.java.eval.EvalException;
-import net.starlark.java.eval.StarlarkSemantics;
 
 /** SkyFunction for {@link PackageLookupValue}s. */
 public class PackageLookupFunction implements SkyFunction {
-  /** Lists possible ways to handle a package label which crosses into a new repository. */
-  public enum CrossRepositoryLabelViolationStrategy {
-    /** Ignore the violation. */
-    IGNORE,
-    /** Generate an error. */
-    ERROR;
-  }
-
   private final AtomicReference<ImmutableSet<PackageIdentifier>> deletedPackages;
-  private final CrossRepositoryLabelViolationStrategy crossRepositoryLabelViolationStrategy;
   private final ImmutableList<BuildFileName> buildFilesByPriority;
-  private final ExternalPackageHelper externalPackageHelper;
 
   public PackageLookupFunction(
       AtomicReference<ImmutableSet<PackageIdentifier>> deletedPackages,
-      CrossRepositoryLabelViolationStrategy crossRepositoryLabelViolationStrategy,
-      ImmutableList<BuildFileName> buildFilesByPriority,
-      ExternalPackageHelper externalPackageHelper) {
+      ImmutableList<BuildFileName> buildFilesByPriority) {
     this.deletedPackages = deletedPackages;
-    this.crossRepositoryLabelViolationStrategy = crossRepositoryLabelViolationStrategy;
     this.buildFilesByPriority = buildFilesByPriority;
-    this.externalPackageHelper = externalPackageHelper;
   }
 
   private static class State implements SkyKeyComputeState {
@@ -80,11 +68,11 @@ public class PackageLookupFunction implements SkyFunction {
     private int buildFileNamePos = 0;
   }
 
+  @Nullable
   @Override
   public SkyValue compute(SkyKey skyKey, Environment env)
       throws PackageLookupFunctionException, InterruptedException {
     PathPackageLocator pkgLocator = PrecomputedValue.PATH_PACKAGE_LOCATOR.get(env);
-    StarlarkSemantics semantics = PrecomputedValue.STARLARK_SEMANTICS.get(env);
 
     PackageIdentifier packageKey = (PackageIdentifier) skyKey.argument();
 
@@ -104,20 +92,23 @@ public class PackageLookupFunction implements SkyFunction {
     }
 
     if (packageKey.equals(LabelConstants.EXTERNAL_PACKAGE_IDENTIFIER)) {
-      return semantics.getBool(BuildLanguageOptions.EXPERIMENTAL_DISABLE_EXTERNAL_PACKAGE)
-          ? PackageLookupValue.NO_BUILD_FILE_VALUE
-          : computeWorkspacePackageLookupValue(env);
+      return PackageLookupValue.NO_BUILD_FILE_VALUE;
     }
 
     // Check .bazelignore file under main repository.
-    IgnoredPackagePrefixesValue ignoredPatternsValue =
-        (IgnoredPackagePrefixesValue) env.getValue(IgnoredPackagePrefixesValue.key());
+    IgnoredSubdirectoriesValue ignoredPatternsValue =
+        (IgnoredSubdirectoriesValue) env.getValue(IgnoredSubdirectoriesValue.key());
     if (ignoredPatternsValue == null) {
       return null;
     }
 
-    if (isPackageIgnored(packageKey, ignoredPatternsValue)) {
-      return PackageLookupValue.DELETED_PACKAGE_VALUE;
+    PathFragment packageFragment = packageKey.getPackageFragment();
+    IgnoredReason reason =
+        ignoredPatternsValue.asIgnoredSubdirectories().matchingEntryReason(packageFragment);
+    if (reason != null) {
+      return reason == IgnoredReason.BAZELIGNORE
+          ? PackageLookupValue.DELETED_BY_BAZELIGNORE_VALUE
+          : PackageLookupValue.DELETED_BY_REPO_BAZEL_VALUE;
     }
 
     return findPackageByBuildFile(env, pkgLocator, packageKey);
@@ -139,7 +130,10 @@ public class PackageLookupFunction implements SkyFunction {
       for (Root root : pkgLocator.getPathEntries()) {
         message
             .append("\n - ")
-            .append(root.asPath().getRelative(packageKey.getPackageFragment()).getPathString());
+            .append(
+                pkgLocator.getPathEntries().size() == 1
+                    ? packageKey.getPackageFragment().getPathString()
+                    : root.asPath().getRelative(packageKey.getPackageFragment()).getPathString());
       }
       return message.toString();
     } else {
@@ -201,15 +195,30 @@ public class PackageLookupFunction implements SkyFunction {
               packageIdentifier,
               message,
               DetailedExitCode.of(
-                  FailureDetails.FailureDetail.newBuilder()
+                  FailureDetail.newBuilder()
                       .setMessage(message)
                       .setPackageLoading(
-                          FailureDetails.PackageLoading.newBuilder()
-                              .setCode(
-                                  FailureDetails.PackageLoading.Code
-                                      .SYMLINK_CYCLE_OR_INFINITE_EXPANSION))
+                          PackageLoading.newBuilder()
+                              .setCode(Code.SYMLINK_CYCLE_OR_INFINITE_EXPANSION))
                       .build())),
           Transience.PERSISTENT);
+    } catch (DetailedIOException e) {
+      String message =
+          "IO errors while looking for "
+              + basename
+              + " file reading "
+              + fileRootedPath.asPath()
+              + ": "
+              + e.getMessage();
+      throw new PackageLookupFunctionException(
+          new BuildFileNotFoundException(
+              packageIdentifier,
+              message,
+              DetailedExitCode.of(
+                  e.getDetailedExitCode().getFailureDetail().toBuilder()
+                      .setMessage(message)
+                      .build())),
+          e.getTransience());
     } catch (IOException e) {
       String message =
           "IO errors while looking for "
@@ -223,17 +232,17 @@ public class PackageLookupFunction implements SkyFunction {
               packageIdentifier,
               message,
               DetailedExitCode.of(
-                  FailureDetails.FailureDetail.newBuilder()
+                  FailureDetail.newBuilder()
                       .setMessage(message)
                       .setPackageLoading(
-                          FailureDetails.PackageLoading.newBuilder()
-                              .setCode(FailureDetails.PackageLoading.Code.OTHER_IO_EXCEPTION))
+                          PackageLoading.newBuilder().setCode(Code.OTHER_IO_EXCEPTION))
                       .build())),
           Transience.PERSISTENT);
     }
     return fileValue;
   }
 
+  @Nullable
   private PackageLookupValue getPackageLookupValue(
       Environment env,
       Root packagePathEntry,
@@ -241,106 +250,22 @@ public class PackageLookupFunction implements SkyFunction {
       BuildFileName buildFileName)
       throws InterruptedException, PackageLookupFunctionException {
     PathFragment buildFileFragment = buildFileName.getBuildFileFragment(packageIdentifier);
-    RootedPath buildFileRootedPath = RootedPath.toRootedPath(packagePathEntry, buildFileFragment);
-
-    if (crossRepositoryLabelViolationStrategy == CrossRepositoryLabelViolationStrategy.ERROR) {
-      // Is this path part of a local repository?
-      RootedPath currentPath =
-          RootedPath.toRootedPath(packagePathEntry, buildFileFragment.getParentDirectory());
-      SkyKey repositoryLookupKey = LocalRepositoryLookupValue.key(currentPath);
-
-      // TODO(jcater): Consider parallelizing these lookups.
-      LocalRepositoryLookupValue localRepository;
-      try {
-        localRepository =
-            (LocalRepositoryLookupValue)
-                env.getValueOrThrow(repositoryLookupKey, ErrorDeterminingRepositoryException.class);
-        if (localRepository == null) {
-          return null;
-        }
-      } catch (ErrorDeterminingRepositoryException e) {
-        // If the directory selected isn't part of a repository, that's an error.
-        // TODO(katre): Improve the error message given here.
-        throw new PackageLookupFunctionException(
-            new BuildFileNotFoundException(
-                packageIdentifier,
-                "Unable to determine the local repository for directory "
-                    + currentPath.asPath().getPathString()),
-            Transience.PERSISTENT);
-      }
-
-      if (localRepository.exists()
-          && !localRepository.getRepository().equals(packageIdentifier.getRepository())) {
-        // There is a repository mismatch, this is an error.
-        // The correct package path is the one originally given, minus the part that is the local
-        // repository.
-        PathFragment pathToRequestedPackage = packageIdentifier.getSourceRoot();
-        PathFragment localRepositoryPath = localRepository.getPath();
-        if (localRepositoryPath.isAbsolute()) {
-          // We need the package path to also be absolute.
-          pathToRequestedPackage =
-              packagePathEntry.getRelative(pathToRequestedPackage).asFragment();
-        }
-        PathFragment remainingPath = pathToRequestedPackage.relativeTo(localRepositoryPath);
-        PackageIdentifier correctPackage =
-            PackageIdentifier.create(localRepository.getRepository(), remainingPath);
-        return PackageLookupValue.incorrectRepositoryReference(packageIdentifier, correctPackage);
-      }
-
-      // There's no local repository, keep going.
-    } else {
-      // Future-proof against adding future values to CrossRepositoryLabelViolationStrategy.
-      Preconditions.checkState(
-          crossRepositoryLabelViolationStrategy == CrossRepositoryLabelViolationStrategy.IGNORE,
-          crossRepositoryLabelViolationStrategy);
-    }
+    RootedPath packageDirectory =
+        RootedPath.toRootedPath(packagePathEntry, buildFileFragment.getParentDirectory());
 
     // Check for the existence of the build file.
+    RootedPath buildFileRootedPath =
+        packageDirectory.getChild(buildFileName.getFilenameFragment().getPathString());
     FileValue fileValue = getFileValue(buildFileRootedPath, env, packageIdentifier);
     if (fileValue == null) {
       return null;
     }
+
     if (fileValue.isFile()) {
       return PackageLookupValue.success(buildFileRootedPath.getRoot(), buildFileName);
     }
 
     return PackageLookupValue.NO_BUILD_FILE_VALUE;
-  }
-
-  private static boolean isPackageIgnored(
-      PackageIdentifier id, IgnoredPackagePrefixesValue ignoredPatternsValue) {
-    PathFragment packageFragment = id.getPackageFragment();
-    for (PathFragment pattern : ignoredPatternsValue.getPatterns()) {
-      if (packageFragment.startsWith(pattern)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private PackageLookupValue computeWorkspacePackageLookupValue(Environment env)
-      throws InterruptedException {
-    RootedPath workspaceFile = externalPackageHelper.findWorkspaceFile(env);
-    if (env.valuesMissing()) {
-      return null;
-    }
-
-    if (workspaceFile == null) {
-      return PackageLookupValue.NO_BUILD_FILE_VALUE;
-    } else {
-      BuildFileName filename = null;
-      for (BuildFileName candidate : BuildFileName.values()) {
-        if (workspaceFile.getRootRelativePath().equals(candidate.getFilenameFragment())) {
-          filename = candidate;
-          break;
-        }
-      }
-
-      // Otherwise ExternalPackageUtil.findWorkspaceFile() returned something whose name is not in
-      // BuildFileName
-      Verify.verify(filename != null);
-      return PackageLookupValue.success(workspaceFile.getRoot(), filename);
-    }
   }
 
   /**
@@ -349,6 +274,7 @@ public class PackageLookupFunction implements SkyFunction {
    * <p>To do this, it looks up the "external" package and finds a path mapping for the repository
    * name.
    */
+  @Nullable
   private PackageLookupValue computeExternalPackageLookupValue(
       SkyKey skyKey, Environment env, PackageIdentifier packageIdentifier)
       throws PackageLookupFunctionException, InterruptedException {
@@ -374,37 +300,41 @@ public class PackageLookupFunction implements SkyFunction {
       throw new PackageLookupFunctionException(
           new RepositoryFetchException(id, e.getMessage()), Transience.PERSISTENT);
     }
-    if (!repositoryValue.repositoryExists()) {
-      return new PackageLookupValue.NoRepositoryPackageLookupValue(
-          id.getRepository().getName(), repositoryValue.getErrorMsg());
+    if (repositoryValue instanceof Failure(String errorMsg)) {
+      return new NoRepositoryPackageLookupValue(id.getRepository(), errorMsg);
     }
 
     // Check .bazelignore file after fetching the external repository.
-    IgnoredPackagePrefixesValue ignoredPatternsValue =
-        (IgnoredPackagePrefixesValue)
-            env.getValue(IgnoredPackagePrefixesValue.key(id.getRepository()));
+    IgnoredSubdirectoriesValue ignoredPatternsValue =
+        (IgnoredSubdirectoriesValue)
+            env.getValue(IgnoredSubdirectoriesValue.key(id.getRepository()));
     if (ignoredPatternsValue == null) {
       return null;
     }
 
-    if (isPackageIgnored(id, ignoredPatternsValue)) {
-      return PackageLookupValue.DELETED_PACKAGE_VALUE;
+    PathFragment packageFragment = id.getPackageFragment();
+    IgnoredReason reason =
+        ignoredPatternsValue.asIgnoredSubdirectories().matchingEntryReason(packageFragment);
+    if (reason != null) {
+      return reason == IgnoredReason.BAZELIGNORE
+          ? PackageLookupValue.DELETED_BY_BAZELIGNORE_VALUE
+          : PackageLookupValue.DELETED_BY_REPO_BAZEL_VALUE;
     }
 
+    Root root = ((Success) repositoryValue).root();
+
     // This checks for the build file names in the correct precedence order.
+    RootedPath packageDirectory = RootedPath.toRootedPath(root, id.getPackageFragment());
     for (BuildFileName buildFileName : buildFilesByPriority) {
-      PathFragment buildFileFragment =
-          id.getPackageFragment().getRelative(buildFileName.getFilenameFragment());
       RootedPath buildFileRootedPath =
-          RootedPath.toRootedPath(Root.fromPath(repositoryValue.getPath()), buildFileFragment);
+          packageDirectory.getChild(buildFileName.getFilenameFragment().getPathString());
       FileValue fileValue = getFileValue(buildFileRootedPath, env, packageIdentifier);
       if (fileValue == null) {
         return null;
       }
 
       if (fileValue.isFile()) {
-        return PackageLookupValue.success(
-            repositoryValue, Root.fromPath(repositoryValue.getPath()), buildFileName);
+        return PackageLookupValue.success(root, buildFileName);
       }
     }
 
@@ -415,23 +345,21 @@ public class PackageLookupFunction implements SkyFunction {
    * Used to declare all the exception types that can be wrapped in the exception thrown by {@link
    * PackageLookupFunction#compute}. Note that {@link InconsistentFilesystemException} can only be
    * thrown during target pattern parsing because of Bazel's end-to-end behavior: {@link
-   * com.google.devtools.build.lib.actions.FileStateValue} throws {@link
-   * InconsistentFilesystemException} only if a cached-on-this-evaluation directory listing said
-   * that an entry was a file but the stat had no result. However, the only time Bazel lists a
-   * directory without first accessing its BUILD/BUILD.bazel file is during evaluation of a
-   * recursive target pattern (like foo/...).
+   * FileStateValue} throws {@link InconsistentFilesystemException} only if a
+   * cached-on-this-evaluation directory listing said that an entry was a file but the stat had no
+   * result. However, the only time Bazel lists a directory without first accessing its
+   * BUILD/BUILD.bazel file is during evaluation of a recursive target pattern (like foo/...).
    */
   private static final class PackageLookupFunctionException extends SkyFunctionException {
-    public PackageLookupFunctionException(BuildFileNotFoundException e, Transience transience) {
+    PackageLookupFunctionException(BuildFileNotFoundException e, Transience transience) {
       super(e, transience);
     }
 
-    public PackageLookupFunctionException(RepositoryFetchException e, Transience transience) {
+    PackageLookupFunctionException(RepositoryFetchException e, Transience transience) {
       super(e, transience);
     }
 
-    public PackageLookupFunctionException(
-        InconsistentFilesystemException e, Transience transience) {
+    PackageLookupFunctionException(InconsistentFilesystemException e, Transience transience) {
       super(e, transience);
     }
   }

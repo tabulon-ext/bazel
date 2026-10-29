@@ -17,15 +17,16 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
-import com.google.devtools.build.lib.collect.nestedset.NestedSetStore.FingerprintComputationResult;
 import com.google.devtools.build.lib.skyframe.serialization.DeserializationContext;
 import com.google.devtools.build.lib.skyframe.serialization.ObjectCodec;
+import com.google.devtools.build.lib.skyframe.serialization.PackedFingerprint;
+import com.google.devtools.build.lib.skyframe.serialization.PutOperation;
 import com.google.devtools.build.lib.skyframe.serialization.SerializationContext;
 import com.google.devtools.build.lib.skyframe.serialization.SerializationException;
-import com.google.protobuf.ByteString;
 import com.google.protobuf.CodedInputStream;
 import com.google.protobuf.CodedOutputStream;
 import java.io.IOException;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 
 /** Codec for {@link NestedSet} that uses the {@link NestedSetStore}. */
@@ -83,10 +84,10 @@ public class NestedSetCodecWithStore implements ObjectCodec<NestedSet<?>> {
     } else {
       codedOut.writeEnumNoTag(NestedSetSize.NONLEAF.ordinal());
       codedOut.writeInt32NoTag(obj.getApproxDepth());
-      FingerprintComputationResult fingerprintComputationResult =
+      PutOperation fingerprintComputationResult =
           nestedSetStore.computeFingerprintAndStore((Object[]) obj.getChildren(), context);
       context.addFutureToBlockWritingOn(fingerprintComputationResult.writeStatus());
-      codedOut.writeByteArrayNoTag(fingerprintComputationResult.fingerprint().toByteArray());
+      fingerprintComputationResult.fingerprint().writeTo(codedOut);
     }
     interner.put(new EqualsWrapper(obj), obj);
   }
@@ -96,18 +97,18 @@ public class NestedSetCodecWithStore implements ObjectCodec<NestedSet<?>> {
       throws SerializationException, IOException {
     Order order = context.deserialize(codedIn);
     NestedSetSize nestedSetSize = NestedSetSize.values()[codedIn.readEnum()];
-    switch (nestedSetSize) {
-      case EMPTY:
-        return NestedSetBuilder.emptySet(order);
-      case LEAF:
+    return switch (nestedSetSize) {
+      case EMPTY -> NestedSetBuilder.emptySet(order);
+      case LEAF -> {
         Object contents = context.deserialize(codedIn);
-        return intern(order, /*depth=*/ 1, contents);
-      case NONLEAF:
+        yield intern(order, /* depth= */ 1, contents);
+      }
+      case NONLEAF -> {
         int depth = codedIn.readInt32();
-        ByteString fingerprint = ByteString.copyFrom(codedIn.readByteArray());
-        return intern(order, depth, nestedSetStore.getContentsAndDeserialize(fingerprint, context));
-    }
-    throw new IllegalStateException("NestedSet size " + nestedSetSize + " not known");
+        var fingerprint = PackedFingerprint.readFrom(codedIn);
+        yield intern(order, depth, nestedSetStore.getContentsAndDeserialize(fingerprint, context));
+      }
+    };
   }
 
   /**
@@ -155,10 +156,10 @@ public class NestedSetCodecWithStore implements ObjectCodec<NestedSet<?>> {
     @Override
     public int hashCode() {
       int childrenHashCode;
-      if (children instanceof ListenableFuture && ((ListenableFuture<?>) children).isDone()) {
+      if (children instanceof ListenableFuture<?> future && future.isDone()) {
         try {
-          childrenHashCode = Futures.getDone((ListenableFuture<?>) children).hashCode();
-        } catch (ExecutionException e) {
+          childrenHashCode = Futures.getDone(future).hashCode();
+        } catch (ExecutionException | CancellationException e) {
           // If the future failed, we can treat it as unequal to all non-future NestedSet instances
           // (using the hashCode of the Future object) and hide the exception until the NestedSet is
           // truly needed (i.e. unrolled). Note that NestedSetStore already attaches a listener to
@@ -180,7 +181,7 @@ public class NestedSetCodecWithStore implements ObjectCodec<NestedSet<?>> {
 
       try {
         return Futures.getDone(contentsFuture) == contents;
-      } catch (ExecutionException e) {
+      } catch (ExecutionException | CancellationException e) {
         return false; // Treat a failure to fetch as unequal to a non-future NestedSet.
       }
     }
@@ -191,12 +192,11 @@ public class NestedSetCodecWithStore implements ObjectCodec<NestedSet<?>> {
       if (this == obj) {
         return true;
       }
-      if (!(obj instanceof EqualsWrapper)) {
+      if (!(obj instanceof EqualsWrapper that)) {
         return false;
       }
 
       // Both sets contain Object[] or both sets contain ListenableFuture<Object[]>
-      EqualsWrapper that = (EqualsWrapper) obj;
       if (this.order.equals(that.order) && this.children.equals(that.children)) {
         return true;
       }

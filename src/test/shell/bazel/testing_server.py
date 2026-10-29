@@ -17,6 +17,9 @@
 # pylint: disable=g-import-not-at-top,g-importing-member
 import argparse
 import base64
+import errno
+import json
+
 try:
   from http.server import BaseHTTPRequestHandler
 except ImportError:
@@ -26,11 +29,15 @@ import os
 import os.path
 try:
   from socketserver import TCPServer
+  from socketserver import ThreadingMixIn
+
   if os.name != 'nt':
     from socketserver import UnixStreamServer
 except ImportError:
   # Python 2.x compatibility hack.
   from SocketServer import TCPServer
+  from SocketServer import ThreadingMixIn
+
   if os.name != 'nt':
     from SocketServer import UnixStreamServer
 import random
@@ -39,16 +46,31 @@ import sys
 import time
 
 
+class TCPServerV6(TCPServer):
+  address_family = socket.AF_INET6
+
+
+class TCPServerDualStack(TCPServer):
+  address_family = socket.AF_INET6
+
+  def server_bind(self):
+    # Disable IPV6_V6ONLY to allow IPv4 connections
+    self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    super().server_bind()
+
+
 class Handler(BaseHTTPRequestHandler):
   """Handlers for testing HTTP server."""
   auth = False
   not_found = False
   simulate_timeout = False
+  dump_headers = None
   filename = None
   redirect = None
   valid_headers = [
       b'Basic ' + base64.b64encode('foo:bar'.encode('ascii')), b'Bearer TOKEN'
   ]
+  unstable_headers = ['Host', 'User-Agent']
 
   def do_HEAD(self):  # pylint: disable=invalid-name
     self.send_response(200)
@@ -66,6 +88,13 @@ class Handler(BaseHTTPRequestHandler):
       # Needed for Unix domain connections as the response functions
       # fail without this being set.
       self.client_address = 'localhost'
+
+    if self.dump_headers:
+      headers = filter(
+          lambda hv: hv[0] not in self.unstable_headers, self.headers.items()
+      )
+      with open(self.dump_headers, 'w') as f:
+        f.write(json.dumps(dict(headers)))
 
     if self.simulate_timeout:
       while True:
@@ -94,7 +123,9 @@ class Handler(BaseHTTPRequestHandler):
       self.serve_file()
     else:
       self.do_AUTHHEAD()
-      self.wfile.write(b'Login required.' + str(auth_header))
+      self.wfile.write(
+          'Bad authorization header: {}'.format(auth_header).encode('ascii')
+      )
 
   def serve_file(self):
     path_to_serve = self.path[1:]
@@ -105,9 +136,25 @@ class Handler(BaseHTTPRequestHandler):
       self.wfile.write(file_to_serve.read())
 
 
+def make_server(server_class, address):
+  if Handler.simulate_timeout:
+    # Requests never complete in this mode. Serve each one in its own thread so
+    # that clients time out reading the response instead of depending on what
+    # the kernel does with connections beyond the listen backlog, which macOS 27
+    # resets.
+    class ThreadingServer(ThreadingMixIn, server_class):
+      daemon_threads = True
+
+    server_class = ThreadingServer
+  return server_class(address, Handler)
+
+
 def main(argv):
   parser = argparse.ArgumentParser()
   parser.add_argument('--unix_socket', action='store')
+  parser.add_argument('--bind_address', action='store')
+  parser.add_argument('--dump_headers', action='store')
+
   parser.add_argument('mode', type=str, nargs='?')
   parser.add_argument('target', type=str, nargs='?')
   args = parser.parse_args(argv)
@@ -126,17 +173,35 @@ def main(argv):
       if args.target:
         Handler.filename = args.target
 
+  Handler.dump_headers = args.dump_headers
+
   httpd = None
   if args.unix_socket:
-    httpd = UnixStreamServer(args.unix_socket, Handler)
+    httpd = make_server(UnixStreamServer, args.unix_socket)
     sys.stderr.write('Serving forever on %s.\n' % args.unix_socket)
   else:
     port = None
     while port is None:
       try:
         port = random.randrange(32760, 59760)
-        httpd = TCPServer(('', port), Handler)
-      except socket.error:
+        if args.bind_address:
+          if ':' in args.bind_address:
+            httpd = make_server(TCPServerV6, (args.bind_address, port))
+          else:
+            httpd = make_server(TCPServer, (args.bind_address, port))
+        elif socket.has_dualstack_ipv6():
+          httpd = make_server(TCPServerDualStack, ('::', port))
+        elif socket.has_ipv6:
+          httpd = make_server(TCPServerV6, ('::', port))
+        else:
+          httpd = make_server(TCPServer, ('', port))
+      except socket.error as e:
+        # A port collision is the only bind failure worth retrying with a
+        # different port. Retrying a permanent failure - e.g. the requested
+        # address not existing in this network namespace - would loop forever
+        # and hang the caller waiting for the 'started' line below.
+        if e.errno != errno.EADDRINUSE:
+          raise
         port = None
     sys.stdout.write('%d\nstarted\n' % (port,))
     sys.stdout.flush()

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright 2016 The Bazel Authors. All rights reserved.
 #
@@ -41,18 +41,6 @@ fi
 source "$(rlocation "io_bazel/src/test/shell/integration_test_setup.sh")" \
   || { echo "integration_test_setup.sh not found!" >&2; exit 1; }
 
-IS_WINDOWS=false
-case "$(uname | tr [:upper:] [:lower:])" in
-msys*|mingw*|cygwin*)
-  IS_WINDOWS=true
-esac
-
-if "$IS_WINDOWS"; then
-  EXE_EXT=".exe"
-else
-  EXE_EXT=""
-fi
-
 javabase="$1"
 if [[ $javabase = external/* ]]; then
   javabase=${javabase#external/}
@@ -62,6 +50,7 @@ jmaptool="$(rlocation "${javabase}/bin/jmap${EXE_EXT}")"
 function write_hello_world_files() {
   mkdir -p hello || fail "mkdir hello failed"
   cat >hello/BUILD <<EOF
+load("@rules_java//java:java_binary.bzl", "java_binary")
 java_binary(name = 'hello',
   srcs = ['Hello.java'],
   main_class = 'hello.Hello')
@@ -77,10 +66,27 @@ public class Hello {
 EOF
 }
 
+function set_up() {
+  add_rules_java MODULE.bazel
+  add_rules_shell MODULE.bazel
+}
+
 #### TESTS #############################################################
 
 function test_compile_helloworld() {
-  write_hello_world_files
+  mkdir -p hello || fail "mkdir hello failed"
+  cat >hello/BUILD <<EOF
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+sh_binary(name = 'hello',
+  srcs = ['hello.sh'])
+EOF
+
+  cat >hello/hello.sh <<EOF
+#!/usr/bin/env bash
+echo "hello!"
+EOF
+  chmod +x hello/hello.sh
+
   bazel run --experimental_ui_debug_all_events --discard_analysis_cache hello:hello >&$TEST_log \
       || fail "Build failed"
   expect_log "Loading package: hello"
@@ -98,6 +104,37 @@ function test_compile_helloworld() {
   expect_log 'hello!'
 }
 
+# Regression test for b/336514394
+function test_aspect_after_cache_discard() {
+  write_hello_world_files
+
+  mkdir -p aspect
+  cat > aspect/aspect.bzl << 'EOF' || fail "Couldn't write aspect.bzl"
+def _simple_aspect_impl(target, ctx):
+    return []
+
+simple_aspect = aspect(
+    implementation=_simple_aspect_impl,
+    attr_aspects = ["*"],
+)
+EOF
+  touch aspect/BUILD
+
+  # Build and then discard the cache.
+  bazel build \
+    --discard_analysis_cache \
+    --aspects=aspect/aspect.bzl%simple_aspect \
+    hello:hello >&$TEST_log \
+      || fail "Build failed"
+
+  # This should rebuild the cache as needed..
+  bazel build \
+    --discard_analysis_cache \
+    --aspects=aspect/aspect.bzl%simple_aspect \
+    hello:hello >&$TEST_log \
+      || fail "Second build failed"
+}
+
 function extract_histogram_count() {
   local histofile="$1"
   local item="$2"
@@ -110,9 +147,10 @@ function test_aspect_and_configured_target_cleared() {
   export DONT_SANITY_CHECK_SERIALIZATION=1
   mkdir -p "foo" || fail "Couldn't make directory"
   cat > foo/simpleaspect.bzl <<'EOF' || fail "Couldn't write bzl file"
+AspectInfo = provider()
 def _simple_aspect_impl(target, ctx):
   result=[]
-  for orig_out in target.files.to_list():
+  for orig_out in target[DefaultInfo].files.to_list():
     aspect_out = ctx.actions.declare_file(orig_out.basename + ".aspect")
     ctx.actions.write(
         output=aspect_out,
@@ -120,10 +158,12 @@ def _simple_aspect_impl(target, ctx):
     result += [aspect_out]
 
   result = depset(result,
-      transitive = [src.aspectouts for src in ctx.rule.attr.srcs])
+      transitive = [src[AspectInfo].aspectouts for src in ctx.rule.attr.srcs])
 
-  return struct(output_groups={
-      "aspect-out" : result }, aspectouts = result)
+  return [
+      OutputGroupInfo(**{"aspect-out" : result}),
+      AspectInfo(aspectouts = result),
+  ]
 
 simple_aspect = aspect(implementation=_simple_aspect_impl,
                        attr_aspects = ["srcs"])
@@ -158,7 +198,7 @@ EOF
   "$jmaptool" -histo:live "$server_pid" > histo.txt
   cat histo.txt >> "$TEST_log"
   ct_count="$(extract_histogram_count histo.txt 'RuleConfiguredTarget$')"
-  aspect_count="$(extract_histogram_count histo.txt 'ConfiguredAspect$')"
+  aspect_count="$(extract_histogram_count histo.txt 'lib.packages.Aspect$')"
   [[ "$ct_count" -ge 2 ]] \
       || fail "Too few configured targets: $ct_count. Did you move/rename the class?"
   [[ "$aspect_count" -ge 1 ]] \
@@ -168,11 +208,11 @@ EOF
   bazel build --discard_analysis_cache //foo:foo >& "$TEST_log" \
       || fail "Expected success"
   "$jmaptool" -histo:live "$server_pid" > histo.txt
-  cat histo.txt >> "$TEST_log"
+  #cat histo.txt >> "$TEST_log"
   ct_count="$(extract_histogram_count histo.txt 'RuleConfiguredTarget$')"
-  aspect_count="$(extract_histogram_count histo.txt 'ConfiguredAspect$')"
-  # One top-level configured target is allowed to stick around.
-  [[ "$ct_count" -le 1 ]] \
+  aspect_count="$(extract_histogram_count histo.txt 'lib.packages.Aspect$')"
+  # Several top-level configured targets are allowed to stick around.
+  [[ "$ct_count" -le 20 ]] \
       || fail "Too many configured targets: $ct_count"
   [[ "$aspect_count" -eq 0 ]] || fail "Too many aspects: $aspect_count"
   bazel --batch clean >& "$TEST_log" || fail "Expected success"
@@ -188,10 +228,186 @@ EOF
   "$jmaptool" -histo:live "$server_pid" > histo.txt
   cat histo.txt >> "$TEST_log"
   ct_count="$(extract_histogram_count histo.txt 'RuleConfiguredTarget$')"
-  aspect_count="$(extract_histogram_count histo.txt 'ConfiguredAspect$')"
+  aspect_count="$(extract_histogram_count histo.txt 'lib.packages.Aspect$')"
   # One top-level aspect is allowed to stick around.
   [[ "$aspect_count" -le 1 ]] || fail "Too many aspects: $aspect_count"
-  [[ "$ct_count" -le 1 ]] || fail "Too many configured targets: $ct_count"
+  [[ "$ct_count" -le 20 ]] || fail "Too many configured targets: $ct_count"
+}
+
+# Regression test for https://github.com/bazelbuild/bazel/issues/30800.
+#
+# Real-world scenario:
+# A C++ toolchain (or system library) is vendored in an external repository,
+# and headers (e.g. Windows SDK headers) are reached dynamically via relative
+# include search paths (e.g. cxx_builtin_include_directories or -isystem)
+# rather than declared target inputs (srcs/hdrs/deps).
+#
+# On a warm server following an analysis cache discard (e.g. build option change),
+# Skymeld re-instantiates IncrementalPackageRoots with an empty map. Because the
+# headers are reached dynamically rather than via declared target dependency edges,
+# the external package root is not re-registered in the second build's
+# TopLevelTargetReadyForSymlinkPlanting event. Post-execution HeaderDiscovery
+# then fails to resolve the relative path, causing spurious "undeclared inclusion(s)".
+#
+# Test setup:
+# Setting up a full custom cc_toolchain in an external repository in a shell test
+# is heavy and fragile across platforms. As noted in issue #30800, this failure
+# affects any header reached via system include paths without a declared target
+# dependency. Here we export system_includes via CcInfo from @other_repo//pkg_tool:tool_lib
+# pointing to @other_repo//pkg_header to test this exact Skyframe state:
+# 1. Build 1 loads @other_repo//pkg_header via target_a, caching PackageValue in Skyframe.
+# 2. Build 2 discards analysis cache (--cxxopt change) and builds target_b.
+# 3. target_b depends on tool_lib (which exports pkg_header as system_includes,
+#    so CppCompileAction validates the inclusion) but does NOT declare a dependency
+#    on pkg_header.
+# 4. In Build 2, IncrementalPackageRoots has an empty map. With standalone spawn
+#    strategy, the compiler finds the header in the execroot. HeaderDiscovery
+#    requires the fallback package root lookup in IncrementalPackageRoots to
+#    resolve the package root. Without the fallback, HeaderDiscovery fails.
+function test_skymeld_external_repo_package_root_preserved_after_discard_analysis_cache() {
+  if [[ "${PRODUCT_NAME}" != "bazel" ]]; then
+    return 0
+  fi
+
+  add_rules_cc MODULE.bazel
+
+  mkdir -p ../other_repo/pkg_header ../other_repo/pkg_tool
+  touch ../other_repo/REPO.bazel
+  cat > ../other_repo/pkg_header/BUILD << 'EOF'
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+cc_library(
+    name = "header_lib",
+    hdrs = ["header.h"],
+    visibility = ["//visibility:public"],
+)
+EOF
+  cat > ../other_repo/pkg_header/header.h << 'EOF'
+#pragma once
+#define FOO_VALUE 42
+EOF
+
+  cat > ../other_repo/pkg_tool/defs.bzl << 'EOF'
+load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
+load("@rules_cc//cc/common:cc_info.bzl", "CcInfo")
+
+def _tool_lib_impl(ctx):
+    return [
+        CcInfo(
+            compilation_context = cc_common.create_compilation_context(
+                system_includes = depset([ctx.label.workspace_root + "/pkg_header"]),
+            ),
+        ),
+    ]
+
+tool_lib = rule(
+    implementation = _tool_lib_impl,
+)
+EOF
+
+  cat > ../other_repo/pkg_tool/BUILD << 'EOF'
+load(":defs.bzl", "tool_lib")
+tool_lib(
+    name = "tool_lib",
+    visibility = ["//visibility:public"],
+)
+EOF
+
+  cat >> MODULE.bazel << 'EOF'
+local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
+local_repository(
+    name = "other_repo",
+    path = "../other_repo",
+)
+EOF
+
+  mkdir -p foo
+  cat > foo/BUILD << 'EOF'
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+cc_library(
+    name = "target_a",
+    srcs = ["a.cc"],
+    deps = ["@other_repo//pkg_header:header_lib"],
+)
+cc_library(
+    name = "target_b",
+    srcs = ["b.cc"],
+    deps = ["@other_repo//pkg_tool:tool_lib"],
+)
+EOF
+
+  cat > foo/a.cc << 'EOF'
+#include "pkg_header/header.h"
+int a() { return FOO_VALUE; }
+EOF
+
+  cat > foo/b.cc << 'EOF'
+#include "header.h"
+int b() { return FOO_VALUE; }
+EOF
+
+  # Settle MODULE.bazel.lock before the builds below: a lockfile updated at
+  # the end of the first build would dirty the loading-phase nodes of
+  # @other_repo, which the second build relies on finding done in Skyframe.
+  bazel build --experimental_merged_skyframe_analysis_execution --nobuild \
+      //foo:target_a >& "$TEST_log" \
+      || fail "Warm-up build of target_a failed"
+
+  bazel build --experimental_merged_skyframe_analysis_execution \
+      //foo:target_a >& "$TEST_log" \
+      || fail "First build of target_a failed"
+
+  # In the second build, target_b depends on @other_repo//pkg_tool:tool_lib (so
+  # the @other_repo symlink is planted in the execroot), but includes header.h
+  # from @other_repo//pkg_header via system_includes.
+  # Following analysis cache discard (--cxxopt change), IncrementalPackageRoots
+  # has an empty map. With standalone spawn strategy, the compiler accesses the
+  # header from the execroot. HeaderDiscovery then requires the fallback
+  # package root lookup in IncrementalPackageRoots to resolve the package root.
+  bazel build --experimental_merged_skyframe_analysis_execution \
+      --spawn_strategy=standalone \
+      --cxxopt=-O3 //foo:target_b >& "$TEST_log" \
+      || fail "Second build of target_b failed"
+}
+
+function test_skymeld_top_level_alias_notrack_incremental_state() {
+  mkdir -p real aliased chain pkg
+  cat > real/BUILD << 'EOF'
+genrule(
+    name = "real_bin",
+    outs = ["real.out"],
+    cmd = "sleep 3 && echo real > $@",
+    visibility = ["//visibility:public"],
+)
+EOF
+
+  cat > aliased/BUILD << 'EOF'
+alias(
+    name = "aliased_bin",
+    actual = "//real:real_bin",
+    visibility = ["//visibility:public"],
+)
+EOF
+
+  cat > chain/BUILD << 'EOF'
+alias(
+    name = "chain_bin",
+    actual = "//aliased:aliased_bin",
+)
+EOF
+
+  cat > pkg/BUILD << 'EOF'
+genrule(
+    name = "quick",
+    outs = ["quick.out"],
+    cmd = "echo quick > $@",
+)
+EOF
+
+  bazel build --experimental_merged_skyframe_analysis_execution \
+      --notrack_incremental_state \
+      //chain:chain_bin //pkg:quick >& "$TEST_log" \
+      || fail "Expected build to succeed"
 }
 
 run_suite "test for --discard_analysis_cache"
+

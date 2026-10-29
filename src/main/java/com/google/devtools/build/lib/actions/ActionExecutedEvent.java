@@ -14,11 +14,11 @@
 
 package com.google.devtools.build.lib.actions;
 
+
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.flogger.GoogleLogger;
-import com.google.devtools.build.lib.actions.SpawnResult.MetadataLog;
 import com.google.devtools.build.lib.buildeventstream.BuildEvent;
 import com.google.devtools.build.lib.buildeventstream.BuildEvent.LocalFile.LocalFileType;
 import com.google.devtools.build.lib.buildeventstream.BuildEventContext;
@@ -29,51 +29,74 @@ import com.google.devtools.build.lib.buildeventstream.BuildEventWithConfiguratio
 import com.google.devtools.build.lib.buildeventstream.GenericBuildEvent;
 import com.google.devtools.build.lib.buildeventstream.NullConfiguration;
 import com.google.devtools.build.lib.buildeventstream.PathConverter;
-import com.google.devtools.build.lib.events.ExtendedEventHandler.ProgressLike;
+import com.google.devtools.build.lib.exec.Protos.SpawnExec;
 import com.google.devtools.build.lib.server.FailureDetails;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
+import com.google.protobuf.Any;
+import com.google.protobuf.Timestamp;
+import java.time.Instant;
 import java.util.Collection;
+import javax.annotation.Nullable;
 
 /**
  * This event is fired during the build, when an action is executed. It contains information about
  * the action: the Action itself, and the output file names its stdout and stderr are recorded in.
  */
-public class ActionExecutedEvent implements BuildEventWithConfiguration, ProgressLike {
+public final class ActionExecutedEvent implements BuildEventWithConfiguration {
   private static final GoogleLogger logger = GoogleLogger.forEnclosingClass();
 
   private final PathFragment actionId;
   private final Action action;
-  private final ActionExecutionException exception;
+  @Nullable private final ActionExecutionException exception;
   private final Path primaryOutput;
+  private final Artifact outputArtifact;
+  @Nullable private final FileArtifactValue primaryOutputMetadata;
   private final Path stdout;
   private final Path stderr;
-  private final ImmutableList<MetadataLog> actionMetadataLogs;
-  private final boolean isInMemoryFs;
   private final ErrorTiming timing;
+
+  /** Timestamp of the action starting; if no timestamp is available will be {@code null}. */
+  @Nullable private final Instant startTime;
+
+  /** Timestamp of the action finishing; if no timestamp is available will be {@code null}. */
+  @Nullable private final Instant endTime;
+
+  /**
+   * One entry per spawn, populating only {@code runner} and {@code cache_hit}: a full {@link
+   * SpawnExec} would make the BEP too large and duplicate the execution log.
+   */
+  private final ImmutableList<SpawnExec> strategyDetails;
 
   public ActionExecutedEvent(
       PathFragment actionId,
       Action action,
-      ActionExecutionException exception,
+      @Nullable ActionExecutionException exception,
       Path primaryOutput,
+      Artifact outputArtifact,
+      @Nullable FileArtifactValue primaryOutputMetadata,
       Path stdout,
       Path stderr,
-      ImmutableList<MetadataLog> actionMetadataLogs,
       ErrorTiming timing,
-      boolean isInMemoryFs) {
+      @Nullable Instant startTime,
+      @Nullable Instant endTime,
+      ImmutableList<SpawnExec> strategyDetails) {
     this.actionId = actionId;
     this.action = action;
     this.exception = exception;
     this.primaryOutput = primaryOutput;
+    this.outputArtifact = outputArtifact;
+    this.primaryOutputMetadata = primaryOutputMetadata;
     this.stdout = stdout;
     this.stderr = stderr;
     this.timing = timing;
-    this.actionMetadataLogs = actionMetadataLogs;
-    this.isInMemoryFs = isInMemoryFs;
-    Preconditions.checkNotNull(this.actionMetadataLogs, this);
+    this.startTime = startTime;
+    this.endTime = endTime;
+    this.strategyDetails = strategyDetails;
     Preconditions.checkState(
         (this.exception == null) == (this.timing == ErrorTiming.NO_ERROR), this);
+    Preconditions.checkState(
+        (this.exception == null) != (this.primaryOutputMetadata == null), this);
   }
 
   public Action getAction() {
@@ -89,10 +112,7 @@ public class ActionExecutedEvent implements BuildEventWithConfiguration, Progres
     return timing;
   }
 
-  public boolean hasInMemoryFs() {
-    return isInMemoryFs;
-  }
-
+  @Nullable
   public String getStdout() {
     if (stdout == null) {
       return null;
@@ -100,6 +120,7 @@ public class ActionExecutedEvent implements BuildEventWithConfiguration, Progres
     return stdout.toString();
   }
 
+  @Nullable
   public String getStderr() {
     if (stderr == null) {
       return null;
@@ -107,8 +128,9 @@ public class ActionExecutedEvent implements BuildEventWithConfiguration, Progres
     return stderr.toString();
   }
 
-  public ImmutableList<MetadataLog> getActionMetadataLogs() {
-    return actionMetadataLogs;
+  @Nullable
+  public FileArtifactValue getPrimaryOutputMetadata() {
+    return primaryOutputMetadata;
   }
 
   @Override
@@ -123,36 +145,38 @@ public class ActionExecutedEvent implements BuildEventWithConfiguration, Progres
 
   @Override
   public Collection<BuildEventId> getChildrenEvents() {
-    return ImmutableList.<BuildEventId>of();
+    return ImmutableList.of();
   }
 
   @Override
   public Collection<BuildEvent> getConfigurations() {
     if (action.getOwner() != null) {
-      BuildEvent configuration = action.getOwner().getConfiguration();
+      BuildEvent configuration = action.getOwner().getBuildConfigurationEvent();
       if (configuration == null) {
-        configuration = new NullConfiguration();
+        configuration = NullConfiguration.INSTANCE;
       }
       return ImmutableList.of(configuration);
     } else {
-      return ImmutableList.<BuildEvent>of();
+      return ImmutableList.of();
     }
   }
 
   @Override
   public Collection<LocalFile> referencedLocalFiles() {
     ImmutableList.Builder<LocalFile> localFiles = ImmutableList.builder();
+    // TODO(b/199940216): thread file metadata through here when possible.
     if (stdout != null) {
-      localFiles.add(new LocalFile(stdout, LocalFileType.STDOUT));
+      localFiles.add(new LocalFile(stdout, LocalFileType.STDOUT, /* artifactMetadata= */ null));
     }
     if (stderr != null) {
-      localFiles.add(new LocalFile(stderr, LocalFileType.STDERR));
-    }
-    for (MetadataLog actionMetadataLog : actionMetadataLogs) {
-      localFiles.add(new LocalFile(actionMetadataLog.getFilePath(), LocalFileType.LOG));
+      localFiles.add(new LocalFile(stderr, LocalFileType.STDERR, /* artifactMetadata= */ null));
     }
     if (exception == null) {
-      localFiles.add(new LocalFile(primaryOutput, LocalFileType.OUTPUT));
+      localFiles.add(
+          new LocalFile(
+              primaryOutput,
+              LocalFileType.forArtifact(outputArtifact, primaryOutputMetadata),
+              primaryOutputMetadata));
     }
     return localFiles.build();
   }
@@ -165,6 +189,15 @@ public class ActionExecutedEvent implements BuildEventWithConfiguration, Progres
         BuildEventStreamProtos.ActionExecuted.newBuilder()
             .setSuccess(getException() == null)
             .setType(action.getMnemonic());
+    if (startTime != null) {
+      actionBuilder.setStartTime(timestampProto(startTime));
+      if (endTime != null) {
+        actionBuilder.setEndTime(timestampProto(endTime));
+      }
+    }
+    for (SpawnExec details : strategyDetails) {
+      actionBuilder.addStrategyDetails(Any.pack(details));
+    }
 
     if (exception != null) {
       // TODO(b/150405553): This statement seems to be confused. The exit_code field of
@@ -196,21 +229,11 @@ public class ActionExecutedEvent implements BuildEventWithConfiguration, Progres
       actionBuilder.setLabel(action.getOwner().getLabel().toString());
     }
     if (action.getOwner() != null) {
-      BuildEvent configuration = action.getOwner().getConfiguration();
+      BuildEvent configuration = action.getOwner().getBuildConfigurationEvent();
       if (configuration == null) {
-        configuration = new NullConfiguration();
+        configuration = NullConfiguration.INSTANCE;
       }
       actionBuilder.setConfiguration(configuration.getEventId().getConfiguration());
-    }
-    for (MetadataLog actionMetadataLog : actionMetadataLogs) {
-      String uri = pathConverter.apply(actionMetadataLog.getFilePath());
-      if (uri != null) {
-        actionBuilder.addActionMetadataLogs(
-            BuildEventStreamProtos.File.newBuilder()
-                .setName(actionMetadataLog.getName())
-                .setUri(uri)
-                .build());
-      }
     }
     if (exception == null) {
       String uri = pathConverter.apply(primaryOutput);
@@ -220,8 +243,8 @@ public class ActionExecutedEvent implements BuildEventWithConfiguration, Progres
       }
     }
     try {
-      if (action instanceof CommandAction) {
-        actionBuilder.addAllCommandLine(((CommandAction) action).getArguments());
+      if (action instanceof CommandAction commandAction) {
+        actionBuilder.addAllCommandLine(commandAction.getArguments());
       }
     } catch (CommandLineExpansionException e) {
       // Command-line not available, so just not report it
@@ -238,6 +261,12 @@ public class ActionExecutedEvent implements BuildEventWithConfiguration, Progres
         .add("stdout", stdout)
         .add("stderr", stderr)
         .add("action", action)
+        .add("primaryOutput", primaryOutput)
+        .add("outputArtifact", outputArtifact)
+        .add("primaryOutputMetadata", primaryOutputMetadata)
+        .add("startTime", startTime)
+        .add("endTime", endTime)
+        .add("strategyDetails", strategyDetails)
         .toString();
   }
 
@@ -246,5 +275,12 @@ public class ActionExecutedEvent implements BuildEventWithConfiguration, Progres
     NO_ERROR,
     BEFORE_EXECUTION,
     AFTER_EXECUTION
+  }
+
+  private static Timestamp timestampProto(Instant time) {
+    return Timestamp.newBuilder()
+        .setSeconds(time.getEpochSecond())
+        .setNanos(time.getNano())
+        .build();
   }
 }

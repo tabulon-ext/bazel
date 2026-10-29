@@ -21,13 +21,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <libgen.h>
-#include <math.h>
 #include <mntent.h>
 #include <net/if.h>
 #include <pwd.h>
 #include <signal.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,7 +40,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <ctime>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 
 #ifndef MS_REC
 // Some systems do not define MS_REC in sys/mount.h. We might be able to grab it
@@ -67,31 +70,42 @@
 #include "src/main/tools/logging.h"
 #include "src/main/tools/process-tools.h"
 
-static void WriteFile(const std::string &filename, const char *fmt, ...) {
-  FILE *stream = fopen(filename.c_str(), "w");
-  if (stream == nullptr) {
-    DIE("fopen(%s)", filename.c_str());
-  }
-
-  va_list ap;
-  va_start(ap, fmt);
-  int r = vfprintf(stream, fmt, ap);
-  va_end(ap);
-
-  if (r < 0) {
-    DIE("vfprintf");
-  }
-
-  if (fclose(stream) != 0) {
-    DIE("fclose(%s)", filename.c_str());
-  }
-}
-
 static int global_child_pid;
 
 // Helper methods
-static void CreateFile(const char *path) {
-  int handle = open(path, O_CREAT | O_WRONLY | O_EXCL, 0666);
+
+// Returns the interpreter specified in the file's shebang ('#!') line, if
+// present. Returns std::nullopt if the file does not start with '#!' or has no
+// non-empty interpreter.
+static std::optional<std::string> GetInterpreter(const std::string& path) {
+  int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return std::nullopt;
+  }
+  char buf[1024];
+  ssize_t n = read(fd, buf, sizeof(buf));
+  close(fd);
+
+  if (n <= 2 || buf[0] != '#' || buf[1] != '!') {
+    return std::nullopt;
+  }
+
+  std::string header(buf + 2, n - 2);
+  size_t start = header.find_first_not_of(" \t");
+  if (start == std::string::npos) {
+    return std::nullopt;
+  }
+  size_t end = header.find_first_of(" \t\r\n", start);
+  std::string interpreter = header.substr(
+      start, end == std::string::npos ? std::string::npos : end - start);
+  if (interpreter.empty()) {
+    return std::nullopt;
+  }
+  return interpreter;
+}
+
+static void CreateFile(const char* path) {
+  int handle = open(path, O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW, 0666);
   if (handle < 0) {
     DIE("open");
   }
@@ -103,9 +117,35 @@ static void CreateFile(const char *path) {
 // Creates an empty file at 'path' by hard linking it from a known empty file.
 // This is over two times faster than creating empty files via open() on
 // certain filesystems (e.g. XFS).
-static void LinkFile(const char *path) {
+static void LinkFile(const char* path) {
   if (link("tmp/empty_file", path) < 0) {
+    if (errno == EEXIST) {
+      // Try to remove the existing file first.
+      if (unlink(path) < 0) {
+        DIE("unlink %s", path);
+      }
+      if (link("tmp/empty_file", path) == 0) {
+        return;
+      }
+    }
     DIE("link %s", path);
+  }
+}
+
+// Creates a symlink from 'target' -> 'path'. If 'path' already existed then
+// unlink and try again.
+static void SymlinkFile(const char* target, const char* path) {
+  if (symlink(target, path) < 0) {
+    if (errno == EEXIST) {
+      // Try to remove the existing file first.
+      if (unlink(path) < 0) {
+        DIE("unlink %s", path);
+      }
+      if (symlink(target, path) == 0) {
+        return;
+      }
+    }
+    DIE("symlink %s", path);
   }
 }
 
@@ -116,7 +156,7 @@ static void LinkFile(const char *path) {
 //    ENOTDIR  path exists and is not a directory
 //    EEXIST   path exists and is a directory
 //    ENOENT   stat call with the path failed
-static int CreateTarget(const char *path, bool is_directory) {
+static int CreateTarget(const char* path, bool is_directory) {
   if (path == NULL) {
     errno = EINVAL;
     return -1;
@@ -146,13 +186,22 @@ static int CreateTarget(const char *path, bool is_directory) {
   }
 
   // Create the parent directory.
-  if (CreateTarget(dirname(strdupa(path)), true) < 0) {
-    DIE("CreateTarget %s", dirname(strdupa(path)));
+  {
+    char *buf, *dir;
+
+    if (!(buf = strdup(path))) DIE("strdup");
+
+    dir = dirname(buf);
+    if (CreateTarget(dir, true) < 0) {
+      DIE("CreateTarget %s", dir);
+    }
+
+    free(buf);
   }
 
   if (is_directory) {
     if (mkdir(path, 0755) < 0) {
-      DIE("mkdir");
+      DIE("mkdir(%s)", path);
     }
   } else {
     LinkFile(path);
@@ -161,7 +210,7 @@ static int CreateTarget(const char *path, bool is_directory) {
   return 0;
 }
 
-static void SetupSelfDestruction(int *sync_pipe) {
+static void SetupSelfDestruction(int* pipe_to_parent) {
   // We could also poll() on the pipe fd to find out when the parent goes away,
   // and rely on SIGCHLD interrupting that otherwise. That might require us to
   // install some trivial handler for SIGCHLD. Using O_ASYNC to turn the pipe
@@ -179,16 +228,7 @@ static void SetupSelfDestruction(int *sync_pipe) {
   }
 
   // Verify that the parent still lives.
-  char buf = 0;
-  if (close(sync_pipe[0]) < 0) {
-    DIE("close");
-  }
-  if (write(sync_pipe[1], &buf, 1) < 0) {
-    DIE("write");
-  }
-  if (close(sync_pipe[1]) < 0) {
-    DIE("close");
-  }
+  SignalPipe(pipe_to_parent);
 }
 
 static void SetupMountNamespace() {
@@ -212,27 +252,45 @@ static void SetupUserNamespace() {
     }
   }
 
-  int inner_uid, inner_gid;
+  uid_t inner_uid;
+  gid_t inner_gid;
   if (opt.fake_root) {
     // Change our username to 'root'.
     inner_uid = 0;
     inner_gid = 0;
   } else if (opt.fake_username) {
     // Change our username to 'nobody'.
-    struct passwd *pwd = getpwnam("nobody");
-    if (pwd == nullptr) {
-      DIE("unable to find passwd entry for user nobody")
+    struct passwd pwd;
+    char buf[1024];
+    size_t buflen = sizeof(buf);
+    struct passwd* result;
+    if (getpwnam_r("nobody", &pwd, buf, buflen, &result) != 0 ||
+        result == nullptr) {
+      DIE("getpwnam_r for nobody failed");
     }
 
-    inner_uid = pwd->pw_uid;
-    inner_gid = pwd->pw_gid;
+    inner_uid = pwd.pw_uid;
+    inner_gid = pwd.pw_gid;
   } else {
     // Do not change the username inside the sandbox.
     inner_uid = global_outer_uid;
     inner_gid = global_outer_gid;
   }
-  WriteFile("/proc/self/uid_map", "%d %d 1\n", inner_uid, global_outer_uid);
-  WriteFile("/proc/self/gid_map", "%d %d 1\n", inner_gid, global_outer_gid);
+  if (opt.enable_pty) {
+    // Change the group to "tty" regardless of what was previously set
+    struct group grp;
+    char buf[256];
+    size_t buflen = sizeof(buf);
+    struct group* result;
+    getgrnam_r("tty", &grp, buf, buflen, &result);
+    if (result == nullptr) {
+      DIE("getgrnam_r");
+    }
+    inner_gid = grp.gr_gid;
+  }
+
+  WriteFile("/proc/self/uid_map", "%u %u 1\n", inner_uid, global_outer_uid);
+  WriteFile("/proc/self/gid_map", "%u %u 1\n", inner_gid, global_outer_gid);
 }
 
 static void SetupUtsNamespace() {
@@ -246,24 +304,11 @@ static void SetupUtsNamespace() {
 }
 
 static void MountFilesystems() {
-  for (const std::string &tmpfs_dir : opt.tmpfs_dirs) {
-    PRINT_DEBUG("tmpfs: %s", tmpfs_dir.c_str());
-    if (mount("tmpfs", tmpfs_dir.c_str(), "tmpfs",
-              MS_NOSUID | MS_NODEV | MS_NOATIME, nullptr) < 0) {
-      DIE("mount(tmpfs, %s, tmpfs, MS_NOSUID | MS_NODEV | MS_NOATIME, nullptr)",
-          tmpfs_dir.c_str());
-    }
-  }
-
-  // Make sure that our working directory is a mount point. The easiest way to
-  // do this is by bind-mounting it upon itself.
-  PRINT_DEBUG("working dir: %s", opt.working_dir.c_str());
-
   // An attempt to mount the sandbox in tmpfs will always fail, so this block is
   // slightly redundant with the next mount() check, but dumping the mount()
   // syscall is incredibly cryptic, so we explicitly check against and warn
   // about attempts to use tmpfs.
-  for (const std::string &tmpfs_dir : opt.tmpfs_dirs) {
+  for (const std::string& tmpfs_dir : opt.tmpfs_dirs) {
     if (opt.working_dir.find(tmpfs_dir) == 0) {
       DIE("The sandbox working directory cannot be below a path where we mount "
           "tmpfs (you requested mounting %s in %s). Is your --output_base= "
@@ -272,47 +317,93 @@ static void MountFilesystems() {
     }
   }
 
-  if (mount(opt.working_dir.c_str(), opt.working_dir.c_str(), nullptr, MS_BIND,
-            nullptr) < 0) {
-    DIE("mount(%s, %s, nullptr, MS_BIND, nullptr)", opt.working_dir.c_str(),
-        opt.working_dir.c_str());
-  }
+  std::unordered_set<std::string> bind_mount_sources;
 
   for (size_t i = 0; i < opt.bind_mount_sources.size(); i++) {
-    const std::string &source = opt.bind_mount_sources.at(i);
-    const std::string &target = opt.bind_mount_targets.at(i);
+    const std::string& source = opt.bind_mount_sources.at(i);
+    bind_mount_sources.insert(source);
+    const std::string& target = opt.bind_mount_targets.at(i);
     PRINT_DEBUG("bind mount: %s -> %s", source.c_str(), target.c_str());
-    if (mount(source.c_str(), target.c_str(), nullptr, MS_BIND, nullptr) < 0) {
-      DIE("mount(%s, %s, nullptr, MS_BIND, nullptr)", source.c_str(),
+    if (mount(source.c_str(), target.c_str(), nullptr, MS_BIND | MS_REC,
+              nullptr) < 0) {
+      DIE("mount(%s, %s, nullptr, MS_BIND | MS_REC, nullptr)", source.c_str(),
           target.c_str());
     }
   }
 
-  for (const std::string &writable_file : opt.writable_files) {
+  for (const std::string& tmpfs_dir : opt.tmpfs_dirs) {
+    PRINT_DEBUG("tmpfs: %s", tmpfs_dir.c_str());
+    if (mount("tmpfs", tmpfs_dir.c_str(), "tmpfs",
+              MS_NOSUID | MS_NODEV | MS_NOATIME, nullptr) < 0) {
+      DIE("mount(tmpfs, %s, tmpfs, MS_NOSUID | MS_NODEV | MS_NOATIME, nullptr)",
+          tmpfs_dir.c_str());
+    }
+  }
+
+  for (const std::string& writable_file : opt.writable_files) {
     PRINT_DEBUG("writable: %s", writable_file.c_str());
+    if (bind_mount_sources.find(writable_file) != bind_mount_sources.end()) {
+      // Bind mount sources contained in writable_files will be kept writable in
+      // MakeFileSystemMostlyReadOnly, but have already been mounted at this
+      // point.
+      continue;
+    }
     if (mount(writable_file.c_str(), writable_file.c_str(), nullptr,
               MS_BIND | MS_REC, nullptr) < 0) {
       DIE("mount(%s, %s, nullptr, MS_BIND | MS_REC, nullptr)",
           writable_file.c_str(), writable_file.c_str());
     }
   }
+
+  // Make sure that the working directory is writable (unlike most of the rest
+  // of the file system, which is read-only by default). The easiest way to do
+  // this is by bind-mounting it upon itself.
+  PRINT_DEBUG("working dir: %s", opt.working_dir.c_str());
+
+  if (mount(opt.working_dir.c_str(), opt.working_dir.c_str(), nullptr, MS_BIND,
+            nullptr) < 0) {
+    DIE("mount(%s, %s, nullptr, MS_BIND, nullptr)", opt.working_dir.c_str(),
+        opt.working_dir.c_str());
+  }
+}
+
+static std::string_view GetRelativePath(std::string_view path) {
+  if (opt.hermetic) {
+    if (path == opt.sandbox_root) {
+      return "/";
+    }
+    std::string_view root = opt.sandbox_root;
+    if (path.length() > root.length() && path[root.length()] == '/' &&
+        path.substr(0, root.length()) == root) {
+      return path.substr(root.length());
+    }
+  }
+  return path;
 }
 
 // We later remount everything read-only, except the paths for which this method
 // returns true.
-static bool ShouldBeWritable(const std::string &mnt_dir) {
-  if (mnt_dir == opt.working_dir) {
+static bool ShouldBeWritable(std::string_view mnt_dir) {
+  if (opt.hermetic && mnt_dir == "/proc") {
     return true;
   }
 
-  for (const std::string &writable_file : opt.writable_files) {
-    if (mnt_dir == writable_file) {
+  if (mnt_dir == GetRelativePath(opt.working_dir)) {
+    return true;
+  }
+
+  if (opt.enable_pty && mnt_dir == "/dev/pts") {
+    return true;
+  }
+
+  for (const std::string& writable_file : opt.writable_files) {
+    if (mnt_dir == GetRelativePath(writable_file)) {
       return true;
     }
   }
 
-  for (const std::string &tmpfs_dir : opt.tmpfs_dirs) {
-    if (mnt_dir == tmpfs_dir) {
+  for (const std::string& tmpfs_dir : opt.tmpfs_dirs) {
+    if (mnt_dir == GetRelativePath(tmpfs_dir)) {
       return true;
     }
   }
@@ -320,16 +411,89 @@ static bool ShouldBeWritable(const std::string &mnt_dir) {
   return false;
 }
 
-// Makes the whole filesystem read-only, except for the paths for which
-// ShouldBeWritable returns true.
-static void MakeFilesystemMostlyReadOnly() {
-  FILE *mounts = setmntent("/proc/self/mounts", "r");
+static int RemountWithBusyRetry(const std::string& target, int mount_flags) {
+  for (int i = 0; i < 5; ++i) {
+    if (mount(nullptr, target.c_str(), nullptr, mount_flags, nullptr) == 0) {
+      return 0;
+    }
+    if (errno != EBUSY) {
+      break;
+    }
+    struct timespec delay = {0, 100 * 1000 * 1000};  // 100 milliseconds
+    nanosleep(&delay, nullptr);
+  }
+  return -1;
+}
+
+static void RemountReadonly(const std::string& target) {
+  FILE* mounts = setmntent("/proc/self/mounts", "r");
   if (mounts == nullptr) {
     DIE("setmntent");
   }
 
-  struct mntent *ent;
+  struct mntent* ent;
+  bool found = false;
+  int mount_flags = MS_BIND | MS_REMOUNT | MS_RDONLY;
+
   while ((ent = getmntent(mounts)) != nullptr) {
+    if (strcmp(ent->mnt_dir, target.c_str()) == 0) {
+      found = true;
+      if (hasmntopt(ent, "ro") != nullptr) {
+        // Target mount is already read-only.
+        endmntent(mounts);
+        return;
+      }
+      if (hasmntopt(ent, "nodev") != nullptr) {
+        mount_flags |= MS_NODEV;
+      }
+      if (hasmntopt(ent, "noexec") != nullptr) {
+        mount_flags |= MS_NOEXEC;
+      }
+      if (hasmntopt(ent, "nosuid") != nullptr) {
+        mount_flags |= MS_NOSUID;
+      }
+      if (hasmntopt(ent, "noatime") != nullptr) {
+        mount_flags |= MS_NOATIME;
+      }
+      if (hasmntopt(ent, "nodiratime") != nullptr) {
+        mount_flags |= MS_NODIRATIME;
+      }
+      if (hasmntopt(ent, "relatime") != nullptr) {
+        mount_flags |= MS_RELATIME;
+      }
+      break;
+    }
+  }
+  endmntent(mounts);
+
+  if (!found) {
+    DIE("Could not find mount entry for %s", target.c_str());
+  }
+
+  if (RemountWithBusyRetry(target, mount_flags) < 0) {
+    DIE("remount sandbox_root read-only failed");
+  }
+}
+
+// Makes the whole filesystem read-only, except for the paths for which
+// ShouldBeWritable returns true.
+static void MakeFilesystemMostlyReadOnly() {
+  FILE* mounts = setmntent("/proc/self/mounts", "r");
+  if (mounts == nullptr) {
+    DIE("setmntent");
+  }
+
+  struct mntent* ent;
+  while ((ent = getmntent(mounts)) != nullptr) {
+    bool should_be_writable = ShouldBeWritable(ent->mnt_dir);
+    bool is_already_ro = (hasmntopt(ent, "ro") != nullptr);
+
+    // If the mount is already in the desired state, skip redundant remount
+    // syscall.
+    if (should_be_writable != is_already_ro) {
+      continue;
+    }
+
     int mountFlags = MS_BIND | MS_REMOUNT;
 
     // MS_REMOUNT does not allow us to change certain flags. This means, we have
@@ -355,13 +519,22 @@ static void MakeFilesystemMostlyReadOnly() {
       mountFlags |= MS_RELATIME;
     }
 
-    if (!ShouldBeWritable(ent->mnt_dir)) {
+    if (!should_be_writable) {
       mountFlags |= MS_RDONLY;
     }
 
     PRINT_DEBUG("remount %s: %s", (mountFlags & MS_RDONLY) ? "ro" : "rw",
                 ent->mnt_dir);
-    if (mount(nullptr, ent->mnt_dir, nullptr, mountFlags, nullptr) < 0) {
+    // The remount races with concurrent path lookups elsewhere on the host:
+    // walking through a symlink calls touch_atime(), which briefly bumps the
+    // per-mount writer counter (mnt_get_write_access -> mnt_inc_writers).
+    // MS_BIND|MS_REMOUNT|MS_RDONLY goes through mnt_hold_writers() which
+    // returns -EBUSY if that counter is non-zero. The window is tiny but on
+    // active mounts (especially "/") it can sometimes hit. Retry on EBUSY.
+    // This behavior mimics runc's handling of EBUSY during readonly remounts:
+    // https://github.com/opencontainers/runc/blob/eb7eaf19b6eec5d1143b257057899e4a7b738c81/libcontainer/rootfs_linux.go#L1305-L1309
+    int rc = RemountWithBusyRetry(ent->mnt_dir, mountFlags);
+    if (rc < 0) {
       // If we get EACCES or EPERM, this might be a mount-point for which we
       // don't have read access. Not much we can do about this, but it also
       // won't do any harm, so let's go on. The same goes for EINVAL or ENOENT,
@@ -372,13 +545,15 @@ static void MakeFilesystemMostlyReadOnly() {
       // /proc/sys/fs/binfmt_misc, because it is hidden. If we get ESTALE, the
       // mount is a broken NFS mount. In the ideal case, the user would either
       // fix or remove that mount, but in cases where that's not possible, we
-      // should just ignore it.
+      // should just ignore it. Similarly, one can get ENODEV in case of
+      // autofs/automount failure.
       switch (errno) {
         case EACCES:
         case EPERM:
         case EINVAL:
         case ENOENT:
         case ESTALE:
+        case ENODEV:
           PRINT_DEBUG(
               "remount(nullptr, %s, nullptr, %d, nullptr) failure (%m) ignored",
               ent->mnt_dir, mountFlags);
@@ -393,19 +568,53 @@ static void MakeFilesystemMostlyReadOnly() {
   endmntent(mounts);
 }
 
-static void MountProc() {
-  // Mount a new proc on top of the old one, because the old one still refers to
-  // our parent PID namespace.
-  if (mount("/proc", "/proc", "proc", MS_NODEV | MS_NOEXEC | MS_NOSUID,
-            nullptr) < 0) {
-    DIE("mount");
+static void MountProcAndSys() {
+  if (opt.hermetic) {
+    if (CreateTarget("proc", true) < 0) {
+      DIE("CreateTarget proc");
+    }
+    if (mount("proc", "proc", "proc", MS_NODEV | MS_NOEXEC | MS_NOSUID,
+              nullptr) < 0) {
+      DIE("mount proc");
+    }
+
+    if (CreateTarget("sys", true) < 0) {
+      DIE("CreateTarget sys");
+    }
+
+    if (opt.create_netns != NO_NETNS) {
+      if (mount("none", "sys", "sysfs",
+                MS_NOEXEC | MS_NOSUID | MS_NODEV | MS_RDONLY, nullptr) < 0) {
+        DIE("mount sys");
+      }
+    } else {
+      // In hermetic mode without a new network namespace, we cannot mount a
+      // fresh sysfs because we share the network namespace with the host (this
+      // fails with EPERM in a user namespace). Bind-mount the host /sys
+      // instead.
+      if (mount("/sys", "sys", nullptr, MS_BIND | MS_REC, nullptr) < 0) {
+        DIE("bind mount /sys to sys");
+      }
+    }
+  } else {
+    if (mount("proc", "/proc", "proc", MS_NODEV | MS_NOEXEC | MS_NOSUID,
+              nullptr) < 0) {
+      DIE("mount /proc");
+    }
+
+    if (opt.create_netns != NO_NETNS) {
+      if (mount("none", "/sys", "sysfs",
+                MS_NOEXEC | MS_NOSUID | MS_NODEV | MS_RDONLY, nullptr) < 0) {
+        DIE("mount /sys");
+      }
+    }
   }
 }
 
 static void SetupNetworking() {
   // When running in a separate network namespace, enable the loopback interface
   // because some application may want to use it.
-  if (opt.create_netns) {
+  if (opt.create_netns == NETNS_WITH_LOOPBACK) {
     int fd;
     fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
@@ -430,6 +639,14 @@ static void SetupNetworking() {
       DIE("close");
     }
   }
+
+  if (opt.create_netns != NO_NETNS && opt.fake_root) {
+    // Allow IPPROTO_ICMP sockets when already allowed outside of the namespace.
+    // In a namespace, /proc/sys/net/ipv4/ping_group_range is reset to the
+    // default of 1 0, which does not match any groups. However, it can only be
+    // overridden when the namespace has a fake root. This may be a kernel bug.
+    WriteFile("/proc/sys/net/ipv4/ping_group_range", "0 0");
+  }
 }
 
 static void EnterWorkingDirectory() {
@@ -443,9 +660,7 @@ static void EnterWorkingDirectory() {
   }
 }
 
-static void ForwardSignal(int signum) {
-  kill(-global_child_pid, signum);
-}
+static void ForwardSignal(int signum) { kill(-global_child_pid, signum); }
 
 static void SpawnChild() {
   PRINT_DEBUG("calling fork...");
@@ -467,6 +682,13 @@ static void SpawnChild() {
     // Unblock all signals, restore default handlers.
     ClearSignalMask();
 
+    // Close the file PRINT_DEBUG writes to.
+    // Must happen late enough so we don't lose any debugging output.
+    if (global_debug) {
+      fclose(global_debug);
+      global_debug = nullptr;
+    }
+
     // Force umask to include read and execute for everyone, to make output
     // permissions predictable.
     umask(022);
@@ -475,6 +697,41 @@ static void SpawnChild() {
     opt.args.push_back(nullptr);
 
     if (execvp(opt.args[0], opt.args.data()) < 0) {
+      const int orig_errno = errno;
+      // If opt.args[0] does not contain a '/', execvp searches PATH. Calling
+      // stat/access on opt.args[0] in that case would incorrectly check the
+      // current working directory rather than the PATH entries.
+      if ((orig_errno == ENOENT || orig_errno == ENOTDIR) &&
+          strchr(opt.args[0], '/') != nullptr) {
+        struct stat st;
+        // Only inspect regular files to avoid blocking on FIFOs or reading
+        // directories.
+        if (stat(opt.args[0], &st) == 0 && S_ISREG(st.st_mode)) {
+          std::optional<std::string> interpreter = GetInterpreter(opt.args[0]);
+          if (interpreter.has_value()) {
+            // If the interpreter exists on disk, its dynamic loader or
+            // library is missing.
+            if (!interpreter->empty() && (*interpreter)[0] == '/' &&
+                access(interpreter->c_str(), F_OK) == 0) {
+              errno = orig_errno;
+              DIE("execvp(%s, %p): file exists and interpreter '%s' exists, "
+                  "but its loader or dependencies do not exist in sandbox",
+                  opt.args[0], opt.args.data(), interpreter->c_str());
+            }
+            errno = orig_errno;
+            DIE("execvp(%s, %p): file exists, but interpreter '%s' does not "
+                "exist in sandbox",
+                opt.args[0], opt.args.data(), interpreter->c_str());
+          }
+          // The file is either a dynamic ELF binary or a script with an empty
+          // shebang.
+          errno = orig_errno;
+          DIE("execvp(%s, %p): file exists, but its loader or interpreter does "
+              "not exist in sandbox",
+              opt.args[0], opt.args.data());
+        }
+      }
+      errno = orig_errno;
       DIE("execvp(%s, %p)", opt.args[0], opt.args.data());
     }
   } else {
@@ -538,23 +795,35 @@ static void CreateEmptyFile() {
 
 static void MountDev() {
   if (CreateTarget("dev", true) < 0) {
-    DIE("CreateTarget /dev");
+    DIE("CreateTarget dev");
   }
-  const char *devs[] = {"/dev/null", "/dev/random", "/dev/urandom", "/dev/zero",
-                        NULL};
+
+  const char* devs[] = {"/dev/null", "/dev/random", "/dev/urandom",
+                        "/dev/zero", "/dev/full",   NULL};
   for (int i = 0; devs[i] != NULL; i++) {
     LinkFile(devs[i] + 1);
+    PRINT_DEBUG("bind mount: %s -> dev/%s", devs[i], devs[i] + 5);
     if (mount(devs[i], devs[i] + 1, NULL, MS_BIND, NULL) < 0) {
-      DIE("mount");
+      DIE("mount %s", devs[i]);
     }
   }
-  if (symlink("/proc/self/fd", "dev/fd") < 0) {
-    DIE("symlink");
+
+  if (CreateTarget("dev/shm", true) == 0) {
+    PRINT_DEBUG("mounting tmpfs on dev/shm");
+    if (mount("tmpfs", "dev/shm", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777") <
+        0) {
+      DIE("mount dev/shm");
+    }
   }
+
+  SymlinkFile("/proc/self/fd", "dev/fd");
+  SymlinkFile("/proc/self/fd/0", "dev/stdin");
+  SymlinkFile("/proc/self/fd/1", "dev/stdout");
+  SymlinkFile("/proc/self/fd/2", "dev/stderr");
 }
 
 static void MountAllMounts() {
-  for (const std::string &tmpfs_dir : opt.tmpfs_dirs) {
+  for (const std::string& tmpfs_dir : opt.tmpfs_dirs) {
     PRINT_DEBUG("tmpfs: %s", tmpfs_dir.c_str());
     if (mount("tmpfs", tmpfs_dir.c_str(), "tmpfs",
               MS_NOSUID | MS_NODEV | MS_NOATIME, nullptr) < 0) {
@@ -563,15 +832,16 @@ static void MountAllMounts() {
     }
   }
 
-  // Make sure that our working directory is a mount point. The easiest way to
-  // do this is by bind-mounting it upon itself.
-  if (mount(opt.working_dir.c_str(), opt.working_dir.c_str(), nullptr, MS_BIND,
-            nullptr) < 0) {
-    DIE("mount(%s, %s, nullptr, MS_BIND, nullptr)", opt.working_dir.c_str(),
-        opt.working_dir.c_str());
+  if (!opt.hermetic) {
+    if (mount(opt.working_dir.c_str(), opt.working_dir.c_str(), nullptr,
+              MS_BIND, nullptr) < 0) {
+      DIE("mount(%s, %s, nullptr, MS_BIND, nullptr)", opt.working_dir.c_str(),
+          opt.working_dir.c_str());
+    }
   }
+
   for (int i = 0; i < (signed)opt.bind_mount_sources.size(); i++) {
-    if (opt.debug) {
+    if (global_debug) {
       if (strcmp(opt.bind_mount_sources[i].c_str(),
                  opt.bind_mount_targets[i].c_str()) == 0) {
         // The file is mounted to the same path inside the sandbox, as outside
@@ -605,7 +875,7 @@ static void MountAllMounts() {
       DIE("mount");
     }
   }
-  for (const std::string &writable_file : opt.writable_files) {
+  for (const std::string& writable_file : opt.writable_files) {
     PRINT_DEBUG("writable: %s", writable_file.c_str());
     if (mount(writable_file.c_str(), writable_file.c_str(), nullptr,
               MS_BIND | MS_REC, nullptr) < 0) {
@@ -637,17 +907,23 @@ static void ChangeRoot() {
   }
 }
 
-int Pid1Main(void *sync_pipe_param) {
+int Pid1Main(void* args) {
   PRINT_DEBUG("Pid1Main started");
+
+  Pid1Args pid1Args = *(static_cast<Pid1Args*>(args));
 
   if (getpid() != 1) {
     DIE("Using PID namespaces, but we are not PID 1");
   }
 
+  // Before pid1 spawns a child pid2, we want to wait for the parent process to
+  // move pid1 to the cgroup so that pid2 will be created in the same cgroup.
+  WaitPipe(pid1Args.pipe_from_parent);
+
   // Start with default signal handlers and an empty signal mask.
   ClearSignalMask();
 
-  SetupSelfDestruction(reinterpret_cast<int *>(sync_pipe_param));
+  SetupSelfDestruction(pid1Args.pipe_to_parent);
 
   // Sandbox ourselves.
   SetupMountNamespace();
@@ -660,13 +936,15 @@ int Pid1Main(void *sync_pipe_param) {
     MountSandboxAndGoThere();
     CreateEmptyFile();
     MountDev();
-    MountProc();
+    MountProcAndSys();
     MountAllMounts();
     ChangeRoot();
+    MakeFilesystemMostlyReadOnly();
+    RemountReadonly("/");
   } else {
     MountFilesystems();
     MakeFilesystemMostlyReadOnly();
-    MountProc();
+    MountProcAndSys();
   }
   SetupNetworking();
   EnterWorkingDirectory();

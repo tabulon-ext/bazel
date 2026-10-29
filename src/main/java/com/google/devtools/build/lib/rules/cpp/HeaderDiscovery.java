@@ -14,23 +14,31 @@
 
 package com.google.devtools.build.lib.rules.cpp;
 
+import static com.google.devtools.build.lib.analysis.constraints.ConstraintConstants.getOsFromConstraintsOrHost;
+
+import com.google.common.collect.Collections2;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterables;
 import com.google.devtools.build.lib.actions.Action;
 import com.google.devtools.build.lib.actions.ActionExecutionException;
 import com.google.devtools.build.lib.actions.Artifact;
-import com.google.devtools.build.lib.actions.Artifact.SpecialArtifact;
+import com.google.devtools.build.lib.actions.Artifact.TreeArtifact;
 import com.google.devtools.build.lib.actions.ArtifactResolver;
-import com.google.devtools.build.lib.cmdline.LabelConstants;
+import com.google.devtools.build.lib.actions.PathMapper;
 import com.google.devtools.build.lib.cmdline.PackageIdentifier;
-import com.google.devtools.build.lib.cmdline.RepositoryName;
+import com.google.devtools.build.lib.collect.compacthashset.CompactHashSet;
 import com.google.devtools.build.lib.collect.nestedset.NestedSet;
 import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
+import com.google.devtools.build.lib.util.OS;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import javax.annotation.Nullable;
 
 /**
@@ -43,12 +51,6 @@ import javax.annotation.Nullable;
  * entire check is performed by hash lookups.
  */
 final class HeaderDiscovery {
-
-  /** Indicates if a compile should perform dotd pruning. */
-  public enum DotdPruningMode {
-    USE,
-    DO_NOT_USE
-  }
 
   private HeaderDiscovery() {}
 
@@ -71,10 +73,10 @@ final class HeaderDiscovery {
       NestedSet<Artifact> allowedDerivedInputs,
       Path execRoot,
       ArtifactResolver artifactResolver,
-      boolean siblingRepositoryLayout)
+      PathMapper pathMapper)
       throws ActionExecutionException {
     Map<PathFragment, Artifact> regularDerivedArtifacts = new HashMap<>();
-    Map<PathFragment, SpecialArtifact> treeArtifacts = new HashMap<>();
+    Map<PathFragment, TreeArtifact> treeArtifacts = new HashMap<>();
     for (Artifact a : allowedDerivedInputs.toList()) {
       if (a.isSourceArtifact()) {
         continue;
@@ -88,10 +90,12 @@ final class HeaderDiscovery {
       // an action cache hit in that case, since even if it previously depended on the artifact
       // whose path changed, that is not taken into account by the action cache, and it will get an
       // action cache hit using the remaining un-renamed artifact.
-      if (a.isTreeArtifact()) {
-        treeArtifacts.putIfAbsent(a.getExecPath(), (SpecialArtifact) a);
+      // TODO: Consider using a multimap here so that header resolution depends on _all_ identical
+      // files, not just a single representative.
+      if (a instanceof TreeArtifact treeArtifact) {
+        treeArtifacts.putIfAbsent(pathMapper.map(a.getExecPath()), treeArtifact);
       } else {
-        regularDerivedArtifacts.putIfAbsent(a.getExecPath(), a);
+        regularDerivedArtifacts.putIfAbsent(pathMapper.map(a.getExecPath()), a);
       }
     }
 
@@ -105,7 +109,7 @@ final class HeaderDiscovery {
         treeArtifacts,
         execRoot,
         artifactResolver,
-        siblingRepositoryLayout);
+        pathMapper);
   }
 
   private static NestedSet<Artifact> runDiscovery(
@@ -115,81 +119,149 @@ final class HeaderDiscovery {
       Collection<Path> dependencies,
       List<Path> permittedSystemIncludePrefixes,
       Map<PathFragment, Artifact> regularDerivedArtifacts,
-      Map<PathFragment, SpecialArtifact> treeArtifacts,
+      Map<PathFragment, TreeArtifact> treeArtifacts,
       Path execRoot,
       ArtifactResolver artifactResolver,
-      boolean siblingRepositoryLayout)
+      PathMapper pathMapper)
       throws ActionExecutionException {
     NestedSetBuilder<Artifact> inputs = NestedSetBuilder.stableOrder();
 
     // Check inclusions.
-    IncludeProblems problems = new IncludeProblems();
+    IncludeProblems absolutePathProblems = new IncludeProblems();
+    IncludeProblems unresolvablePathProblems = new IncludeProblems();
+    boolean possiblyCaseInsensitiveFileSystem =
+        getOsFromConstraintsOrHost(action.getExecutionPlatform()) == OS.WINDOWS;
+    CompactHashSet<Artifact> sourceArtifactInputs = null;
     for (Path execPath : dependencies) {
       PathFragment execPathFragment = execPath.asFragment();
       if (execPathFragment.isAbsolute()) {
-        // Absolute includes from system paths are ignored.
-        if (FileSystemUtils.startsWithAny(execPath, permittedSystemIncludePrefixes)) {
-          continue;
+        if (possiblyCaseInsensitiveFileSystem) {
+          // Absolute includes from system paths are ignored. With a case-insensitive file system,
+          // the paths as reported by the compiler may differ in casing from those listed by the
+          // toolchain.
+          if (FileSystemUtils.startsWithAnyIgnoringCase(execPath, permittedSystemIncludePrefixes)) {
+            continue;
+          }
+        } else {
+          if (FileSystemUtils.startsWithAny(execPath, permittedSystemIncludePrefixes)) {
+            continue;
+          }
         }
-        // Since gcc is given only relative paths on the command line, non-system include paths here
-        // should never be absolute. If they are, it's probably due to a non-hermetic #include, and
-        // we should stop the build with an error.
         if (execPath.startsWith(execRoot)) {
           execPathFragment = execPath.relativeTo(execRoot); // funky but tolerable path
-        } else if (siblingRepositoryLayout && execPath.startsWith(execRoot.getParentDirectory())) {
-          // for --experimental_sibling_repository_layout
-          execPathFragment =
-              LabelConstants.EXPERIMENTAL_EXTERNAL_PATH_PREFIX.getRelative(
-                  execPath.relativeTo(execRoot.getParentDirectory()));
         } else {
-          problems.add(execPathFragment.getPathString());
+          // Since gcc is given only relative paths on the command line, non-builtin include paths
+          // here should never be absolute. If they are, it's probably due to a non-hermetic
+          // #include,
+          // and we should stop the build with an error.
+          absolutePathProblems.add(execPathFragment.getPathString());
           continue;
         }
       }
-      Artifact artifact = regularDerivedArtifacts.get(execPathFragment);
-      if (artifact == null) {
-        RepositoryName repository =
-            PackageIdentifier.discoverFromExecPath(execPathFragment, false, siblingRepositoryLayout)
-                .getRepository();
-        artifact = artifactResolver.resolveSourceArtifact(execPathFragment, repository);
-      }
-      if (artifact != null) {
-        // We don't need to add the sourceFile itself as it is a mandatory input.
-        if (!artifact.equals(sourceFile)) {
-          inputs.add(artifact);
+      Collection<? extends Artifact> resolvedArtifacts = ImmutableList.of();
+      Artifact derivedArtifact = regularDerivedArtifacts.get(execPathFragment);
+      if (derivedArtifact == null) {
+        Optional<PackageIdentifier> pkgId =
+            PackageIdentifier.discoverFromExecPath(execPathFragment, /* forFiles= */ false);
+        if (pkgId.isPresent()) {
+          if (possiblyCaseInsensitiveFileSystem) {
+            resolvedArtifacts =
+                artifactResolver.resolveSourceArtifactsAsciiCaseInsensitively(
+                    execPathFragment, pkgId.get().getRepository());
+          } else {
+            var sourceArtifact =
+                artifactResolver.resolveSourceArtifact(
+                    execPathFragment, pkgId.get().getRepository());
+            if (sourceArtifact != null) {
+              resolvedArtifacts = ImmutableList.of(sourceArtifact);
+            }
+          }
         }
+      } else {
+        resolvedArtifacts = ImmutableList.of(derivedArtifact);
+      }
+      if (!resolvedArtifacts.isEmpty()) {
+        // We don't need to add the sourceFile itself as it is a mandatory input.
+        resolvedArtifacts = Collections2.filter(resolvedArtifacts, a -> !a.equals(sourceFile));
+        switch (resolvedArtifacts.size()) {
+          case 0 -> {}
+          case 1 -> inputs.add(Iterables.getOnlyElement(resolvedArtifacts));
+          default -> {
+            if (sourceArtifactInputs == null) {
+              sourceArtifactInputs = CompactHashSet.create();
+              for (Artifact input : action.getInputs().toList()) {
+                if (input.isSourceArtifact()) {
+                  sourceArtifactInputs.add(input);
+                }
+              }
+            }
+            if (Collections.disjoint(resolvedArtifacts, sourceArtifactInputs)) {
+              inputs.addAll(resolvedArtifacts);
+            } else {
+              for (Artifact resolvedArtifact : resolvedArtifacts) {
+                if (sourceArtifactInputs.contains(resolvedArtifact)) {
+                  inputs.add(resolvedArtifact);
+                }
+              }
+            }
+          }
+        }
+        continue;
+      } else if (execPathFragment.getFileExtension().equals("cppmap")) {
+        // Transitive cppmap files are added to the dotd files of compiles even
+        // though they are not required for compilation. Since they're not
+        // explicit inputs to the action this only happens when sandboxing is
+        // disabled.
         continue;
       }
 
-      SpecialArtifact treeArtifact = findOwningTreeArtifact(execPathFragment, treeArtifacts);
+      TreeArtifact treeArtifact =
+          findOwningTreeArtifact(execPathFragment, treeArtifacts, pathMapper);
       if (treeArtifact != null) {
         inputs.add(treeArtifact);
       } else {
         // Record a problem if we see files that we can't resolve, likely caused by undeclared
         // includes or illegal include constructs.
-        problems.add(execPathFragment.getPathString());
+        unresolvablePathProblems.add(execPathFragment.getPathString());
       }
     }
     if (shouldValidateInclusions) {
-      problems.assertProblemFree(action, sourceFile);
+      absolutePathProblems.assertProblemFree(
+          "absolute path inclusion(s) found in rule '"
+              + action.getOwner().getLabel()
+              + "':\n"
+              + "the source file '"
+              + sourceFile.prettyPrint()
+              + "' includes the following non-builtin files with absolute paths "
+              + "(if these are builtin files, make sure these paths are in your toolchain):",
+          action);
+      unresolvablePathProblems.assertProblemFree(
+          "undeclared inclusion(s) in rule '"
+              + action.getOwner().getLabel()
+              + "':\n"
+              + "this rule is missing dependency declarations for the following files "
+              + "included by '"
+              + sourceFile.prettyPrint()
+              + "':",
+          action);
     }
     return inputs.build();
   }
 
   @Nullable
-  private static SpecialArtifact findOwningTreeArtifact(
-      PathFragment execPath, Map<PathFragment, SpecialArtifact> treeArtifacts) {
+  private static TreeArtifact findOwningTreeArtifact(
+      PathFragment execPath, Map<PathFragment, TreeArtifact> treeArtifacts, PathMapper pathMapper) {
     // Check the map for the exec path's parent directory first. If the exec path matches a direct
     // child of a tree artifact (a common case), we can skip the full iteration below.
     PathFragment dir = execPath.getParentDirectory();
-    SpecialArtifact tree = treeArtifacts.get(dir);
+    TreeArtifact tree = treeArtifacts.get(dir);
     if (tree != null) {
       return tree;
     }
 
     // Search for any tree artifact that encloses the exec path.
     return treeArtifacts.values().stream()
-        .filter(a -> dir.startsWith(a.getExecPath()))
+        .filter(a -> dir.startsWith(pathMapper.map(a.getExecPath())))
         .findAny()
         .orElse(null);
   }

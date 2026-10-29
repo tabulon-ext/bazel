@@ -14,10 +14,11 @@
 
 package com.google.devtools.build.lib.rules.java;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
-import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.PathFragment;
+import javax.annotation.Nullable;
 
 /** Utility methods for use by Java-related parts of the build system. */
 public final class JavaUtil {
@@ -51,17 +52,11 @@ public final class JavaUtil {
    * arbitrary padding before the Java sourceroot.
    */
 
-  /**
-   * Given the filename of a Java source file, returns the name of the toplevel Java class defined
-   * within it.
-   */
-  public static String getJavaClassName(PathFragment path) {
-    return FileSystemUtils.removeExtension(path.getBaseName());
-  }
-
   /** Java source roots, used to relativize resource paths and infer main_class values. */
   public static final ImmutableSet<String> KNOWN_SOURCE_ROOTS =
       ImmutableSet.of("java", "javatests", "src", "testsrc");
+
+  private static final PathFragment THIRD_PARTY_JAVA = PathFragment.create("third_party/java");
 
   /**
    * Finds the index of the segment in a Java path fragment that precedes the source root. Starts
@@ -79,23 +74,37 @@ public final class JavaUtil {
     if (path.isAbsolute()) {
       throw new IllegalArgumentException("path must not be absolute: '" + path + "'");
     }
-    int rootIndex = Iterables.indexOf(path.segments(), KNOWN_SOURCE_ROOTS::contains);
+    if (path.startsWith(THIRD_PARTY_JAVA)) {
+      // For third_party/java, try skipping past the first two segments and looking for a nested
+      // source root, to relativize e.g. third_party/java/foo/java/resource into 'resource',
+      // not 'foo/java/resource'.
+      int nested = javaSegmentIndexImpl(path.subFragment(2));
+      if (nested >= 0) {
+        return nested + 2;
+      }
+    }
+    return javaSegmentIndexImpl(path);
+  }
+
+  private static int javaSegmentIndexImpl(PathFragment path) {
+    ImmutableList<String> segments = path.splitToListOfSegments();
+    int rootIndex = Iterables.indexOf(segments, KNOWN_SOURCE_ROOTS::contains);
     if (rootIndex == -1) {
       return -1;
     }
-    final boolean isSrc = "src".equals(path.getSegment(rootIndex));
+    boolean isSrc = segments.get(rootIndex).equals("src");
     int checkMavenIndex = isSrc ? rootIndex : -1;
     if (rootIndex == 0 || isSrc) {
       // Check for a nested root directory.
-      for (int i = rootIndex + 1, max = path.segmentCount() - 2; i <= max; i++) {
-        String segment = path.getSegment(i);
-        if ("src".equals(segment)
-            || (isSrc && ("javatests".equals(segment) || "java".equals(segment)))) {
-          String next = path.getSegment(i + 1);
-          if ("com".equals(next) || "org".equals(next) || "net".equals(next)) {
+      for (int i = rootIndex + 1, max = segments.size() - 2; i <= max; i++) {
+        String segment = segments.get(i);
+        if (segment.equals("src")
+            || (isSrc && (segment.equals("javatests") || segment.equals("java")))) {
+          String next = segments.get(i + 1);
+          if (next.equals("com") || next.equals("org") || next.equals("net")) {
             // Check for common first element of java package, to avoid false positives.
             rootIndex = i;
-          } else if ("src".equals(segment)) {
+          } else if (segment.equals("src")) {
             // Also accept maven style src/(main|test)/(java|resources).
             checkMavenIndex = i;
           }
@@ -104,41 +113,16 @@ public final class JavaUtil {
       }
     }
     // Check for (main|test)/(java|resources) after /src/.
-    if (checkMavenIndex >= 0 && checkMavenIndex + 2 < path.segmentCount()) {
-      String next = path.getSegment(checkMavenIndex + 1);
-      if ("main".equals(next) || "test".equals(next)) {
-        next = path.getSegment(checkMavenIndex + 2);
-        if ("java".equals(next) || "resources".equals(next)) {
+    if (checkMavenIndex >= 0 && checkMavenIndex + 2 < segments.size()) {
+      String next = segments.get(checkMavenIndex + 1);
+      if (next.equals("main") || next.equals("test")) {
+        next = segments.get(checkMavenIndex + 2);
+        if (next.equals("java") || next.equals("resources")) {
           rootIndex = checkMavenIndex + 2;
         }
       }
     }
     return rootIndex;
-  }
-
-  /** Given the PathFragment of a Java source file, returns the Java package to which it belongs. */
-  public static String getJavaPackageName(PathFragment path) {
-    int index = javaSegmentIndex(path) + 1;
-    path = path.subFragment(index, path.segmentCount() - 1);
-    return path.getPathString().replace('/', '.');
-  }
-
-  /**
-   * Given the PathFragment of a file without extension, returns the Java fully qualified class name
-   * based on the Java root relative path of the specified path or 'null' if no java root can be
-   * determined.
-   *
-   * <p>For example, "java/foo/bar/wiz" and "javatests/foo/bar/wiz" both result in "foo.bar.wiz".
-   *
-   * <p>TODO(bazel-team): (2011) We need to have a more robust way to determine the Java root of a
-   * relative path rather than simply trying to find the "java" or "javatests" or "src" directory.
-   */
-  public static String getJavaFullClassname(PathFragment path) {
-    PathFragment javaPath = getJavaPath(path);
-    if (javaPath != null) {
-      return javaPath.getPathString().replace('/', '.');
-    }
-    return null;
   }
 
   /**
@@ -151,29 +135,11 @@ public final class JavaUtil {
    * <p>TODO(bazel-team): (2011) We need to have a more robust way to determine the Java root of a
    * relative path rather than simply trying to find the "java" or "javatests" directory.
    */
+  @Nullable
   public static PathFragment getJavaPath(PathFragment path) {
     int index = javaSegmentIndex(path);
     if (index >= 0) {
       return path.subFragment(index + 1);
-    }
-    return null;
-  }
-
-  /**
-   * Given the PathFragment of a Java source file, returns the Java root of the specified path or
-   * 'null' if no java root can be determined.
-   *
-   * <p>Example 1: "{workspace}/java/foo/bar/wiz" and "{workspace}/javatests/foo/bar/wiz" result in
-   * "{workspace}/java" and "{workspace}/javatests" Example 2: "java/foo/bar/wiz" and
-   * "javatests/foo/bar/wiz" result in "java" and "javatests"
-   *
-   * <p>TODO(bazel-team): (2011) We need to have a more robust way to determine the Java root of a
-   * relative path rather than simply trying to find the "java" or "javatests" directory.
-   */
-  public static PathFragment getJavaRoot(PathFragment path) {
-    int index = javaSegmentIndex(path);
-    if (index >= 0) {
-      return path.subFragment(0, index + 1);
     }
     return null;
   }

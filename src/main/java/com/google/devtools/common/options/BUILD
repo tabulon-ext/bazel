@@ -3,15 +3,21 @@ load("@rules_java//java:defs.bzl", "java_library")
 # Description:
 #   A devtools-common options parser.
 #   Open-sourced as part of Bazel.
-package(default_visibility = ["//src:__subpackages__"])
+package(
+    default_applicable_licenses = ["//:license"],
+    default_visibility = ["//visibility:private"],
+)
 
 filegroup(
     name = "srcs",
     srcs = glob(["**"]) + [
-        "//src/main/java/com/google/devtools/common/options/testing:srcs",
         "//src/main/java/com/google/devtools/common/options/processor:srcs",
+        "//src/main/java/com/google/devtools/common/options/testing:srcs",
     ],
-    visibility = ["//src:__subpackages__"],
+    visibility = [
+        "//src:__pkg__",
+        "//src/main/java/com/google/devtools/build/lib:__pkg__",
+    ],
 )
 
 java_library(
@@ -20,19 +26,30 @@ java_library(
         "InvocationPolicyEnforcer.java",
         "InvocationPolicyParser.java",
     ],
+    visibility = [
+        "//src:__subpackages__",
+    ],
     deps = [
         ":options_internal",
         "//src/main/protobuf:invocation_policy_java_proto",
-        "//third_party:flogger",
-        "//third_party:guava",
-        "//third_party:jsr305",
-        "//third_party/protobuf:protobuf_java",
+        "//third_party/java/flogger",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:collect",
+        "//third_party/java/guava:io",
+        "//third_party/java/jsr305_annotations",
+        "//third_party/java/protobuf",
     ],
 )
 
 java_library(
     name = "options",
-    exported_plugins = ["//src/main/java/com/google/devtools/common/options/processor:options_preprocessor"],
+    exported_plugins = [
+        "//src/main/java/com/google/devtools/common/options/processor:options_preprocessor",
+        "//src/main/java/com/google/devtools/common/options/processor:options_class_processor",
+    ],
+    visibility = [
+        "//src:__subpackages__",
+    ],
     exports = [":options_internal"],
 )
 
@@ -41,14 +58,43 @@ java_library(
     srcs = glob(
         ["*.java"],
         exclude = [
+            "HtmlUtils.java",
             "InvocationPolicyEnforcer.java",
             "InvocationPolicyParser.java",
         ],
     ),
+    visibility = [
+        "//src/main/java/com/google/devtools/common/options/processor:__pkg__",
+        "//src/test/java/com/google/devtools/build/lib:__subpackages__",
+    ],
     deps = [
-        "//third_party:auto_value",
-        "//third_party:caffeine",
-        "//third_party:guava",
-        "//third_party:jsr305",
+        "//src/main/java/com/google/devtools/build/lib/skybridge:skybridge_interface",
+        "//src/main/java/com/google/devtools/build/lib/util:pair",
+        "//src/main/java/com/google/devtools/build/lib/util:string_encoding",
+        "//src/main/java/com/google/devtools/build/lib/util/regex:regex_util",
+        "//src/main/java/net/starlark/java/spelling",
+        "//third_party/java/auto:auto_value",
+        "//third_party/java/caffeine",
+        "//third_party/java/guava:annotations",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:collect",
+        "//third_party/java/guava:primitives",
+        "//third_party/java/guava:reflect",
+        "//third_party/java/jsr305_annotations",
+    ],
+)
+
+java_library(
+    name = "html_utils",
+    srcs = ["HtmlUtils.java"],
+    visibility = [
+        "//src:__subpackages__",
+    ],
+    deps = [
+        ":options_internal",
+        "//src/main/java/com/google/devtools/build/lib/util:markdown",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:collect",
+        "//third_party/java/guava:escape",
     ],
 )

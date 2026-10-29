@@ -27,7 +27,6 @@ import javax.annotation.Nullable;
  * <p>This is intended only for use in alternative {@code MemoizingEvaluator} implementations.
  */
 public class ErrorInfo {
-
   /** Create an ErrorInfo from a {@link ReifiedSkyFunctionException}. */
   public static ErrorInfo fromException(
       ReifiedSkyFunctionException skyFunctionException, boolean isTransitivelyTransient) {
@@ -50,6 +49,16 @@ public class ErrorInfo {
         /*isCatastrophic=*/ false);
   }
 
+  /** A wrapper that indicates that there's a value associated with the ErrorInfo's SkyKey. */
+  public static ErrorInfo withValue(ErrorInfo wrapped) {
+    return new ErrorInfoWithValue(
+        wrapped.getException(),
+        wrapped.getCycleInfo(),
+        wrapped.isDirectlyTransient(),
+        wrapped.isTransitivelyTransient(),
+        wrapped.isCatastrophic());
+  }
+
   /** Create an ErrorInfo from a collection of existing errors. */
   public static ErrorInfo fromChildErrors(SkyKey currentValue, Collection<ErrorInfo> childErrors) {
     Preconditions.checkNotNull(currentValue, "currentValue must not be null");
@@ -57,13 +66,18 @@ public class ErrorInfo {
         !childErrors.isEmpty(), "childErrors may not be empty %s", currentValue);
 
     ImmutableList.Builder<CycleInfo> cycleBuilder = ImmutableList.builder();
-    Exception firstException = null;
+    Exception representativeException = null;
+    boolean representativeExceptionCameWithValue = false;
     boolean isTransitivelyTransient = false;
     boolean isCatastrophic = false;
     for (ErrorInfo child : childErrors) {
-      if (firstException == null) {
-        // Arbitrarily pick the first error.
-        firstException = child.exception;
+      // Child errors that come with a value indicates that the error was somehow tolerated.
+      // Priorities should be given to those without values.
+      // Otherwise, choose the first error.
+      if (representativeException == null
+          || (representativeExceptionCameWithValue && child.exception != null)) {
+        representativeException = child.exception;
+        representativeExceptionCameWithValue = child.hasValue();
       }
       cycleBuilder.addAll(CycleInfo.prepareCycles(currentValue, child.cycles));
       isTransitivelyTransient |= child.isTransitivelyTransient;
@@ -71,11 +85,16 @@ public class ErrorInfo {
     }
 
     return new ErrorInfo(
-        firstException,
+        representativeException,
         cycleBuilder.build(),
-        /*isDirectlyTransient=*/ false,
+        /* isDirectlyTransient= */ false,
         isTransitivelyTransient,
         isCatastrophic);
+  }
+
+  /** Whether the SkyKey of this ErrorInfo has a corresponding SkyValue. */
+  boolean hasValue() {
+    return false;
   }
 
   @Nullable private final Exception exception;
@@ -84,6 +103,7 @@ public class ErrorInfo {
   private final boolean isTransitivelyTransient;
   private final boolean isCatastrophic;
 
+  @SuppressWarnings("LenientFormatStringValidation")
   public ErrorInfo(
       @Nullable Exception exception,
       ImmutableList<CycleInfo> cycles,
@@ -95,10 +115,12 @@ public class ErrorInfo {
     this.isDirectlyTransient = isDirectlyTransient;
     this.isTransitivelyTransient = isTransitivelyTransient;
     this.isCatastrophic = isCatastrophic;
+    // Expected 0 args, but got 1.
     Preconditions.checkArgument(
         exception != null || !cycles.isEmpty(),
         "At least one of exception and cycles must be present",
         this);
+    // Expected 0 args, but got 1.
     Preconditions.checkArgument(
         !isDirectlyTransient || isTransitivelyTransient,
         "Cannot be directly transient but not transitively transient",
@@ -110,11 +132,9 @@ public class ErrorInfo {
     if (this == obj) {
       return true;
     }
-    if (!(obj instanceof ErrorInfo)) {
+    if (!(obj instanceof ErrorInfo other)) {
       return false;
     }
-
-    ErrorInfo other = (ErrorInfo) obj;
 
     if (!Objects.equals(cycles, other.cycles)) {
       return false;
@@ -214,4 +234,24 @@ public class ErrorInfo {
     return isCatastrophic;
   }
 
+  /**
+   * Indicates that there's a value associated with the SkyKey that owns this ErrorInfo.
+   *
+   * <p>These should be de-prioritized among child ErrorInfos in {@link #fromChildErrors}.
+   */
+  private static class ErrorInfoWithValue extends ErrorInfo {
+    public ErrorInfoWithValue(
+        @Nullable Exception exception,
+        ImmutableList<CycleInfo> cycles,
+        boolean isDirectlyTransient,
+        boolean isTransitivelyTransient,
+        boolean isCatastrophic) {
+      super(exception, cycles, isDirectlyTransient, isTransitivelyTransient, isCatastrophic);
+    }
+
+    @Override
+    boolean hasValue() {
+      return true;
+    }
+  }
 }

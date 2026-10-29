@@ -13,26 +13,58 @@
 // limitations under the License.
 package com.google.devtools.build.lib.rules.cpp;
 
+import static com.google.devtools.build.lib.util.FileType.hasExtension;
+
 import com.google.common.base.Predicate;
 import com.google.common.collect.ImmutableList;
 import com.google.devtools.build.lib.actions.Artifact;
 import com.google.devtools.build.lib.util.FileType;
 import com.google.devtools.build.lib.util.FileTypeSet;
-import com.google.devtools.build.lib.vfs.OsPathPolicy;
 import java.util.regex.Pattern;
 
-/**
- * C++-related file type definitions.
- */
+/** C++-related file type definitions. */
 public final class CppFileTypes {
-  private static final OsPathPolicy OS = OsPathPolicy.getFilePathOs();
-
   // .cu and .cl are CUDA and OpenCL source extensions, respectively. They are expected to only be
   // supported with clang. Bazel is not officially supporting these targets, and the extensions are
   // listed only as long as they work with the existing C++ actions.
+  // FileType is extended to use case-sensitive comparison also on Windows
   public static final FileType CPP_SOURCE =
-      FileType.of(".cc", ".cpp", ".cxx", ".c++", ".C", ".cu", ".cl");
-  public static final FileType C_SOURCE = FileType.of(".c");
+      new FileType() {
+        final ImmutableList<String> extensions =
+            ImmutableList.of(".cc", ".cpp", ".cxx", ".c++", ".C", ".cu", ".cl");
+
+        @Override
+        public boolean apply(String path) {
+          for (String ext : extensions) {
+            if (path.endsWith(ext)) {
+              return true;
+            }
+          }
+          return false;
+        }
+
+        @Override
+        public ImmutableList<String> getExtensions() {
+          return extensions;
+        }
+      };
+
+  // FileType is extended to use case-sensitive comparison also on Windows
+  public static final FileType C_SOURCE =
+      new FileType() {
+        final String ext = ".c";
+
+        @Override
+        public boolean apply(String path) {
+          return path.endsWith(ext);
+        }
+
+        @Override
+        public ImmutableList<String> getExtensions() {
+          return ImmutableList.of(ext);
+        }
+      };
+
   public static final FileType OBJC_SOURCE = FileType.of(".m");
   public static final FileType OBJCPP_SOURCE = FileType.of(".mm");
   public static final FileType CLIF_INPUT_PROTO = FileType.of(".ipb");
@@ -67,7 +99,7 @@ public final class CppFileTypes {
 
         @Override
         public boolean apply(String path) {
-          return OS.endsWith(path, ext) && !PIC_PREPROCESSED_C.matches(path);
+          return hasExtension(path, ext) && !PIC_PREPROCESSED_C.matches(path);
         }
 
         @Override
@@ -82,7 +114,7 @@ public final class CppFileTypes {
 
         @Override
         public boolean apply(String path) {
-          return OS.endsWith(path, ext) && !PIC_PREPROCESSED_CPP.matches(path);
+          return hasExtension(path, ext) && !PIC_PREPROCESSED_CPP.matches(path);
         }
 
         @Override
@@ -114,7 +146,7 @@ public final class CppFileTypes {
 
         @Override
         public boolean apply(String path) {
-          return OS.endsWith(path, ext) && path.endsWith(".s");
+          return hasExtension(path, ext) && path.endsWith(".s");
         }
 
         @Override
@@ -130,7 +162,7 @@ public final class CppFileTypes {
 
         @Override
         public boolean apply(String path) {
-          return (path.endsWith(ext) && !PIC_ASSEMBLER.matches(path)) || OS.endsWith(path, ".asm");
+          return (path.endsWith(ext) && !PIC_ASSEMBLER.matches(path)) || hasExtension(path, ".asm");
         }
 
         @Override
@@ -148,15 +180,10 @@ public final class CppFileTypes {
         public boolean apply(String path) {
           if (PIC_ARCHIVE.matches(path)
               || ALWAYS_LINK_LIBRARY.matches(path)
-              || OS.endsWith(path, ".if.lib")) {
+              || hasExtension(path, ".if.lib")) {
             return false;
           }
-          for (String ext : extensions) {
-            if (OS.endsWith(path, ext)) {
-              return true;
-            }
-          }
-          return false;
+          return hasAnyExtension(path, extensions);
         }
 
         @Override
@@ -172,8 +199,8 @@ public final class CppFileTypes {
 
         @Override
         public boolean apply(String path) {
-          return (OS.endsWith(path, ext) && !ALWAYS_LINK_PIC_LIBRARY.matches(path))
-              || OS.endsWith(path, ".lo.lib");
+          return (hasExtension(path, ext) && !ALWAYS_LINK_PIC_LIBRARY.matches(path))
+              || hasExtension(path, ".lo.lib");
         }
 
         @Override
@@ -189,8 +216,8 @@ public final class CppFileTypes {
 
         @Override
         public boolean apply(String path) {
-          return (OS.endsWith(path, ext) && !PIC_OBJECT_FILE.matches(path))
-              || OS.endsWith(path, ".obj");
+          return (hasExtension(path, ext) && !PIC_OBJECT_FILE.matches(path))
+              || hasExtension(path, ".obj");
         }
 
         @Override
@@ -204,7 +231,17 @@ public final class CppFileTypes {
   // Minimized bitcode file emitted by the ThinLTO compile step and used just for LTO indexing.
   public static final FileType LTO_INDEXING_OBJECT_FILE = FileType.of(".indexing.o");
 
-  public static final FileType SHARED_LIBRARY = FileType.of(".so", ".dylib", ".dll");
+  // Imports file emitted by the ThinLTO indexing step and used for LTO backend action.
+  public static final FileType LTO_IMPORTS_FILE = FileType.of(".imports");
+
+  // Indexing analysis result file emitted by the ThinLTO indexing step and used for LTO backend
+  // action.
+  public static final FileType LTO_INDEXING_ANALYSIS_FILE = FileType.of(".thinlto.bc");
+
+  // TODO(bazel-team): File types should not be read from this hard-coded list but should come from
+  // the toolchain instead. See https://github.com/bazelbuild/bazel/issues/17117
+  public static final FileType SHARED_LIBRARY =
+      FileType.of(".so", ".dylib", ".dll", ".pyd", ".wasm", ".tgt", ".vpi");
   // Unix shared libraries can be passed to linker, but not .dll on Windows
   public static final FileType UNIX_SHARED_LIBRARY = FileType.of(".so", ".dylib");
   public static final FileType INTERFACE_SHARED_LIBRARY =
@@ -240,7 +277,7 @@ public final class CppFileTypes {
   public static final FileType LLVM_PROFILE_ZIP = FileType.of(".zip");
 
   public static final FileType CPP_MODULE_MAP = FileType.of(".cppmap");
-  public static final FileType CPP_MODULE = FileType.of(".pcm");
+  public static final FileType CPP_MODULE = FileType.of(".pcm", ".gcm", ".ifc");
   public static final FileType OBJC_MODULE_MAP = FileType.of("module.modulemap");
 
   /** Predicate that matches all artifacts that can be used in an objc Clang module map. */
@@ -255,7 +292,7 @@ public final class CppFileTypes {
           // The current clang (clang-600.0.57) on Darwin doesn't support 'textual', so we can't
           // have '.inc' files in the module map (since they're implictly textual).
           // TODO(bazel-team): Use HEADERS file type once clang-700 is the base clang we support.
-          return OS.endsWith(artifact.getFilename(), ".h");
+          return hasExtension(artifact.getFilename(), ".h");
         }
       };
 

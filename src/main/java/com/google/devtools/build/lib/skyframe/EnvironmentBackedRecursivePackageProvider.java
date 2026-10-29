@@ -15,10 +15,10 @@ package com.google.devtools.build.lib.skyframe;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.devtools.build.lib.cmdline.BatchCallback.SafeBatchCallback;
+import com.google.devtools.build.lib.cmdline.IgnoredSubdirectories;
 import com.google.devtools.build.lib.cmdline.PackageIdentifier;
 import com.google.devtools.build.lib.cmdline.RepositoryName;
 import com.google.devtools.build.lib.events.Event;
@@ -26,31 +26,39 @@ import com.google.devtools.build.lib.events.ExtendedEventHandler;
 import com.google.devtools.build.lib.io.InconsistentFilesystemException;
 import com.google.devtools.build.lib.io.ProcessPackageDirectoryException;
 import com.google.devtools.build.lib.packages.BuildFileContainsErrorsException;
+import com.google.devtools.build.lib.packages.InputFile;
 import com.google.devtools.build.lib.packages.NoSuchPackageException;
 import com.google.devtools.build.lib.packages.Package;
+import com.google.devtools.build.lib.packages.Packageoid;
 import com.google.devtools.build.lib.pkgcache.AbstractRecursivePackageProvider;
 import com.google.devtools.build.lib.pkgcache.PathPackageLocator;
+import com.google.devtools.build.lib.pkgcache.RecursivePackageProvider;
 import com.google.devtools.build.lib.rules.repository.RepositoryDirectoryValue;
+import com.google.devtools.build.lib.rules.repository.RepositoryDirectoryValue.Failure;
+import com.google.devtools.build.lib.rules.repository.RepositoryDirectoryValue.Success;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.Root;
 import com.google.devtools.build.lib.vfs.RootedPath;
 import com.google.devtools.build.skyframe.SkyFunction.Environment;
 import com.google.devtools.build.skyframe.SkyKey;
-import com.google.devtools.build.skyframe.ValueOrException2;
+import com.google.devtools.build.skyframe.SkyframeLookupResult;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 
 /**
- * A {@link com.google.devtools.build.lib.pkgcache.RecursivePackageProvider} backed by an {@link
- * Environment}. Its methods may throw {@link MissingDepException} if the package values this
- * depends on haven't been calculated and added to its environment.
+ * A {@link RecursivePackageProvider} backed by an {@link Environment}. Its methods may throw {@link
+ * MissingDepException} if the package values this depends on haven't been calculated and added to
+ * its environment.
  *
  * <p>This implementation never emits events through the {@link ExtendedEventHandler}s passed to its
  * methods. Instead, it emits events through its environment's {@link Environment#getListener()}.
+ *
+ * <p>This implementation expands symbolic macros eagerly; in other words, {@link #getBuildFile} and
+ * {@link #getTarget} force the full package to be expanded. This is intentional, since this
+ * implementation is used for retrieving the full list of targets in packages.
  *
  * <p>This implementation suppresses most {@link NoSuchPackageException}s discovered during package
  * loading, since target pattern expansion may tolerate point failures in packages. The first one
@@ -75,9 +83,8 @@ public final class EnvironmentBackedRecursivePackageProvider
 
   /**
    * Whether any of the calls to {@link #getPackage}, {@link #getTarget}, {@link #bulkGetPackages},
-   * or {@link
-   * com.google.devtools.build.lib.pkgcache.RecursivePackageProvider#streamPackagesUnderDirectory}
-   * encountered a package in error.
+   * or {@link RecursivePackageProvider#streamPackagesUnderDirectory} encountered a package in
+   * error.
    *
    * <p>The client of {@link EnvironmentBackedRecursivePackageProvider} may want to check this. See
    * comments in {@link #getPackage} for details.
@@ -94,10 +101,9 @@ public final class EnvironmentBackedRecursivePackageProvider
   @Override
   public Package getPackage(ExtendedEventHandler eventHandler, PackageIdentifier packageName)
       throws NoSuchPackageException, MissingDepException, InterruptedException {
-    SkyKey pkgKey = PackageValue.key(packageName);
     PackageValue pkgValue;
     try {
-      pkgValue = (PackageValue) env.getValueOrThrow(pkgKey, NoSuchPackageException.class);
+      pkgValue = (PackageValue) env.getValueOrThrow(packageName, NoSuchPackageException.class);
       if (pkgValue == null) {
         throw new MissingDepException();
       }
@@ -107,14 +113,30 @@ public final class EnvironmentBackedRecursivePackageProvider
     }
 
     Package pkg = pkgValue.getPackage();
-    if (pkg.containsErrors()) {
+    handlePackageoidErrors(pkg);
+    return pkg;
+  }
+
+  @SuppressWarnings("ThrowsUncheckedException") // Good for callers to know about MissingDep.
+  @Override
+  public InputFile getBuildFile(ExtendedEventHandler eventHandler, PackageIdentifier packageName)
+      throws NoSuchPackageException, MissingDepException, InterruptedException {
+    return getPackage(eventHandler, packageName).getBuildFile();
+  }
+
+  @SuppressWarnings("ThrowsUncheckedException") // Good for callers to know about MissingDep.
+  private void handlePackageoidErrors(Packageoid packageoid)
+      throws MissingDepException, InterruptedException {
+    if (packageoid.containsErrors()) {
       // If this is a nokeep_going build, we must shut the build down by throwing an exception. To
       // do that, we request a node that will throw an exception, and then try to catch it and
       // continue. This gives the framework notification to shut down the build if it should.
       try {
         env.getValueOrThrow(
-            PackageErrorFunction.key(packageName), BuildFileContainsErrorsException.class);
-        Preconditions.checkState(env.valuesMissing(), "Should have thrown for %s", packageName);
+            PackageErrorFunction.key(packageoid.getPackageIdentifier()),
+            BuildFileContainsErrorsException.class);
+        Preconditions.checkState(
+            env.valuesMissing(), "Should have thrown for %s", packageoid.getPackageIdentifier());
         throw new MissingDepException();
       } catch (BuildFileContainsErrorsException e) {
         // If this is a keep_going build, then the user of this RecursivePackageProvider has two
@@ -125,17 +147,6 @@ public final class EnvironmentBackedRecursivePackageProvider
         noSuchPackageException.compareAndSet(null, e);
       }
     }
-    return pkgValue.getPackage();
-  }
-
-  @Override
-  public Map<PackageIdentifier, Package> bulkGetPackages(Iterable<PackageIdentifier> pkgIds)
-      throws NoSuchPackageException, InterruptedException {
-    ImmutableMap.Builder<PackageIdentifier, Package> builder = ImmutableMap.builder();
-    for (PackageIdentifier pkgId : pkgIds) {
-      builder.put(pkgId, getPackage(env.getListener(), pkgId));
-    }
-    return builder.buildOrThrow();
   }
 
   @SuppressWarnings("ThrowsUncheckedException") // Good for callers to know about MissingDep.
@@ -167,7 +178,7 @@ public final class EnvironmentBackedRecursivePackageProvider
       ExtendedEventHandler eventHandler,
       RepositoryName repository,
       PathFragment directory,
-      ImmutableSet<PathFragment> ignoredSubdirectories,
+      IgnoredSubdirectories ignoredSubdirectories,
       ImmutableSet<PathFragment> excludedSubdirectories)
       throws InterruptedException, NoSuchPackageException, ProcessPackageDirectoryException {
     PathPackageLocator packageLocator = PrecomputedValue.PATH_PACKAGE_LOCATOR.get(env);
@@ -185,38 +196,34 @@ public final class EnvironmentBackedRecursivePackageProvider
         throw new MissingDepException();
       }
 
-      if (!repositoryValue.repositoryExists()) {
+      if (repositoryValue instanceof Failure(String errorMsg)) {
         eventHandler.handle(
-            Event.error(
-                String.format(
-                    "No such repository '%s': %s", repository, repositoryValue.getErrorMsg())));
+            Event.error(String.format("No such repository '%s': %s", repository, errorMsg)));
         return;
       }
-      roots.add(Root.fromPath(repositoryValue.getPath()));
+      roots.add(((Success) repositoryValue).root());
     }
 
-    ImmutableSet<PathFragment> filteredIgnoredSubdirectories =
-        ImmutableSet.copyOf(
-            Iterables.filter(ignoredSubdirectories, path -> path.startsWith(directory)));
+    IgnoredSubdirectories filteredIgnoredSubdirectories =
+        ignoredSubdirectories.filterForDirectory(directory);
 
-    List<ValueOrException2<NoSuchPackageException, ProcessPackageDirectoryException>>
-        recursivePackageValues =
-            env.getOrderedValuesOrThrow(
-                Iterables.transform(
-                    roots,
-                    r ->
-                        RecursivePkgValue.key(
-                            repository,
-                            RootedPath.toRootedPath(r, directory),
-                            filteredIgnoredSubdirectories)),
-                NoSuchPackageException.class,
-                ProcessPackageDirectoryException.class);
+    Iterable<RecursivePkgValue.Key> recursivePackageKeys =
+        Iterables.transform(
+            roots,
+            r ->
+                RecursivePkgValue.key(
+                    repository,
+                    RootedPath.toRootedPath(r, directory),
+                    filteredIgnoredSubdirectories));
+    SkyframeLookupResult recursivePackageValues = env.getValuesAndExceptions(recursivePackageKeys);
     NoSuchPackageException firstNspe = null;
-    for (ValueOrException2<NoSuchPackageException, ProcessPackageDirectoryException> lookupWrapper :
-        recursivePackageValues) {
+    for (RecursivePkgValue.Key key : recursivePackageKeys) {
       RecursivePkgValue lookup;
       try {
-        lookup = (RecursivePkgValue) lookupWrapper.get();
+        lookup =
+            (RecursivePkgValue)
+                recursivePackageValues.getOrThrow(
+                    key, NoSuchPackageException.class, ProcessPackageDirectoryException.class);
       } catch (NoSuchPackageException e) {
         // NoSuchPackageException can happen during error bubbling in a no-keep-going build.
         if (firstNspe == null) {

@@ -65,17 +65,37 @@ public interface FileStatus {
   /**
    * Returns the last modified time of this file's data (milliseconds since
    * UNIX epoch).
-   *
-   * TODO(bazel-team): Unix actually gives us nanosecond resolution for mtime and ctime. Consider
-   * making use of this.
    */
   long getLastModifiedTime() throws IOException;
 
   /**
-   * Returns the last change time of this file, where change means any change
-   * to the file, including metadata changes (milliseconds since UNIX epoch).
+   * Returns the last modified time of this file's data in nanoseconds since UNIX epoch, at the
+   * finest resolution the file system provides.
+   *
+   * <p>Use this rather than {@link #getLastModifiedTime} to detect changes to a file.
+   */
+  default long getLastModifiedTimeNanos() throws IOException {
+    return getLastModifiedTime() * 1_000_000;
+  }
+
+  /**
+   * Returns the last change time of this file, where change means any change to the file, including
+   * metadata changes (milliseconds since UNIX epoch).
+   *
+   * <p>On systems where the last change time is not supported, the last modified time will be
+   * returned instead.
    */
   long getLastChangeTime() throws IOException;
+
+  /**
+   * Returns the last change time of this file in nanoseconds since UNIX epoch, at the finest
+   * resolution the file system provides.
+   *
+   * <p>Use this rather than {@link #getLastChangeTime} to detect changes to a file.
+   */
+  default long getLastChangeTimeNanos() throws IOException {
+    return getLastChangeTime() * 1_000_000;
+  }
 
   /**
    * Returns the unique file node id. Usually it is computed using both device
@@ -85,4 +105,16 @@ public interface FileStatus {
    * ought to cause the node ID of b to change, but appending / modifying b should not.
    */
   long getNodeId() throws IOException;
+
+  /**
+   * Returns the file's permissions in POSIX format (e.g. 0755) if possible without performing
+   * additional IO, otherwise (or if unsupported by the file system) returns -1.
+   *
+   * <p>If accurate group and other permissions aren't available, the returned value should attempt
+   * to mimic a umask of 022 (i.e. read and execute permissions extend to group and other, write
+   * does not).
+   */
+  default int getPermissions() {
+    return -1;
+  }
 }

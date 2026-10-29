@@ -17,7 +17,7 @@ package com.google.testing.junit.runner.junit4;
 import java.nio.file.FileSystems;
 import java.nio.file.Path;
 import java.util.Properties;
-import javax.annotation.Nullable;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Configuration for the JUnit4 test runner.
@@ -26,16 +26,11 @@ class JUnit4Config {
   // VisibleForTesting
   static final String JUNIT_API_VERSION_PROPERTY = "com.google.testing.junit.runner.apiVersion";
 
-  // VisibleForTesting
-  static final String SHOULD_INSTALL_SECURITY_MANAGER_PROPERTY
-      = "com.google.testing.junit.runner.shouldInstallTestSecurityManager";
-
   private final boolean testRunnerFailFast;
   private final String testIncludeFilterRegexp;
   private final String testExcludeFilterRegexp;
-  @Nullable private final Path xmlOutputPath;
+  private final @Nullable Path xmlOutputPath;
   private final String junitApiVersion;
-  private final boolean shouldInstallSecurityManager;
 
   private static final String XML_OUTPUT_FILE_ENV_VAR = "XML_OUTPUT_FILE";
 
@@ -81,30 +76,10 @@ class JUnit4Config {
     this.testExcludeFilterRegexp = testExcludeFilterRegexp;
     this.xmlOutputPath = xmlOutputPath;
     junitApiVersion = systemProperties.getProperty(JUNIT_API_VERSION_PROPERTY, "1").trim();
-    shouldInstallSecurityManager = installSecurityManager(systemProperties);
   }
 
-  private static boolean installSecurityManager(Properties systemProperties) {
-    String securityManager = systemProperties.getProperty("java.security.manager");
-    if (securityManager != null) {
-      return false; // Don't install over the specified security manager
-    }
-    return Boolean.valueOf(
-        systemProperties.getProperty(SHOULD_INSTALL_SECURITY_MANAGER_PROPERTY, "true"));
-  }
-
-  /**
-   * @return Whether the test security manager should be installed
-   */
-  public boolean shouldInstallSecurityManager() {
-    return shouldInstallSecurityManager;
-  }
-
-  /**
-   * Returns the XML output path, or null if not specified.
-   */
-  @Nullable
-  public Path getXmlOutputPath() {
+  /** Returns the XML output path, or null if not specified. */
+  public @Nullable Path getXmlOutputPath() {
     if (xmlOutputPath == null) {
       String envXmlOutputPath = System.getenv(XML_OUTPUT_FILE_ENV_VAR);
       return

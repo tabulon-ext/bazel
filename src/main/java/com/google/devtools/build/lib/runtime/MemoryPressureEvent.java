@@ -14,29 +14,47 @@
 
 package com.google.devtools.build.lib.runtime;
 
-import com.google.auto.value.AutoValue;
+import com.google.auto.value.AutoBuilder;
+import com.google.common.annotations.VisibleForTesting;
+import java.time.Duration;
 
 /** A memory pressure event. */
-@AutoValue
-public abstract class MemoryPressureEvent {
-  public abstract boolean wasManualGc();
+public record MemoryPressureEvent(
+    boolean wasManualGc,
+    boolean wasGcLockerInitiatedGc,
+    boolean wasFullGc,
+    long tenuredSpaceUsedBytes,
+    long tenuredSpaceMaxBytes,
+    Duration duration) {
 
-  public abstract long tenuredSpaceUsedBytes();
-
-  public abstract long tenuredSpaceMaxBytes();
-
-  static Builder newBuilder() {
-    return new AutoValue_MemoryPressureEvent.Builder();
+  public final int percentTenuredSpaceUsed() {
+    return (int) ((tenuredSpaceUsedBytes() * 100L) / tenuredSpaceMaxBytes());
   }
 
-  @AutoValue.Builder
-  abstract static class Builder {
-    abstract Builder setWasManualGc(boolean value);
+  @VisibleForTesting
+  public static Builder newBuilder() {
+    return new AutoBuilder_MemoryPressureEvent_Builder()
+        .setWasManualGc(false)
+        .setWasGcLockerInitiatedGc(false)
+        .setWasFullGc(false);
+  }
 
-    abstract Builder setTenuredSpaceUsedBytes(long value);
+  /** A memory pressure event builder. */
+  @VisibleForTesting
+  @AutoBuilder
+  public abstract static class Builder {
+    public abstract Builder setWasManualGc(boolean value);
 
-    abstract Builder setTenuredSpaceMaxBytes(long value);
+    public abstract Builder setWasGcLockerInitiatedGc(boolean value);
 
-    abstract MemoryPressureEvent build();
+    public abstract Builder setWasFullGc(boolean value);
+
+    public abstract Builder setTenuredSpaceUsedBytes(long value);
+
+    public abstract Builder setTenuredSpaceMaxBytes(long value);
+
+    public abstract Builder setDuration(Duration duration);
+
+    public abstract MemoryPressureEvent build();
   }
 }

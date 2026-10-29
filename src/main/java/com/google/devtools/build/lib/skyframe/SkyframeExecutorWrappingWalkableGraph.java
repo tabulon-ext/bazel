@@ -23,7 +23,7 @@ import java.util.Map;
 import javax.annotation.Nullable;
 
 /**
- * {@link com.google.devtools.build.skyframe.WalkableGraph} backed by a {@link SkyframeExecutor}.
+ * {@link com.google.devtools.build.skyframe.WalkableGraph} backed by a {@link MemoizingEvaluator}.
  */
 public class SkyframeExecutorWrappingWalkableGraph extends DelegatingWalkableGraph {
 
@@ -38,7 +38,12 @@ public class SkyframeExecutorWrappingWalkableGraph extends DelegatingWalkableGra
           }
 
           @Override
-          public Map<SkyKey, ? extends NodeEntry> getBatch(
+          public LookupHint getLookupHint(SkyKey key) {
+            return LookupHint.INDIVIDUAL;
+          }
+
+          @Override
+          public Map<SkyKey, ? extends NodeEntry> getBatchMap(
               @Nullable SkyKey requestor, Reason reason, Iterable<? extends SkyKey> keys)
               throws InterruptedException {
             Map<SkyKey, NodeEntry> result = new HashMap<>();
@@ -53,8 +58,7 @@ public class SkyframeExecutorWrappingWalkableGraph extends DelegatingWalkableGra
         });
   }
 
-  public static SkyframeExecutorWrappingWalkableGraph of(SkyframeExecutor skyframeExecutor) {
-    // TODO(janakr): Provide the graph in a more principled way.
-    return new SkyframeExecutorWrappingWalkableGraph(skyframeExecutor.getEvaluator());
+  public static SkyframeExecutorWrappingWalkableGraph of(MemoizingEvaluator evaluator) {
+    return new SkyframeExecutorWrappingWalkableGraph(evaluator);
   }
 }

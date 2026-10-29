@@ -17,11 +17,11 @@ import com.google.auto.value.AutoValue;
 import com.google.common.collect.Iterables;
 import com.google.devtools.build.lib.analysis.TopLevelArtifactContext;
 import com.google.devtools.build.lib.skyframe.AspectKeyCreator.AspectKey;
-import com.google.devtools.build.lib.skyframe.CompletionFunction.TopLevelActionLookupKey;
 import com.google.devtools.build.lib.skyframe.serialization.autocodec.SerializationConstant;
 import com.google.devtools.build.skyframe.SkyFunctionName;
 import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.SkyValue;
+import com.google.devtools.build.skyframe.StallableSkykey;
 import java.util.Collection;
 
 /**
@@ -38,7 +38,8 @@ public class AspectCompletionValue implements SkyValue {
 
   /** The key of an AspectCompletionValue. */
   @AutoValue
-  public abstract static class AspectCompletionKey implements TopLevelActionLookupKey {
+  public abstract static class AspectCompletionKey
+      implements TopLevelActionLookupKeyWrapper, StallableSkykey {
     public static AspectCompletionKey create(
         AspectKey aspectKey, TopLevelArtifactContext topLevelArtifactContext) {
       return new AutoValue_AspectCompletionValue_AspectCompletionKey(

@@ -18,14 +18,14 @@ import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Supplier;
 import com.google.common.base.Suppliers;
-import com.google.common.collect.Interner;
-import com.google.devtools.build.lib.concurrent.BlazeInterners;
 import com.google.devtools.build.lib.packages.Package.ConfigSettingVisibilityPolicy;
 import com.google.devtools.build.lib.packages.RuleVisibility;
+import com.google.devtools.build.lib.pkgcache.PackageOptions.LazyMacroExpansionPackages;
 import com.google.devtools.build.lib.pkgcache.PathPackageLocator;
+import com.google.devtools.build.lib.skyframe.serialization.VisibleForSerialization;
 import com.google.devtools.build.lib.skyframe.serialization.autocodec.AutoCodec;
-import com.google.devtools.build.lib.skyframe.serialization.autocodec.AutoCodec.VisibleForSerialization;
 import com.google.devtools.build.skyframe.AbstractSkyKey;
+import com.google.devtools.build.skyframe.Differencer.DiffWithDelta.Delta;
 import com.google.devtools.build.skyframe.Injectable;
 import com.google.devtools.build.skyframe.SkyFunction;
 import com.google.devtools.build.skyframe.SkyFunctionName;
@@ -58,7 +58,11 @@ public final class PrecomputedValue implements SkyValue {
     }
 
     public void inject(Injectable injectable) {
-      injectable.inject(precomputed.key, new PrecomputedValue(supplier.get()));
+      injectable.inject(precomputed.key, Delta.justNew(new PrecomputedValue(supplier.get())));
+    }
+
+    public SkyKey getKey() {
+      return precomputed.getKey();
     }
 
     @Override
@@ -84,17 +88,36 @@ public final class PrecomputedValue implements SkyValue {
   public static final Precomputed<StarlarkSemantics> STARLARK_SEMANTICS =
       new Precomputed<>("starlark_semantics");
 
-  static final Precomputed<UUID> BUILD_ID = new Precomputed<>("build_id", /*shareable=*/ false);
+  public static final Precomputed<UUID> BUILD_ID = Precomputed.createUnshareable("build_id");
 
   public static final Precomputed<Map<String, String>> ACTION_ENV = new Precomputed<>("action_env");
-
-  public static final Precomputed<Map<String, String>> REPO_ENV = new Precomputed<>("repo_env");
 
   public static final Precomputed<PathPackageLocator> PATH_PACKAGE_LOCATOR =
       new Precomputed<>("path_package_locator");
 
   public static final Precomputed<Boolean> REMOTE_EXECUTION_ENABLED =
       new Precomputed<>("remote_execution_enabled");
+
+  public static final Precomputed<LazyMacroExpansionPackages> LAZY_MACRO_EXPANSION_PACKAGES =
+      new Precomputed<>("lazy_macro_expansion_packages");
+
+  /**
+   * A marker Skyframe dependency for a configured target that may behave differently due to {@code
+   * --stamp=true}, even if it does not own a stamped action.
+   *
+   * <p>Examples are:
+   *
+   * <ul>
+   *   <li>When a starlark transition reads {@code //command_line_option:stamp} as an input.
+   *   <li>When a starlark transition sets {@code //command_line_option:stamp} as an output (since
+   *       then dependencies may have a different output path in --stamp vs --nostamp).
+   *   <li>A {@code config_setting} that matches on the value of {@code --stamp}.
+   * </ul>
+   *
+   * <p>The value is irrelevant. Its {@link Injected#getKey} is just a marker dependency.
+   */
+  public static final Injected STAMP_SETTING_MARKER =
+      injected(new Precomputed<>("stamp_setting_marker"), Boolean.TRUE);
 
   private final Object value;
 
@@ -103,9 +126,7 @@ public final class PrecomputedValue implements SkyValue {
     this.value = Preconditions.checkNotNull(value);
   }
 
-  /**
-   * Returns the value of the variable.
-   */
+  /** Returns the value of the variable. */
   public Object get() {
     return value;
   }
@@ -117,10 +138,9 @@ public final class PrecomputedValue implements SkyValue {
 
   @Override
   public boolean equals(Object obj) {
-    if (!(obj instanceof PrecomputedValue)) {
+    if (!(obj instanceof PrecomputedValue other)) {
       return false;
     }
-    PrecomputedValue other = (PrecomputedValue) obj;
     return value.equals(other.value);
   }
 
@@ -138,15 +158,18 @@ public final class PrecomputedValue implements SkyValue {
     private final SkyKey key;
 
     public Precomputed(String key) {
-      this(key, /*shareable=*/ true);
+      this(key, /* shareable= */ true);
     }
 
     private Precomputed(String key, boolean shareable) {
       this.key = shareable ? Key.create(key) : UnshareableKey.create(key);
     }
 
-    @VisibleForTesting
-    public SkyKey getKeyForTesting() {
+    public static <T> Precomputed<T> createUnshareable(String key) {
+      return new Precomputed<>(key, /* shareable= */ false);
+    }
+
+    public SkyKey getKey() {
       return key;
     }
 
@@ -167,7 +190,7 @@ public final class PrecomputedValue implements SkyValue {
 
     /** Injects a new variable value. */
     public void set(Injectable injectable, T value) {
-      injectable.inject(key, new PrecomputedValue(value));
+      injectable.inject(key, Delta.justNew(new PrecomputedValue(value)));
     }
 
     @Override
@@ -182,20 +205,30 @@ public final class PrecomputedValue implements SkyValue {
   /** {@link com.google.devtools.build.skyframe.SkyKey} for {@code PrecomputedValue}. */
   @AutoCodec
   public static final class Key extends AbstractSkyKey<String> {
-    private static final Interner<Key> interner = BlazeInterners.newWeakInterner();
+    private static final SkyKeyInterner<Key> interner = SkyKey.newInterner();
 
     private Key(String arg) {
       super(arg);
     }
 
-    @AutoCodec.Instantiator
     public static Key create(String arg) {
       return interner.intern(new Key(arg));
+    }
+
+    @VisibleForSerialization
+    @AutoCodec.Interner
+    static Key intern(Key key) {
+      return interner.intern(key);
     }
 
     @Override
     public SkyFunctionName functionName() {
       return SkyFunctions.PRECOMPUTED;
+    }
+
+    @Override
+    public SkyKeyInterner<Key> getSkyKeyInterner() {
+      return interner;
     }
   }
 
@@ -203,16 +236,20 @@ public final class PrecomputedValue implements SkyValue {
   @AutoCodec
   @VisibleForSerialization
   static final class UnshareableKey extends AbstractSkyKey<String> {
-    private static final Interner<UnshareableKey> interner = BlazeInterners.newWeakInterner();
+    private static final SkyKeyInterner<UnshareableKey> interner = SkyKey.newInterner();
 
     private UnshareableKey(String arg) {
       super(arg);
     }
 
-    @AutoCodec.Instantiator
-    @VisibleForSerialization
-    static UnshareableKey create(String arg) {
+    private static UnshareableKey create(String arg) {
       return interner.intern(new UnshareableKey(arg));
+    }
+
+    @VisibleForSerialization
+    @AutoCodec.Interner
+    static UnshareableKey intern(UnshareableKey unshareableKey) {
+      return interner.intern(unshareableKey);
     }
 
     @Override
@@ -223,6 +260,11 @@ public final class PrecomputedValue implements SkyValue {
     @Override
     public boolean valueIsShareable() {
       return false;
+    }
+
+    @Override
+    public SkyKeyInterner<UnshareableKey> getSkyKeyInterner() {
+      return interner;
     }
   }
 }

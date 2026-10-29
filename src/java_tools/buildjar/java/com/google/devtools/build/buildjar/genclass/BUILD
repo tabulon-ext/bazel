@@ -1,12 +1,14 @@
-load("//tools/build_rules:java_rules_skylark.bzl", "bootstrap_java_binary")
 load("@rules_java//java:defs.bzl", "java_binary", "java_library")
+load("//tools/build_rules:java_rules_skylark.bzl", "bootstrap_java_binary")
 
-package(default_visibility = ["//src/java_tools/buildjar:buildjar_package_group"])
+package(
+    default_applicable_licenses = ["//:license"],
+    default_visibility = ["//src/java_tools/buildjar:buildjar_package_group"],
+)
 
 filegroup(
     name = "srcs",
     srcs = glob(["*.java"]) + ["BUILD"],
-    visibility = ["//src:__subpackages__"],
 )
 
 java_binary(
@@ -26,7 +28,9 @@ java_library(
     deps = [
         "//src/java_tools/buildjar/java/com/google/devtools/build/buildjar:jarhelper",
         "//src/main/protobuf:java_compilation_java_proto",
-        "//third_party:guava",
+        "//third_party/java/guava:annotations",
+        "//third_party/java/guava:base",
+        "//third_party/java/guava:collect",
     ],
 )
 

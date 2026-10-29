@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright 2015 The Bazel Authors. All rights reserved.
 #
@@ -98,8 +98,6 @@ function run_test_glob_with_io_error() {
   chmod 000 $pkg/t/u
 
   bazel query "$option" "//$pkg/t:*" >& $TEST_log && fail "Expected failure"
-  # TODO(katre): when error message from ErrorDeterminingRepositoryException is
-  #  improved, add it here too.
   expect_log 'error globbing'
 
   chmod 755 $pkg/t/u
@@ -137,7 +135,7 @@ function test_build_file_symlinks() {
   expect_log "no such package '$pkg/a'"
 
   mkdir $pkg/c || fail "couldn't make c"
-  ln -s foo $pkg/c/BUILD || "couldn't link $pkg/c/BUILD to foo"
+  ln -s foo $pkg/c/BUILD || fail "couldn't link $pkg/c/BUILD to foo"
   bazel query $pkg/a:all >& $TEST_log && fail "Expected failure"
   expect_log "no such package '$pkg/a'"
 

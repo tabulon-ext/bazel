@@ -20,19 +20,27 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMultimap;
 import com.google.common.eventbus.EventBus;
 import com.google.devtools.build.lib.actions.Artifact.DerivedArtifact;
+import com.google.devtools.build.lib.actions.ArtifactRoot;
+import com.google.devtools.build.lib.actions.ArtifactRoot.RootType;
+import com.google.devtools.build.lib.actions.util.ActionsTestUtil;
 import com.google.devtools.build.lib.analysis.ConfiguredTarget;
 import com.google.devtools.build.lib.analysis.config.BuildConfigurationValue;
 import com.google.devtools.build.lib.analysis.test.TestProvider;
 import com.google.devtools.build.lib.analysis.test.TestProvider.TestParams;
 import com.google.devtools.build.lib.analysis.test.TestResult;
 import com.google.devtools.build.lib.analysis.test.TestRunnerAction;
+import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.packages.TestTimeout;
 import com.google.devtools.build.lib.runtime.TestResultAggregator.AggregationPolicy;
+import com.google.devtools.build.lib.vfs.DigestHashFunction;
+import com.google.devtools.build.lib.vfs.inmemoryfs.InMemoryFileSystem;
 import com.google.devtools.build.lib.view.test.TestStatus.BlazeTestStatus;
 import com.google.devtools.build.lib.view.test.TestStatus.TestResultData;
-import java.util.stream.Stream;
+import java.io.IOException;
+import java.util.stream.IntStream;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -52,7 +60,7 @@ public final class TestResultAggregatorTest {
   }
 
   @Test
-  public void nonCachedResult_setsActionRanTrue() {
+  public void nonCachedResult_setsActionRanTrue() throws Exception {
     TestResultAggregator underTest = createAggregatorWithTestRuns(1);
 
     underTest.testEvent(
@@ -62,7 +70,7 @@ public final class TestResultAggregatorTest {
   }
 
   @Test
-  public void locallyCachedTest_setsActionRanFalse() {
+  public void locallyCachedTest_setsActionRanFalse() throws Exception {
     TestResultAggregator underTest = createAggregatorWithTestRuns(1);
 
     underTest.testEvent(
@@ -72,7 +80,7 @@ public final class TestResultAggregatorTest {
   }
 
   @Test
-  public void remotelyCachedTest_setsActionRanFalse() {
+  public void remotelyCachedTest_setsActionRanFalse() throws Exception {
     TestResultAggregator underTest = createAggregatorWithTestRuns(1);
 
     underTest.testEvent(
@@ -82,7 +90,7 @@ public final class TestResultAggregatorTest {
   }
 
   @Test
-  public void newCachedResult_keepsActionRanTrueWhenAlreadyTrue() {
+  public void newCachedResult_keepsActionRanTrueWhenAlreadyTrue() throws Exception {
     TestResultAggregator underTest = createAggregatorWithTestRuns(2);
 
     underTest.testEvent(
@@ -94,7 +102,7 @@ public final class TestResultAggregatorTest {
   }
 
   @Test
-  public void timingAggregation() {
+  public void timingAggregation() throws Exception {
     TestResultAggregator underTest = createAggregatorWithTestRuns(2);
 
     underTest.testEvent(
@@ -113,7 +121,7 @@ public final class TestResultAggregatorTest {
   }
 
   @Test
-  public void attemptCount_agggregatesSingleShardSingleAttempt() {
+  public void attemptCount_aggregatesSingleShardSingleAttempt() throws Exception {
     when(mockParams.runsDetectsFlakes()).thenReturn(true);
     TestResultAggregator underTest = createAggregatorWithTestRuns(1);
 
@@ -126,7 +134,7 @@ public final class TestResultAggregatorTest {
   }
 
   @Test
-  public void attemptCount_agggregatesSingleShardMultipleAttempts() {
+  public void attemptCount_aggregatesSingleShardMultipleAttempts() throws Exception {
     when(mockParams.runsDetectsFlakes()).thenReturn(true);
     TestResultAggregator underTest = createAggregatorWithTestRuns(2);
 
@@ -143,7 +151,7 @@ public final class TestResultAggregatorTest {
   }
 
   @Test
-  public void attemptCount_agggregatesMultipleShardsMultipleAttempts() {
+  public void attemptCount_aggregatesMultipleShardsMultipleAttempts() throws Exception {
     when(mockParams.runsDetectsFlakes()).thenReturn(true);
     when(mockParams.getShards()).thenReturn(2);
     TestResultAggregator underTest = createAggregatorWithTestRuns(3);
@@ -165,7 +173,7 @@ public final class TestResultAggregatorTest {
   }
 
   @Test
-  public void attemptCount_agggregatesMultipleShardsSingleShardHasMostAttempts() {
+  public void attemptCount_aggregatesMultipleShardsSingleShardHasMostAttempts() throws Exception {
     when(mockParams.runsDetectsFlakes()).thenReturn(true);
     when(mockParams.getShards()).thenReturn(2);
     TestResultAggregator underTest = createAggregatorWithTestRuns(3);
@@ -187,14 +195,14 @@ public final class TestResultAggregatorTest {
   }
 
   @Test
-  public void cancelConcurrentTests_cancellationAfterPassIgnored() {
+  public void cancelConcurrentTests_cancellationAfterPassIgnored() throws Exception {
     when(mockParams.runsDetectsFlakes()).thenReturn(true);
     TestResultAggregator underTest = createAggregatorWithTestRuns(2);
 
     underTest.testEvent(
         testResult(
             TestResultData.newBuilder().setStatus(BlazeTestStatus.PASSED),
-            /*locallyCached=*/ true));
+            /* locallyCached= */ true));
     underTest.testEvent(
         testResult(
             TestResultData.newBuilder().setStatus(BlazeTestStatus.INCOMPLETE),
@@ -205,7 +213,7 @@ public final class TestResultAggregatorTest {
   }
 
   @Test
-  public void notAllTestRunsReported_skipTargetsOnFailure_noStatus() {
+  public void notAllTestRunsReported_skipTargetsOnFailure_noStatus() throws Exception {
     TestResultAggregator underTest = createAggregatorWithTestRuns(2);
 
     underTest.testEvent(
@@ -218,7 +226,7 @@ public final class TestResultAggregatorTest {
   }
 
   @Test
-  public void notAllTestRunsReported_noSkipTargetsOnFailure_incomplete() {
+  public void notAllTestRunsReported_noSkipTargetsOnFailure_incomplete() throws Exception {
     TestResultAggregator underTest = createAggregatorWithTestRuns(2);
 
     underTest.testEvent(
@@ -230,35 +238,107 @@ public final class TestResultAggregatorTest {
         .isEqualTo(BlazeTestStatus.INCOMPLETE);
   }
 
+  @Test
+  public void testVerboseTimeoutWarnings_ignoredForLocallyCachedTests() throws Exception {
+    TestResultAggregator underTest =
+        createAggregatorWithTestRuns(1, /* testVerboseTimeoutWarnings= */ true);
+
+    underTest.testEvent(
+        testResult(
+            TestResultData.newBuilder()
+                .setStatus(BlazeTestStatus.PASSED)
+                .setRemotelyCached(false)
+                .addTestProcessTimes(10),
+            /* locallyCached= */ true));
+
+    assertThat(underTest.aggregateAndReportSummary(false).getWarnings()).isEmpty();
+  }
+
+  @Test
+  public void testVerboseTimeoutWarnings_ignoredForRemotelyCachedTests() throws Exception {
+    TestResultAggregator underTest =
+        createAggregatorWithTestRuns(1, /* testVerboseTimeoutWarnings= */ true);
+
+    underTest.testEvent(
+        testResult(
+            TestResultData.newBuilder()
+                .setStatus(BlazeTestStatus.PASSED)
+                .setRemotelyCached(true)
+                .addTestProcessTimes(10),
+            /* locallyCached= */ false));
+
+    assertThat(underTest.aggregateAndReportSummary(false).getWarnings()).isEmpty();
+  }
+
+  @Test
+  public void testVerboseTimeoutWarnings_emittedForUncachedTests() throws Exception {
+    TestResultAggregator underTest =
+        createAggregatorWithTestRuns(1, /* testVerboseTimeoutWarnings= */ true);
+
+    underTest.testEvent(
+        testResult(
+            TestResultData.newBuilder()
+                .setStatus(BlazeTestStatus.PASSED)
+                .setRemotelyCached(false)
+                .addTestProcessTimes(10),
+            /* locallyCached= */ false));
+
+    assertThat(underTest.aggregateAndReportSummary(false).getWarnings()).hasSize(1);
+  }
+
   private TestResultAggregator createAggregatorWithTestRuns(int testRuns) {
+    return createAggregatorWithTestRuns(testRuns, /* testVerboseTimeoutWarnings= */ false);
+  }
+
+  private TestResultAggregator createAggregatorWithTestRuns(
+      int testRuns, boolean testVerboseTimeoutWarnings) {
+    ArtifactRoot root =
+        ArtifactRoot.asDerivedRoot(
+            new InMemoryFileSystem(DigestHashFunction.SHA256).getPath("/output_base"),
+            RootType.OUTPUT,
+            "execroot");
     when(mockParams.getTestStatusArtifacts())
         .thenReturn(
-            Stream.generate(() -> mock(DerivedArtifact.class))
-                .limit(testRuns)
+            IntStream.range(0, testRuns)
+                .mapToObj(
+                    i -> (DerivedArtifact) ActionsTestUtil.createArtifact(root, "status." + i))
                 .collect(toImmutableList()));
     when(mockParams.getRuns()).thenReturn(testRuns);
 
     ConfiguredTarget mockTarget = mock(ConfiguredTarget.class);
     when(mockTarget.getProvider(TestProvider.class)).thenReturn(new TestProvider(mockParams));
+    when(mockTarget.getLabel()).thenReturn(Label.parseCanonicalUnchecked("//foo:bar"));
 
     return new TestResultAggregator(
         mockTarget,
         mock(BuildConfigurationValue.class),
         new AggregationPolicy(
-            new EventBus(), /*testCheckUpToDate=*/ false, /*testVerboseTimeoutWarnings=*/ false),
-        /*skippedThisTest=*/ false);
+            new EventBus(), /* testCheckUpToDate= */ false, testVerboseTimeoutWarnings),
+        /* skippedThisTest= */ false);
   }
 
-  private static TestResult testResult(TestResultData.Builder data, boolean locallyCached) {
+  private static TestResult testResult(TestResultData.Builder data, boolean locallyCached)
+      throws IOException {
     TestRunnerAction mockTestAction = mock(TestRunnerAction.class);
-    when(mockTestAction.getTestOutputsMapping(any(), any())).thenReturn(ImmutableList.of());
-    return new TestResult(mockTestAction, data.build(), locallyCached, /*systemFailure=*/ null);
+    when(mockTestAction.getTestOutputsMapping(any(), any())).thenReturn(ImmutableMultimap.of());
+    return new TestResult(
+        mockTestAction,
+        data.build(),
+        ImmutableMultimap.of(),
+        locallyCached,
+        /* systemFailure= */ null);
   }
 
-  private static TestResult shardedTestResult(TestResultData.Builder data, int shardNum) {
+  private static TestResult shardedTestResult(TestResultData.Builder data, int shardNum)
+      throws IOException {
     TestRunnerAction mockTestAction = mock(TestRunnerAction.class);
-    when(mockTestAction.getTestOutputsMapping(any(), any())).thenReturn(ImmutableList.of());
+    when(mockTestAction.getTestOutputsMapping(any(), any())).thenReturn(ImmutableMultimap.of());
     when(mockTestAction.getShardNum()).thenReturn(shardNum);
-    return new TestResult(mockTestAction, data.build(), /*cached=*/ false, /*systemFailure=*/ null);
+    return new TestResult(
+        mockTestAction,
+        data.build(),
+        ImmutableMultimap.of(),
+        /* cached= */ false,
+        /* systemFailure= */ null);
   }
 }
